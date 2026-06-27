@@ -1,0 +1,153 @@
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+eggs/
+.eggs/
+*.manifest
+*.spec
+pip-wheel-metadata/
+
+# ============================================================
+# Virtual environments
+# ============================================================
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+.python-version
+
+# ============================================================
+# Testing & coverage
+# ============================================================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+test-results/
+
+# ============================================================
+# Type checking
+# ============================================================
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+
+# ============================================================
+# Generated output — pipeline artifacts, dashboards, exports
+# ============================================================
+output/
+
+# ============================================================
+# Trained models — large binaries; enable Git LFS if you must version them
+# ============================================================
+models/
+*.joblib
+
+# ============================================================
+# Generated database / state files (inside data/)
+# ============================================================
+data/analisis_gramatical.json
+data/discourse_state.json
+data/best_params.json
+
+# ============================================================
+# AI conversation state — runtime agent database
+# ============================================================
+ia/
+
+# ============================================================
+# Logs
+# ============================================================
+*.log
+history_log.txt
+logs/
+
+# ============================================================
+# Profiling / tracing
+# ============================================================
+*.prof
+viztracer*.json
+
+# ============================================================
+# Environment & secrets — .env.example IS tracked
+# ============================================================
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*-token
+HF_TOKEN
+DEEPSEEK_API_KEY
+
+# ============================================================
+# IDE / Editor
+# ============================================================
+.idea/
+.vscode/
+.zed/
+.cursor/
+*.swp
+*.swo
+*~
+.project
+.settings/
+.classpath
+*.sublime-*
+*.code-workspace
+
+# ============================================================
+# OS files
+# ============================================================
+.DS_Store
+.DS_Store?
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ============================================================
+# Jupyter
+# ============================================================
+.ipynb_checkpoints/
+*.ipynb_checkpoints*
+notebooks/.ipynb_checkpoints/
+
+# ============================================================
+# Docker (don't bake build cache into git)
+# ============================================================
+.docker/
+
+# ============================================================
+# Misc
+# ============================================================
+*.bak
+*.tmp
+*.temp
+*.orig
+notebooks/
+data/*.xlsx
+data/*.bin
+
+# Large pipeline outputs (not source code)
+global_dashboard.json
+global_lexical.json
+global_lexical.xlsx
+red_semantica.gexf
+data/workflow_data.json
+data/best_params.json
+data/discourse_state.json

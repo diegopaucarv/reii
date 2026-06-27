@@ -1,0 +1,48 @@
+# ============================================================
+# REII — Docker Compose (two services)
+# ============================================================
+version: "3.9"
+
+services:
+  # ── Streamlit Dashboard ──────────────────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: reii:latest
+    container_name: reii-dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data:ro          # input data (read-only)
+      - ./models:/app/models:ro       # trained models (read-only)
+      - ./output:/app/output          # generated output
+      - ./ia:/app/ia                  # AI conversation state
+    environment:
+      - REII_DATA_DIR=/app/data/input
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+    restart: unless-stopped
+    command: >
+      streamlit run src/reii/dashboard.py
+      --server.address=0.0.0.0
+      --server.port=8501
+      --server.fileWatcherType=none
+
+  # ── Batch Pipeline (run-once) ─────────────────────────────────────
+  workflow:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: reii:latest
+    container_name: reii-workflow
+    volumes:
+      - ./data:/app/data:ro
+      - ./models:/app/models:ro
+      - ./output:/app/output
+      - ./ia:/app/ia
+    environment:
+      - REII_DATA_DIR=/app/data/input
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+    profiles: ["batch"]                       # doesn't auto-start
+    command: >
+      python src/reii/main_workflow_clasico.py

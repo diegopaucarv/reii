@@ -1,0 +1,46 @@
+# ── Python artifacts ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Virtual environments ────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Output files (generated) ────────────────────────────────────────
+output/
+*.ipynb_checkpoints/
+
+# ── Logs & temp ─────────────────────────────────────────────────────
+*.log
+history_log.txt
+
+# ── IDE / Editor ────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── OS ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Jupyter ─────────────────────────────────────────────────────────
+notebooks/.ipynb_checkpoints/
+
+# ── Git (if present) ────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ── Environment files (keep secrets out of images) ──────────────────
+.env
+.env.local
+.env.*.local
