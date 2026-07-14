@@ -15,7 +15,7 @@ REII is a production‑grade NLP pipeline for Spanish discourse analysis, implem
 REII's most distinctive feature is its **progressive text segmentation** with a **sliding window** for coreference resolution. Unlike traditional fixed‑window or sentence‑based segmentation, this approach:
 
 - **Preserves discourse continuity** – Segments overlap, ensuring that cross‑sentential references are not lost.
-- **Resolves coreferences** – Using **Stanza** (Stanford NLP), the system identifies anaphoric references across the sliding window, maintaining referential coherence even when entities span multiple sentences[reference:3].
+- **Resolves coreferences** – Using **Stanza** (Stanford NLP), the system identifies anaphoric references across the sliding window, maintaining referential coherence even when entities span multiple sentences.
 - **Adapts to text length** – The window size is configurable based on document length and genre, optimising for both short interview excerpts and long transcripts.
 - **Handles Spanish linguistic complexity** – The pipeline is specifically tuned for Spanish, with custom lexicons and grammar rules for the language's rich morphology and flexible syntax.
 
@@ -58,44 +58,35 @@ The `ia_discursiva.py` module provides an optional **DeepSeek‑powered** discou
 - Propose interpretive labels for emerging themes.
 - Suggest relationships between discourse units.
 
-This agent is invoked only when the researcher chooses, preserving the inductive integrity of the pipeline[reference:4].
+This agent is invoked only when the researcher chooses, preserving the inductive integrity of the pipeline.
 
 ## 🏗️ Architecture
 
-```markdown
-┌─────────────────────────────────────────────────────────────────┐
-│ Streamlit Dashboard │
-│ Interactive visualisation of results │
-└─────────────────────────────────────────────────────────────────┘
-│
-┌─────────────────────────────────────────────────────────────────┐
-│ Core Pipeline │
-│ ┌──────────────┐ ┌──────────────┐ ┌────────────────────┐ │
-│ │ Progressive │ │ Grammar │ │ Semantic Network │ │
-│ │ Segmentation │→│ Analysis │→│ Construction │ │
-│ │ (sliding │ │ (UCE, NLP) │ │ (co‑occurrence) │ │
-│ │ window) │ │ │ │ │ │
-│ └──────────────┘ └──────────────┘ └────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-│
-┌─────────────────────────────────────────────────────────────────┐
-│ Language Resources │
-│ ┌──────────────┐ ┌──────────────┐ ┌────────────────────┐ │
-│ │ Spanish │ │ Lexicons │ │ spaCy / Stanza │ │
-│ │ Grammar │→│ (custom) │→│ models (Spanish) │ │
-│ │ Rules │ │ │ │ │ │
-│ └──────────────┘ └──────────────┘ └────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-│
-┌─────────────────────────────────────────────────────────────────┐
-│ Optional Modules │
-│ ┌────────────────────────────────────────────────────────┐ │
-│ │ AI Discourse Agent (DeepSeek API) │ │
-│ │ - Summary generation │ │
-│ │ - Thematic proposal │ │
-│ │ - Relationship suggestion │ │
-│ └────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Dashboard [Streamlit Dashboard]
+        D[Interactive visualisation of results]
+    end
+
+    subgraph Pipeline [Core Pipeline]
+        direction LR
+        Seg[Progressive Segmentation<br/>(sliding window)] --> Gram[Grammar Analysis<br/>(UCE, NLP)] --> Sem[Semantic Network<br/>Construction (co-occurrence)]
+    end
+
+    subgraph Resources [Language Resources]
+        direction LR
+        Rules[Spanish Grammar Rules] --> Lex[Custom Lexicons] --> Models[spaCy / Stanza<br/>Spanish models]
+    end
+
+    subgraph Optional [Optional Modules]
+        AI[AI Discourse Agent<br/>(DeepSeek API)<br/><i>Summary, Proposals, Relationships</i>]
+    end
+
+    Dashboard --> Pipeline
+    Pipeline --> Resources
+    Resources --> Optional
+    
+    Pipeline -.-> Optional
 ```
 
 ## 📦 Quick Start
