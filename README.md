@@ -64,29 +64,45 @@ This agent is invoked only when the researcher chooses, preserving the inductive
 
 ```mermaid
 flowchart TD
-    subgraph Dashboard [Streamlit Dashboard]
-        D[Interactive visualisation of results]
+    %% Style Definitions
+    classDef dash fill:#e1f5fe,stroke:#01579b,stroke-width:2px,color:#000;
+    classDef pipeline fill:#f3e5f5,stroke:#4a148c,stroke-width:2px,color:#000;
+    classDef lang fill:#fff3e0,stroke:#e65100,stroke-width:2px,color:#000;
+    classDef optional fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px,color:#000;
+
+    subgraph Layer1_Dashboard ["Streamlit Dashboard"]
+        D1[Interactive visualisation of results]
     end
 
-    subgraph Pipeline [Core Pipeline]
-        direction LR
-        Seg[Progressive Segmentation<br/>(sliding window)] --> Gram[Grammar Analysis<br/>(UCE, NLP)] --> Sem[Semantic Network<br/>Construction (co-occurrence)]
+    subgraph Layer2_Pipeline ["Core Pipeline"]
+        P1[Progressive Segmentation] --> P2[Grammar & UCE Analysis] --> P3[Semantic Network Construction]
     end
 
-    subgraph Resources [Language Resources]
-        direction LR
-        Rules[Spanish Grammar Rules] --> Lex[Custom Lexicons] --> Models[spaCy / Stanza<br/>Spanish models]
+    subgraph Layer3_Resources ["Language Resources"]
+        R1[Spanish Grammar Rules] --> R2[Custom Lexicons] --> R3[spaCy & Stanza Models]
     end
 
-    subgraph Optional [Optional Modules]
-        AI[AI Discourse Agent<br/>(DeepSeek API)<br/><i>Summary, Proposals, Relationships</i>]
+    subgraph Layer4_Optional ["Optional Modules"]
+        O1[AI Discourse Agent]
+        O2[Summary Generation]
+        O3[Thematic Proposal]
+        O4[Relationship Suggestion]
+        O1 --- O2
+        O1 --- O3
+        O1 --- O4
     end
 
-    Dashboard --> Pipeline
-    Pipeline --> Resources
-    Resources --> Optional
-    
-    Pipeline -.-> Optional
+    %% Vertical Connections between Layers
+    D1 --> P1
+    P3 --> R1
+    R3 --> O1
+
+    %% Dashed optional connection from Core Pipeline to Optional Modules
+    P3 -.-> O1
+
+    %% Apply Styles
+    class D1 dash
+
 ```
 
 ## 📦 Quick Start
