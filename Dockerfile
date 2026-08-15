@@ -1,7 +1,7 @@
 # ============================================================
-# REII — Multi-stage Docker build (CPU)
+# REII — Docker build (CPU)
 # ============================================================
-FROM python:3.11-slim AS base
+FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -11,43 +11,34 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# System deps for compiling C-extensions (scipy, gensim, etc.)
+# System deps for compiling C-extensions
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    gcc \
-    g++ \
+    build-essential gcc g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Python dependencies ──────────────────────────────────────────────
+# ── Python dependencies (cached layer) ────────────────────────────────
 COPY requirements.txt .
-RUN pip install --upgrade pip setuptools wheel && \
-    pip install -r requirements.txt
+RUN pip install --upgrade pip setuptools wheel \
+    && pip install -r requirements.txt
 
-# ── spaCy model ──────────────────────────────────────────────────────
+# ── spaCy model ───────────────────────────────────────────────────────
 RUN python -m spacy download es_core_news_lg
 
-# ── NLTK data ────────────────────────────────────────────────────────
+# ── NLTK data ─────────────────────────────────────────────────────────
 RUN python -c "import nltk; nltk.download('punkt', quiet=True)"
 
-# ============================================================
-# App image
-# ============================================================
-FROM base AS app
-
-# ── Install the REII package ─────────────────────────────────────────
+# ── Application source ────────────────────────────────────────────────
 COPY pyproject.toml .
 COPY src/ src/
-RUN pip install -e . --no-deps
+RUN pip install -e .
 
-# ── Create runtime directories ───────────────────────────────────────
-RUN mkdir -p /app/data /app/output /app/models
+# ── Runtime directories ───────────────────────────────────────────────
+RUN mkdir -p /app/data /app/output /app/models /app/ia
 
-# ── Expose Streamlit port ────────────────────────────────────────────
 EXPOSE 8501
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
     CMD python -c "import reii" || exit 1
 
-# ── Default command (dashboard) ──────────────────────────────────────
 CMD ["streamlit", "run", "src/reii/dashboard.py", \
      "--server.address=0.0.0.0", "--server.port=8501"]

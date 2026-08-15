@@ -5,10 +5,16 @@ import json
 import math
 import os
 import re
+import sys
 from collections import Counter, defaultdict
 from datetime import datetime
 from itertools import combinations, groupby
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+SRC_DIR = Path(__file__).resolve().parent / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 import networkx as nx
 import numpy as np
@@ -20,6 +26,8 @@ from plotly.subplots import make_subplots
 from scipy.signal import savgol_filter
 from scipy.stats import pearsonr
 from sklearn.preprocessing import LabelEncoder
+
+from reii.config import DISCOURSE_STATE_PATH, WORKFLOW_DB_PATH
 
 st.set_page_config(
     page_title="ALCESTE · Dashboard",
@@ -163,17 +171,20 @@ _CONFIDENCE_RANK = {"alta": 3, "media": 2, "baja": 1}
 # ─────────────────────────────────────────────────────────────
 @st.cache_resource
 def load_workflow_data():
-    path = "./data/workflow_data.json"
+    path = WORKFLOW_DB_PATH
     if not os.path.exists(path):
-        st.error(f"❌ No se encontró {path}")
-        st.stop()
+        st.warning(
+            f"⚠️ No se encontró la base de datos del workflow en `{path}`. "
+            "Ejecuta el workflow primero o monta el archivo correcto."
+        )
+        return {}
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 @st.cache_resource
 def load_discourse_state():
-    path = "./data/discurso1.json"
+    path = DISCOURSE_STATE_PATH
     if not os.path.exists(path):
         return {}
     with open(path, "r", encoding="utf-8") as f:
@@ -182,13 +193,10 @@ def load_discourse_state():
 
 @st.cache_resource
 def load_merged_data():
-    _wf_mtime = os.path.getmtime("./data/workflow_data.json")
-    _ds_mtime = (
-        os.path.getmtime("./data/discourse_state.json")
-        if os.path.exists("./data/discourse_state.json")
-        else 0
-    )
     wf = load_workflow_data()
+    if not wf:
+        return {}
+
     disc = load_discourse_state()
     annotations_by_uce = disc.get("annotations_by_uce", {})
 
@@ -219,6 +227,15 @@ def load_merged_data():
 
 data = load_merged_data()
 uces = data.get("uces", [])
+
+if not uces:
+    st.title("ALCESTE · Dashboard")
+    st.info(
+        "No hay datos del workflow disponibles todavía. "
+        "Ejecuta primero el workflow o monta un `data/workflow_data.json` válido."
+    )
+    st.caption(f"Ruta esperada: `{WORKFLOW_DB_PATH}`")
+    st.stop()
 
 
 @st.cache_data(show_spinner=False)
@@ -8767,7 +8784,7 @@ def render_paragraph_card(
             f"{''.join(html_parts)}</div>"
             f"{js_script}"
         )
-        st.components.v1.html(
+        st.iframe(
             final_html,
             height=max(300, len(par_uces) * 110),
             scrolling=True,
@@ -11041,7 +11058,7 @@ with tab_c:
                         </div>"""
                     cards_html += "</div></div>"
                 cards_html += "</div>"
-                st.components.v1.html(cards_html, height=400, scrolling=True)
+                st.iframe(cards_html, height=400, scrolling=True)
 
                 with st.sidebar:
                     if st.button("🔄 Recargar datos discursivos"):
@@ -11266,7 +11283,7 @@ with tab_c:
                             }}, 300);
                         </script>
                         '''
-                st.components.v1.html(doc_html, height=620)
+                st.iframe(doc_html, height=620)
 
         _sec_rule("Síntesis discursiva")
         if str(cur_c) in sintesis_por_clase:

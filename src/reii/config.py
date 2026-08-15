@@ -25,7 +25,7 @@ except ImportError:
 # Filesystem paths
 # ---------------------------------------------------------------------------
 ROOT_DIR = Path(os.environ.get("REII_ROOT_DIR", ".")).resolve()
-DATA_DIR = ROOT_DIR / os.environ.get("REII_DATA_DIR", "data/input")
+DATA_DIR = ROOT_DIR / os.environ.get("REII_DATA_DIR", "data")
 OUTPUT_DIR = ROOT_DIR / os.environ.get("REII_OUTPUT_DIR", "output")
 MODELS_DIR = ROOT_DIR / os.environ.get("REII_MODELS_DIR", "models")
 

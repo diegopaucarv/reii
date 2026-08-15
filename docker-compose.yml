@@ -1,10 +1,8 @@
 # ============================================================
 # REII — Docker Compose (two services)
 # ============================================================
-version: "3.9"
 
 services:
-  # ── Streamlit Dashboard ──────────────────────────────────────────
   dashboard:
     build:
       context: .
@@ -14,13 +12,24 @@ services:
     ports:
       - "8501:8501"
     volumes:
-      - ./data:/app/data:ro          # input data (read-only)
-      - ./models:/app/models:ro       # trained models (read-only)
-      - ./output:/app/output          # generated output
-      - ./ia:/app/ia                  # AI conversation state
+      - ./src:/app/src:ro
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./output:/app/output
+      - ./ia:/app/ia
     environment:
-      - REII_DATA_DIR=/app/data/input
+      - REII_ROOT_DIR=/app
+      - REII_DATA_DIR=data
+      - REII_OUTPUT_DIR=output
+      - REII_MODELS_DIR=models
+      - REII_DB_PATH=data/analisis_gramatical.json
+      - REII_WORKFLOW_DB_PATH=data/workflow_data.json
+      - REII_BEST_PARAMS_PATH=data/best_params.json
+      - REII_DISCOURSE_STATE_PATH=data/discourse_state.json
+      - REII_GRAMMAR_CONFIG_PATH=ia/0.json
+      - REII_DISCOURSE_CONFIG_PATH=ia/1.json
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - HF_TOKEN=${HF_TOKEN:-}
     restart: unless-stopped
     command: >
       streamlit run src/reii/dashboard.py
@@ -28,7 +37,6 @@ services:
       --server.port=8501
       --server.fileWatcherType=none
 
-  # ── Batch Pipeline (run-once) ─────────────────────────────────────
   workflow:
     build:
       context: .
@@ -36,13 +44,23 @@ services:
     image: reii:latest
     container_name: reii-workflow
     volumes:
-      - ./data:/app/data:ro
-      - ./models:/app/models:ro
+      - ./src:/app/src:ro
+      - ./data:/app/data
+      - ./models:/app/models
       - ./output:/app/output
       - ./ia:/app/ia
     environment:
-      - REII_DATA_DIR=/app/data/input
+      - REII_ROOT_DIR=/app
+      - REII_DATA_DIR=data
+      - REII_OUTPUT_DIR=output
+      - REII_MODELS_DIR=models
+      - REII_DB_PATH=data/analisis_gramatical.json
+      - REII_WORKFLOW_DB_PATH=data/workflow_data.json
+      - REII_BEST_PARAMS_PATH=data/best_params.json
+      - REII_DISCOURSE_STATE_PATH=data/discourse_state.json
+      - REII_GRAMMAR_CONFIG_PATH=ia/0.json
+      - REII_DISCOURSE_CONFIG_PATH=ia/1.json
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
-    profiles: ["batch"]                       # doesn't auto-start
-    command: >
-      python src/reii/main_workflow_clasico.py
+      - HF_TOKEN=${HF_TOKEN:-}
+    profiles: ["batch"]
+    command: python src/reii/main_workflow_clasico.py

@@ -167,8 +167,11 @@ _CONFIDENCE_RANK = {"alta": 3, "media": 2, "baja": 1}
 def load_workflow_data():
     path = WORKFLOW_DB_PATH
     if not os.path.exists(path):
-        st.error(f"❌ No se encontró {path}")
-        st.stop()
+        st.warning(
+            f"⚠️ No se encontró la base de datos del workflow en `{path}`. "
+            "Ejecuta el servicio `workflow` primero o monta el archivo correcto."
+        )
+        return {}
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -184,20 +187,17 @@ def load_discourse_state():
 
 @st.cache_resource
 def load_merged_data():
-    _wf_mtime = os.path.getmtime(WORKFLOW_DB_PATH)
-    _ds_mtime = (
-        os.path.getmtime(DISCOURSE_STATE_PATH)
-        if os.path.exists(DISCOURSE_STATE_PATH)
-        else 0
-    )
     wf = load_workflow_data()
+    if not wf:
+        return {}
+
     disc = load_discourse_state()
     annotations_by_uce = disc.get("annotations_by_uce", {})
 
     if annotations_by_uce:
         # Normalize legacy format: some annotations use flat fields instead of spans[]
         for uce in wf.get("uces", []):
-            raw_anns = annotations_by_uce.get(uce["id"], [])
+            raw_anns = annotations_by_uce.get(uce.get("id"), [])
             normalized = []
             for ann in raw_anns:
                 # Legacy: single uce_id + quote → wrap in spans[]
@@ -221,6 +221,15 @@ def load_merged_data():
 
 data = load_merged_data()
 uces = data.get("uces", [])
+
+if not uces:
+    st.title("ALCESTE · Dashboard")
+    st.info(
+        "No hay datos del workflow disponibles todavía. "
+        "Ejecuta primero el servicio `workflow` o monta un `data/workflow_data.json` válido."
+    )
+    st.caption(f"Ruta esperada dentro del contenedor: `{WORKFLOW_DB_PATH}`")
+    st.stop()
 
 
 @st.cache_data(show_spinner=False)
@@ -8769,7 +8778,7 @@ def render_paragraph_card(
             f"{''.join(html_parts)}</div>"
             f"{js_script}"
         )
-        st.components.v1.html(
+        st.iframe(
             final_html,
             height=max(300, len(par_uces) * 110),
             scrolling=True,
@@ -11043,7 +11052,7 @@ with tab_c:
                         </div>"""
                     cards_html += "</div></div>"
                 cards_html += "</div>"
-                st.components.v1.html(cards_html, height=400, scrolling=True)
+                st.iframe(cards_html, height=400, scrolling=True)
 
                 with st.sidebar:
                     if st.button("🔄 Recargar datos discursivos"):
@@ -11268,7 +11277,7 @@ with tab_c:
                             }}, 300);
                         </script>
                         '''
-                st.components.v1.html(doc_html, height=620)
+                st.iframe(doc_html, height=620)
 
         _sec_rule("Síntesis discursiva")
         if str(cur_c) in sintesis_por_clase:

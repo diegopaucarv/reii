@@ -16,6 +16,12 @@ env/
 
 # ── Output files (generated) ────────────────────────────────────────
 output/
+global_dashboard.json
+global_lexical.json
+global_lexical.xlsx
+red_semantica.gexf
+history_log.txt
+data/*.json
 *.ipynb_checkpoints/
 
 # ── Logs & temp ─────────────────────────────────────────────────────
@@ -44,3 +50,13 @@ notebooks/.ipynb_checkpoints/
 .env
 .env.local
 .env.*.local
+
+# ── Docker build allow-list ───────────────────────────────────────────
+# The project filesystem has generated entries Docker cannot stat. The image
+# only needs these files; runtime data and models are mounted by Compose.
+*
+!Dockerfile
+!requirements.txt
+!pyproject.toml
+!src/
+!src/**

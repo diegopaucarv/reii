@@ -14,12 +14,6 @@ authors = [{ name = "REII Team" }]
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[project.scripts]
-reii-dashboard = "reii.dashboard:main"
-reii-workflow = "reii.main_workflow:main"
-reii-workflow-clasico = "reii.main_workflow_clasico:main"
-reii-discourse = "reii.ia_discursiva:main"
-
 [tool.setuptools.package-data]
 reii = ["**/*.joblib", "**/*.json"]
 
