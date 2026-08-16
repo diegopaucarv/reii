@@ -18,7 +18,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 from scipy.signal import savgol_filter
-from scipy.stats import pearsonr
+from scipy.stats import fisher_exact, pearsonr
 from sklearn.preprocessing import LabelEncoder
 
 from reii.config import CORPUS_NAME, DISCOURSE_STATE_PATH, WORKFLOW_DB_PATH
@@ -556,6 +556,23 @@ classified_uces = sum(
 )
 classification_rate = (classified_uces / total_uces * 100) if total_uces else 0
 vocabulary_richness = (analyzed_forms / unique_forms * 100) if unique_forms else 0
+
+# ── Indicadores léxicos de Reinert ─────────────────────────────────────
+# TTR (Type-Token Ratio): formas distintas / ocurrencias totales.
+# Reinert considera aceptable un rango ~9%–20%.
+ttr = (unique_forms / total_forms * 100) if total_forms else 0.0
+# Porcentaje de hápax sobre formas distintas (umbral de Reinert: >= 50%).
+hapax_pct = (hapax / unique_forms * 100) if unique_forms else 0.0
+# Pendiente de la curva de Zipf (parámetro a): regresión log(freq) ~ log(rango).
+_freqs = np.array(sorted(Counter(all_lemmas).values(), reverse=True))
+if len(_freqs) >= 2:
+    _ranks = np.arange(1, len(_freqs) + 1)
+    zipf_slope = float(np.polyfit(np.log(_ranks), np.log(_freqs), 1)[0])
+else:
+    zipf_slope = 0.0
+# Coeficiente de contingencia de solapamiento (CTEST) de Reinert.
+ctest = config.get("ctest_threshold", 0.3)
+use_ctest = config.get("use_ctest", False)
 
 expl_inertia = proyeccion.get("explained_inertia", [0, 0])
 axis1 = expl_inertia[0] * 100 if expl_inertia else 0
@@ -1262,7 +1279,7 @@ with hdr_col:
       <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-low);
                   letter-spacing:.04em">
         Clasificación doble (121) · {clustering_method} ·
-        min_forms={min_forms_uc} · tsj={tsj} · {fecha}
+        min_forms={min_forms_uc} · tsj={tsj} · ctest={ctest}{'' if use_ctest else ' (off)'} · {fecha}
       </div>
     </div>
     """,
@@ -1291,9 +1308,29 @@ STATS = [
     (str(analyzed_forms), "formas analizadas"),
     (str(unique_forms), "formas distintas"),
     (str(hapax), "hapax"),
-    (f"{vocabulary_richness:.1f}%", "riqueza vocab."),
+    (f"{vocabulary_richness:.1f}%", "cobertura vocab."),
 ]
 for col, (val, lbl) in zip(cols_stat, STATS):
+    with col:
+        st.metric(label=lbl, value=val)
+
+# ── Indicadores léxicos de Reinert ─────────────────────────────────────
+st.markdown(
+    "<div style='font-family:var(--font-mono);font-size:10px;letter-spacing:.14em;"
+    "color:var(--accent);text-transform:uppercase;margin:6px 0 2px'>"
+    "Indicadores léxicos (Reinert)</div>",
+    unsafe_allow_html=True,
+)
+cols_lex = st.columns(6)
+LEX_STATS = [
+    (f"{ttr:.1f}%", "TTR (9–20%)"),
+    (f"{hapax_pct:.1f}%", "hápax % (≥50%)"),
+    (f"{zipf_slope:.2f}", "pendiente Zipf (a)"),
+    (str(ctest), "CTEST"),
+    ("activo" if use_ctest else "inactivo", "CTEST aplicado"),
+    (f"{classification_rate:.1f}%", "cobertura UCEs"),
+]
+for col, (val, lbl) in zip(cols_lex, LEX_STATS):
     with col:
         st.metric(label=lbl, value=val)
 
@@ -1595,6 +1632,203 @@ if not class_list:
         unsafe_allow_html=True,
     )
     st.stop()
+
+def _document_label(uce: Dict) -> str:
+    """Return a stable, readable label for a document represented by a UCE."""
+    doc_id = uce.get("doc_id", "")
+    origin = _uce_meta(uce).get("origen")
+    if origin:
+        return f"{doc_id} · {origin}"
+    return f"Documento {doc_id}"
+
+
+def _fdr_bh(p_values: List[float]) -> np.ndarray:
+    """Benjamini-Hochberg adjusted p-values without an extra dependency."""
+    if not p_values:
+        return np.array([])
+    values = np.asarray(p_values, dtype=float)
+    order = np.argsort(values)
+    ranked = values[order] * len(values) / np.arange(1, len(values) + 1)
+    ranked = np.minimum.accumulate(ranked[::-1])[::-1]
+    adjusted = np.empty_like(ranked)
+    adjusted[order] = np.clip(ranked, 0, 1)
+    return adjusted
+
+
+def _significance_style(direction: str) -> str:
+    """Return a theme-aware cell style for a significant enrichment/depletion."""
+    if direction == "over":
+        return (
+            "background-color:#164b35;color:#e6ffed;font-weight:700"
+            if _dm
+            else "background-color:#dff5e7;color:#0e5b35;font-weight:700"
+        )
+    return (
+        "background-color:#5a2228;color:#ffe7e9;font-weight:700"
+        if _dm
+        else "background-color:#fde2e4;color:#922a35;font-weight:700"
+    )
+
+
+def _styled_crosstab(table: pd.DataFrame, cell_styles: Dict[Tuple[int, str], str]):
+    """Apply per-cell styles while keeping identifier and total columns neutral."""
+    if not cell_styles:
+        return table
+    styles = pd.DataFrame("", index=table.index, columns=table.columns)
+    for (row_idx, column), style in cell_styles.items():
+        if row_idx in styles.index and column in styles.columns:
+            styles.loc[row_idx, column] = style
+    return table.style.apply(lambda _: styles, axis=None)
+
+
+def _document_class_crosstab() -> tuple[pd.DataFrame, Dict[Tuple[int, str], str], Dict]:
+    """Count classified UCEs by document/class and test valid contingency cells."""
+    records = []
+    labels: Dict[str, str] = {}
+    doc_order = []
+
+    for uce in uces:
+        doc_key = str(uce.get("doc_id", ""))
+        if doc_key not in labels:
+            labels[doc_key] = _document_label(uce)
+            doc_order.append(doc_key)
+
+        cluster_id = uce.get("cluster_id")
+        if cluster_id is not None and cluster_id >= 0:
+            records.append({"doc_key": doc_key, "cluster_id": cluster_id})
+
+    if not records:
+        return pd.DataFrame(), {}, {"valid": False, "reason": "Sin UCEs clasificadas."}
+
+    counts = pd.crosstab(
+        pd.Series([row["doc_key"] for row in records], name="doc_key"),
+        pd.Series([row["cluster_id"] for row in records], name="cluster_id"),
+    ).reindex(index=doc_order, columns=class_list, fill_value=0)
+
+    # The 30 × 7 table is sparse, so per-cell Fisher exact tests are more reliable
+    # than chi-square residuals. Each cell compares one document against all others.
+    min_class_frequency = 5
+    min_doc_uces = 5
+    total_uces_classified = int(counts.to_numpy().sum())
+    class_totals = counts.sum(axis=0)
+    p_values: List[float] = []
+    test_cells: List[Tuple[int, int, float]] = []
+    for row_idx, doc_key in enumerate(counts.index):
+        doc_total = int(counts.loc[doc_key].sum())
+        if doc_total < min_doc_uces:
+            continue
+        for cluster_id in counts.columns:
+            class_total = int(class_totals.loc[cluster_id])
+            if class_total < min_class_frequency:
+                continue
+            observed = int(counts.loc[doc_key, cluster_id])
+            outside_doc = doc_total - observed
+            outside_class = class_total - observed
+            neither = (total_uces_classified - doc_total) - outside_class
+            if min(outside_doc, outside_class, neither) < 0:
+                continue
+            _, p_value = fisher_exact([[observed, outside_doc], [outside_class, neither]])
+            rest_rate = outside_class / (total_uces_classified - doc_total)
+            direction = 1.0 if observed / doc_total > rest_rate else -1.0
+            p_values.append(p_value)
+            test_cells.append((row_idx, cluster_id, direction))
+
+    cell_styles: Dict[Tuple[int, str], str] = {}
+    adjusted_p = _fdr_bh(p_values)
+    for (row_idx, cluster_id, direction), q_value in zip(test_cells, adjusted_p):
+        if q_value < 0.05:
+            cell_styles[(row_idx, f"Clase {cluster_id}")] = _significance_style(
+                "over" if direction > 0 else "under"
+            )
+    details: Dict[str, Any] = {
+        "valid": bool(test_cells),
+        "tested_cells": len(test_cells),
+        "significant_cells": len(cell_styles),
+        "min_class_frequency": min_class_frequency,
+        "min_doc_uces": min_doc_uces,
+    }
+
+    display = counts.copy()
+    display.columns = [f"Clase {cluster_id}" for cluster_id in display.columns]
+    display.insert(0, "Documento", [labels[doc_key] for doc_key in display.index])
+    display["Total UCEs"] = display.drop(columns="Documento").sum(axis=1)
+    return display.reset_index(drop=True), cell_styles, details
+
+
+def _document_form_crosstab(top_n: int) -> tuple[pd.DataFrame, Dict[Tuple[int, str], str], Dict, int]:
+    """Count forms by document and use exact, FDR-corrected enrichment tests."""
+    records = []
+    labels: Dict[str, str] = {}
+    doc_order = []
+
+    for uce in uces:
+        doc_key = str(uce.get("doc_id", ""))
+        if doc_key not in labels:
+            labels[doc_key] = _document_label(uce)
+            doc_order.append(doc_key)
+
+        for token in uce.get("formas_tokens", []):
+            form = token.get("forma", "") if isinstance(token, dict) else str(token)
+            form = form.strip().casefold()
+            if form:
+                records.append({"doc_key": doc_key, "forma": form})
+
+    if not records:
+        return pd.DataFrame(), {}, {"valid": False}, 0
+
+    forms_df = pd.DataFrame(records)
+    global_counts = forms_df["forma"].value_counts()
+    selected_forms = global_counts.head(top_n).index.tolist()
+    counts = pd.crosstab(forms_df["doc_key"], forms_df["forma"]).reindex(
+        index=doc_order, columns=selected_forms, fill_value=0
+    )
+    doc_totals = forms_df.groupby("doc_key").size().reindex(doc_order, fill_value=0)
+
+    # Fisher's exact test is appropriate for sparse word-form counts. To avoid unstable
+    # inference on extremely rare forms, only forms occurring at least 5 times are tested.
+    min_form_frequency = 5
+    min_doc_forms = 20
+    total_forms = len(forms_df)
+    p_values: List[float] = []
+    test_cells: List[Tuple[int, str, float]] = []
+    for row_idx, doc_key in enumerate(doc_order):
+        doc_total = int(doc_totals.loc[doc_key])
+        if doc_total < min_doc_forms:
+            continue
+        for form in selected_forms:
+            form_total = int(global_counts.loc[form])
+            if form_total < min_form_frequency:
+                continue
+            observed = int(counts.loc[doc_key, form])
+            outside_doc = doc_total - observed
+            outside_form = form_total - observed
+            neither = (total_forms - doc_total) - outside_form
+            if min(outside_doc, outside_form, neither) < 0:
+                continue
+            _, p_value = fisher_exact([[observed, outside_doc], [outside_form, neither]])
+            rest_rate = outside_form / (total_forms - doc_total)
+            direction = 1.0 if observed / doc_total > rest_rate else -1.0
+            p_values.append(p_value)
+            test_cells.append((row_idx, form, direction))
+
+    cell_styles: Dict[Tuple[int, str], str] = {}
+    adjusted_p = _fdr_bh(p_values)
+    for (row_idx, form, direction), q_value in zip(test_cells, adjusted_p):
+        if q_value < 0.05:
+            cell_styles[(row_idx, form)] = _significance_style("over" if direction > 0 else "under")
+
+    display = counts.copy()
+    display.insert(0, "Documento", [labels[doc_key] for doc_key in display.index])
+    display["Total formas"] = doc_totals.to_numpy()
+    details = {
+        "valid": bool(test_cells),
+        "tested_cells": len(test_cells),
+        "significant_cells": len(cell_styles),
+        "min_form_frequency": min_form_frequency,
+        "min_doc_forms": min_doc_forms,
+    }
+    return display.reset_index(drop=True), cell_styles, details, len(global_counts)
+
 
 if "selected_classes" not in st.session_state:
     st.session_state.selected_classes = class_list.copy()
@@ -2342,8 +2576,95 @@ def make_scree_plot(_dm_key: bool):
     return fig
 
 
+def _uce_afc_terms(uce: Dict) -> List[str]:
+    """Reconstruct the binary AFC vocabulary terms for a UCE, mirroring MatrizBuilder."""
+    terms = set(uce.get("stems", []) or [])
+    for bigram in uce.get("bigram_stems", []) or []:
+        if isinstance(bigram, (list, tuple)):
+            terms.add("_".join(bigram))
+        elif bigram:
+            terms.add(str(bigram))
+    for trigram in uce.get("trigram_stems", []) or []:
+        if isinstance(trigram, (list, tuple)):
+            terms.add("_".join(trigram))
+        elif trigram:
+            terms.add(str(trigram))
+    return list(terms)
+
+
+def _document_afc_projection() -> List[Dict]:
+    """Project each document as a supplementary row onto the AFC axes.
+
+    Uses the same formula the pipeline applies to individual UCEs: the document
+    profile (binary term presence aggregated over its UCEs) is projected with
+    the column mass and the unit eigenvectors recovered from col_coords.
+    """
+    voc = proyeccion.get("voc", [])
+    col_coords = proyeccion.get("col_coords", [])
+    singular_values = proyeccion.get("singular_values", [])
+    if not voc or not col_coords or len(singular_values) < 2:
+        return []
+
+    voc_index = {term: i for i, term in enumerate(voc)}
+    col_arr = np.array(col_coords, dtype=float)
+    if col_arr.ndim < 2 or col_arr.shape[1] < 2:
+        return []
+    sv = np.array(singular_values[:2], dtype=float)
+
+    # Column marginals from the class table (same as the pipeline's col_mass).
+    col_sums = np.zeros(len(voc), dtype=float)
+    for uce in uces:
+        for term in _uce_afc_terms(uce):
+            idx = voc_index.get(term)
+            if idx is not None:
+                col_sums[idx] += 1.0
+    col_sums = np.where(col_sums == 0, 1.0, col_sums)
+    col_mass = col_sums / col_sums.sum()
+    sqrt_c = np.sqrt(col_mass)
+    V_unit = (col_arr * sqrt_c[:, np.newaxis]) / sv  # (n_terms, n_factors)
+
+    # Aggregate binary term presence per document.
+    doc_terms: Dict[str, set] = {}
+    doc_labels: Dict[str, str] = {}
+    doc_order: List[str] = []
+    for uce in uces:
+        doc_key = str(uce.get("doc_id", ""))
+        if doc_key not in doc_terms:
+            doc_terms[doc_key] = set()
+            doc_labels[doc_key] = _document_label(uce)
+            doc_order.append(doc_key)
+        doc_terms[doc_key].update(_uce_afc_terms(uce))
+
+    projections = []
+    for doc_key in doc_order:
+        profile = np.zeros(len(voc), dtype=float)
+        for term in doc_terms[doc_key]:
+            idx = voc_index.get(term)
+            if idx is not None:
+                profile[idx] = 1.0
+        row_sum = profile.sum()
+        if row_sum <= 0:
+            continue
+        row_profile = profile / row_sum
+        diff = row_profile - col_mass
+        coord = (diff / sqrt_c) @ V_unit
+        projections.append(
+            {
+                "doc_key": doc_key,
+                "label": doc_labels[doc_key],
+                "f1": float(coord[0]),
+                "f2": float(coord[1]),
+            }
+        )
+    return projections
+
+
 def make_afc_biplot(
-    _selected_classes_key: tuple, view_mode: str, _dm_key: bool, show_ucs: bool = False
+    _selected_classes_key: tuple,
+    view_mode: str,
+    _dm_key: bool,
+    show_ucs: bool = False,
+    show_documents: bool = False,
 ):
     selected_classes = list(_selected_classes_key)
     if not proyeccion:
@@ -2565,6 +2886,31 @@ def make_afc_biplot(
                     marker=dict(size=3, color=col, opacity=0.2),
                     hovertemplate=f"Clase {cid}  F1:{coord[0]:.3f} F2:{coord[1]:.3f}<extra></extra>",
                     showlegend=False,
+                )
+            )
+    if show_documents:
+        doc_proj = _document_afc_projection()
+        for proj in doc_proj:
+            fig.add_trace(
+                go.Scatter(
+                    x=[proj["f1"]],
+                    y=[proj["f2"]],
+                    mode="markers+text",
+                    text=[proj["label"]],
+                    textposition="bottom center",
+                    textfont=dict(size=8, color=T["text_mid"]),
+                    marker=dict(
+                        size=7,
+                        color=T["accent"],
+                        symbol="square",
+                        opacity=0.85,
+                        line=dict(width=1, color=T["bg_page"]),
+                    ),
+                    name="Documentos",
+                    hovertemplate=(
+                        f"<b>{proj['label']}</b><br>F1: {proj['f1']:.3f}<br>F2: {proj['f2']:.3f}<extra></extra>"
+                    ),
+                    showlegend=True,
                 )
             )
     if show_circle:
@@ -8781,7 +9127,6 @@ def render_paragraph_card(
         st.iframe(
             final_html,
             height=max(300, len(par_uces) * 110),
-            scrolling=True,
         )
 
 
@@ -10463,11 +10808,15 @@ with tab_b:
             show_uc_proj = st.checkbox(
                 "Proyectar UCs individuales", False, key="afc_show_ucs"
             )
+            show_doc_proj = st.checkbox(
+                "Proyectar documentos", False, key="afc_show_documents"
+            )
         afc_fig = make_afc_biplot(
             tuple(selected_classes),
             view_mode=afc_view,
             _dm_key=_dm,
             show_ucs=show_uc_proj,
+            show_documents=show_doc_proj,
         )
         if afc_fig:
             st.plotly_chart(afc_fig, width="stretch", config={"displayModeBar": True})
@@ -11052,7 +11401,7 @@ with tab_c:
                         </div>"""
                     cards_html += "</div></div>"
                 cards_html += "</div>"
-                st.iframe(cards_html, height=400, scrolling=True)
+                st.iframe(cards_html, height=400)
 
                 with st.sidebar:
                     if st.button("🔄 Recargar datos discursivos"):
@@ -11683,6 +12032,71 @@ with tab_d:
             ),
             unsafe_allow_html=True,
         )
+
+        _sec_rule("Documentos × clases · UCEs clasificadas")
+        st.caption(
+            "Cada celda cuenta las UCEs clasificadas de un documento que pertenecen a cada clase."
+        )
+        document_class_table, class_cell_styles, class_test = _document_class_crosstab()
+        if document_class_table.empty:
+            st.info("No hay UCEs clasificadas para construir la tabla.")
+        else:
+            if class_test.get("valid"):
+                st.caption(
+                    "Verde = sobrerrepresentación y rojo = subrepresentación significativa "
+                    "(Fisher exacto frente al resto del corpus, q < 0.05 con corrección FDR)."
+                )
+            else:
+                st.caption("Sin color inferencial: no hay celdas con tamaño muestral suficiente para probar.")
+            st.dataframe(
+                _styled_crosstab(document_class_table, class_cell_styles),
+                hide_index=True,
+                width="stretch",
+                height=min(460, 90 + len(document_class_table) * 35),
+            )
+            if class_test.get("valid"):
+                st.caption(
+                    f"{class_test['significant_cells']} de {class_test['tested_cells']} comparaciones exactas significativas. "
+                    f"No se prueban clases con menos de {class_test['min_class_frequency']} UCEs globales "
+                    f"ni documentos con menos de {class_test['min_doc_uces']} UCEs clasificadas."
+                )
+
+        _sec_rule("Formas léxicas × documentos")
+        top_forms = st.slider(
+            "Formas más frecuentes a mostrar",
+            min_value=10,
+            max_value=100,
+            value=30,
+            step=5,
+            key="td_document_form_limit",
+        )
+        document_form_table, form_cell_styles, form_test, total_unique_forms = _document_form_crosstab(top_forms)
+        st.caption(
+            "Frecuencia de formas léxicas (`formas_tokens`) por documento. "
+            f"Mostrando las {min(top_forms, total_unique_forms)} más frecuentes de {total_unique_forms:,}."
+        )
+        if document_form_table.empty:
+            st.info("No hay formas léxicas para construir la tabla.")
+        else:
+            if form_test.get("valid"):
+                st.caption(
+                    "Verde = forma significativamente enriquecida en el documento; rojo = deplecionada "
+                    "(Fisher exacto frente al resto del corpus, q < 0.05 con corrección FDR)."
+                )
+            else:
+                st.caption("Sin color inferencial: no hay celdas con tamaño muestral suficiente para probar.")
+            st.dataframe(
+                _styled_crosstab(document_form_table, form_cell_styles),
+                hide_index=True,
+                width="stretch",
+                height=min(520, 90 + len(document_form_table) * 35),
+            )
+            if form_test.get("valid"):
+                st.caption(
+                    f"{form_test['significant_cells']} de {form_test['tested_cells']} comparaciones exactas significativas. "
+                    f"No se prueban formas con menos de {form_test['min_form_frequency']} ocurrencias globales "
+                    f"ni documentos con menos de {form_test['min_doc_forms']} formas léxicas."
+                )
     with ec4:
         _sec_rule("CAH Global · estructura léxica AFC")
         gcah_fig = make_global_cah_dendrogram(_dm)

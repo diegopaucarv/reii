@@ -882,6 +882,15 @@ class SubtlexAnalyzer:
             df_raw.iloc[header_row_idx].fillna("").astype(str).str.strip().str.lower()
         )
 
+        def normalized_header(value: str) -> str:
+            return re.sub(r"[\s_-]+", "", value)
+
+        cd_header_names = {
+            "cd",
+            "contextualdiversity",
+            "contextdiversity",
+        }
+
         # 3. Find ALL instances of the "word" column to handle the side-by-side layout
         word_col_indices = [i for i, val in enumerate(headers) if val == "word"]
 
@@ -893,10 +902,23 @@ class SubtlexAnalyzer:
         # Now header_row_idx + 1 works perfectly because the type checker knows it's an int
         data_rows = df_raw.iloc[header_row_idx + 1 :].copy()
         # 4. Loop through each set of columns
-        for word_col in word_col_indices:
+        for word_col_idx, word_col in enumerate(word_col_indices):
             col_freqcount = word_col + 1
             col_subtlwf = word_col + 2
             col_logfreq = word_col + 3
+            next_word_col = (
+                word_col_indices[word_col_idx + 1]
+                if word_col_idx + 1 < len(word_col_indices)
+                else len(headers)
+            )
+            col_cd = next(
+                (
+                    i
+                    for i in range(word_col + 1, next_word_col)
+                    if normalized_header(headers.iloc[i]) in cd_header_names
+                ),
+                None,
+            )
 
             # Ensure we don't go out of bounds if the file is malformed
             if col_logfreq >= len(df_raw.columns):
@@ -926,10 +948,20 @@ class SubtlexAnalyzer:
                 except (ValueError, TypeError):
                     freqcount = 0.0
 
+                cd = self.OOV_CD
+                if col_cd is not None:
+                    try:
+                        cd = float(row[col_cd])
+                        # Some SUBTLEX exports store CD as a percentage.
+                        if 1.0 < cd <= 100.0:
+                            cd /= 100.0
+                    except (ValueError, TypeError):
+                        pass
+
                 self._data[word] = {
                     "subtlwf": subtlwf,
                     "zipf": zipf_val,
-                    "cd": getattr(self, "OOV_CD", 0.0),
+                    "cd": cd,
                     "freqcount": freqcount,
                 }
 

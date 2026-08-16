@@ -3387,7 +3387,9 @@ class WorkflowOrchestrator:
                     )
                     s["n_rarezas"] += len(getattr(uce, "rarezas", []))
                     s["n_subj"] += sum(
-                        1 for v in getattr(uce, "verbos", []) if v.get("modo") == "Subj"
+                        1
+                        for v in getattr(uce, "verbos", [])
+                        if v.get("modo") in {"Sub", "Subj"}
                     )
 
                     # Métricas léxicas y sintácticas (sumas)

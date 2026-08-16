@@ -6152,7 +6152,9 @@ class WorkflowOrchestrator:
             s["n_insubordinaciones"] += len(getattr(uce, "insubordinaciones", []))
             s["n_rarezas"] += len(getattr(uce, "rarezas", []))
             s["n_subj"] += sum(
-                1 for v in getattr(uce, "verbos", []) if v.get("modo") == "Subj"
+                1
+                for v in getattr(uce, "verbos", [])
+                if v.get("modo") in {"Sub", "Subj"}
             )
 
             s["sum_ttr"] += uce.metricas_lexicas.get("ttr", 0.0)

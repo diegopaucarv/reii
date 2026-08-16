@@ -1267,28 +1267,38 @@ def get_insubordination_function(conjunction_text: str) -> str:
     )
 
 
+def _dep_base(token: Any) -> str:
+    """Return the UD dependency family, ignoring an optional subtype."""
+    return token.dep_.split(":", 1)[0]
+
+
+def _is_se_clitic(token: Any) -> bool:
+    return token.lemma_.lower() == "se" and token.pos_ == "PRON"
+
+
 def es_pasiva_refleja(verbo_token: Any) -> bool:
     """
     Detecta pasiva refleja: 'se' + verbo transitivo en 3ª persona,
-    con sujeto paciente (explícito o implícito). Ej: 'Se venden casas'.
+    con sujeto paciente explícito. Ej: 'Se venden casas'.
     """
     if verbo_token.pos_ != "VERB":
         return False
-    # Debe tener un hijo 'se' con dep_ 'obj' o 'expl'
+    # UD parsers may emit expl:pv rather than expl, so compare dependency families.
+    # Require the expletive family (expl / expl:pv / expl:pass): a true reflexive
+    # "se" is tagged obj, which would otherwise be a false passive-reflexive
+    # (e.g. "Ella se lava" = she washes herself, not a passive).
     tiene_se = any(
-        c.lemma_ == "se" and c.pos_ == "PRON" and c.dep_ in ("obj", "expl")
+        _is_se_clitic(c) and _dep_base(c) == "expl"
         for c in verbo_token.children
     )
     if not tiene_se:
         return False
-    # Verbo en 3ª persona (singular o plural)
     persona = verbo_token.morph.get("Person")
     if not persona or persona[0] != "3":
         return False
-    # Debe ser transitivo (tener objeto directo) o tener sujeto paciente (nsubj:pass)
-    tiene_objeto = any(c.dep_ == "obj" for c in verbo_token.children)
-    tiene_sujeto_pasivo = any(c.dep_ == "nsubj:pass" for c in verbo_token.children)
-    return tiene_objeto or tiene_sujeto_pasivo
+    # In Spanish UD, the patient of a reflexive passive is normally nsubj,
+    # not nsubj:pass (e.g. 'Se venden casas').
+    return any(_dep_base(c) == "nsubj" for c in verbo_token.children)
 
 
 def es_impersonal_se(verbo_token: Any) -> bool:
@@ -1307,10 +1317,9 @@ def es_impersonal_se(verbo_token: Any) -> bool:
     tiene_sujeto = any("subj" in c.dep_ for c in verbo_token.children)
     if tiene_sujeto:
         return False
-    # Debe tener un hijo 'se' con dep_ 'expl' (expletivo)
+    # Match expletive dependency subtypes too (e.g. expl:pv).
     tiene_se = any(
-        c.lemma_ == "se" and c.pos_ == "PRON" and c.dep_ == "expl"
-        for c in verbo_token.children
+        _is_se_clitic(c) and _dep_base(c) == "expl" for c in verbo_token.children
     )
     return tiene_se
 
@@ -1322,9 +1331,9 @@ def es_media_se(verbo_token: Any) -> bool:
     """
     if verbo_token.pos_ != "VERB":
         return False
-    # Debe tener un hijo 'se' con dep_ 'obj' o 'expl'
+    # Match UD dependency families so expl:pv is recognized as expletive.
     tiene_se = any(
-        c.lemma_ == "se" and c.pos_ == "PRON" and c.dep_ in ("obj", "expl")
+        _is_se_clitic(c) and _dep_base(c) in ("obj", "expl")
         for c in verbo_token.children
     )
     if not tiene_se:
