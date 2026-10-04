@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <script src="https://cdn.jsdelivr.net/npm/streamlit-component-lib/dist/streamlit-component-lib.js"></script>
+</head>
+<body style="margin:0">
+  <div id="root"></div>
+  <script>
+    // Called by the onclick="sendToPython(...)" handlers embedded in the HTML.
+    function sendToPython(tabName, filtersJsonStr) {
+      let filters = {};
+      try {
+        filters = JSON.parse(filtersJsonStr.replace(/&quot;/g, '"'));
+      } catch (e) {
+        filters = {};
+      }
+      Streamlit.setComponentValue({
+        tab: tabName,
+        filters: filters,
+        ts: Date.now()
+      });
+    }
+
+    function onRender(event) {
+      const args = event.detail.args;
+      const html = (args && args.html) || "";
+      document.getElementById('root').innerHTML = html;
+      // Re-fit the iframe height once the content (and fonts) settle.
+      Streamlit.setFrameHeight();
+      setTimeout(function () { Streamlit.setFrameHeight(); }, 100);
+      setTimeout(function () { Streamlit.setFrameHeight(); }, 300);
+    }
+
+    Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, onRender);
+    Streamlit.setComponentReady();
+  </script>
+</body>
+</html>

@@ -21,6 +21,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 from scipy.signal import savgol_filter
 from scipy.stats import fisher_exact, pearsonr
@@ -36,6 +37,28 @@ from reii.config import (
     TRANSCRIPTS_DIR,
     WORKFLOW_CONFIG_PATH,
     WORKFLOW_DB_PATH,
+)
+from reii.ia_config_editor import (
+    AGENT_TEMPLATE,
+    list_discourse_agent_names,
+    list_inactive_agent_files,
+    load_discourse_config,
+    load_grammar_config,
+    parse_json_text,
+    parse_list_text,
+    save_discourse_config,
+    save_grammar_config,
+    to_json_text,
+    to_list_text,
+)
+
+# ── Componente personalizado: tarjeta de párrafo clicable ─────────────
+# Renderiza el HTML anotado en su propio iframe y devuelve a Python los
+# clics sobre tokens vía Streamlit.setComponentValue (funciona en iframes
+# sandboxed, a diferencia de tocar el DOM del padre).
+_ANNOTATED_CARD = components.declare_component(
+    "annotated_card",
+    path=os.path.join(os.path.dirname(__file__), "components", "annotated_card"),
 )
 
 st.set_page_config(
@@ -197,6 +220,101 @@ def _discourse_runner(
     finally:
         state["running"] = False
         state["finished"] = True
+
+
+import re as _re
+
+
+def _sanitize_key(name: str) -> str:
+    return _re.sub(r"[^0-9A-Za-z_]", "_", name) or "agent"
+
+
+def _save_grammar_from_widgets() -> None:
+    ok_schema, schema, err_schema = parse_json_text(
+        st.session_state.get("ia_gram_json_schema", "{}")
+    )
+    ok_fs, fs, err_fs = parse_json_text(st.session_state.get("ia_gram_few_shot", "[]"))
+    if not ok_schema:
+        st.error(f"json_schema: {err_schema}")
+        return
+    if not ok_fs:
+        st.error(f"few_shot_examples: {err_fs}")
+        return
+    data = {
+        "name": st.session_state.get("ia_gram_name", ""),
+        "role": st.session_state.get("ia_gram_role", ""),
+        "instructions": st.session_state.get("ia_gram_instructions", ""),
+        "json_schema": schema,
+        "few_shot_examples": fs,
+    }
+    save_grammar_config(data)
+    st.success("Resumidor gramatical guardado.")
+    st.rerun()
+
+
+def _save_agent_from_widgets(old_name: str) -> None:
+    k = _sanitize_key(old_name)
+    ok_schema, schema, err_schema = parse_json_text(
+        st.session_state.get(f"ia_ag_{k}_json_schema", "{}")
+    )
+    ok_fs, fs, err_fs = parse_json_text(
+        st.session_state.get(f"ia_ag_{k}_few_shot", "[]")
+    )
+    if not ok_schema:
+        st.error(f"json_schema: {err_schema}")
+        return
+    if not ok_fs:
+        st.error(f"few_shot_examples: {err_fs}")
+        return
+    new_name = st.session_state.get(f"ia_ag_{k}_name", "").strip()
+    if not new_name:
+        st.error("El nombre no puede estar vacío.")
+        return
+    agent = {
+        "name": new_name,
+        "role": st.session_state.get(f"ia_ag_{k}_role", ""),
+        "instructions": st.session_state.get(f"ia_ag_{k}_instructions", ""),
+        "json_schema": schema,
+        "few_shot_examples": fs,
+        "gram_cats": parse_list_text(st.session_state.get(f"ia_ag_{k}_gram_cats", "")),
+        "disc_cats": parse_list_text(st.session_state.get(f"ia_ag_{k}_disc_cats", "")),
+    }
+    disc = load_discourse_config()
+    if new_name != old_name and new_name in disc:
+        st.error(f"Ya existe un agente llamado `{new_name}`.")
+        return
+    if new_name != old_name:
+        disc.pop(old_name, None)
+    disc[new_name] = agent
+    save_discourse_config(disc)
+    st.success(f"Agente `{new_name}` guardado.")
+    st.rerun()
+
+
+def _delete_agent(name: str) -> None:
+    disc = load_discourse_config()
+    if name in disc:
+        disc.pop(name)
+        save_discourse_config(disc)
+        st.success(f"Agente `{name}` eliminado.")
+        st.rerun()
+
+
+def _create_agent() -> None:
+    name = st.session_state.get("ia_new_agent_name", "").strip()
+    if not name:
+        st.error("Escribe un nombre para el nuevo agente.")
+        return
+    disc = load_discourse_config()
+    if name in disc:
+        st.error(f"Ya existe un agente llamado `{name}`.")
+        return
+    agent = dict(AGENT_TEMPLATE)
+    agent["name"] = name
+    disc[name] = agent
+    save_discourse_config(disc)
+    st.success(f"Agente `{name}` creado.")
+    st.rerun()
 
 
 def render_batch_tab():
@@ -1237,6 +1355,9 @@ if len(_freqs) >= 2:
     zipf_slope = float(np.polyfit(np.log(_ranks), np.log(_freqs), 1)[0])
 else:
     zipf_slope = 0.0
+# Índice de Guiraud: formas distintas / √(ocurrencias). Menos sensible a la
+# longitud del texto que el TTR; en español los valores de referencia rondan ~7–8.
+guiraud = (unique_forms / math.sqrt(total_forms)) if total_forms else 0.0
 # Coeficiente de contingencia de solapamiento (CTEST) de Reinert.
 ctest = config.get("ctest_threshold", 0.3)
 use_ctest = config.get("use_ctest", False)
@@ -1970,14 +2091,12 @@ with toggle_col:
 cols_stat = st.columns(10)
 STATS = [
     (str(len(class_sizes)), "clases"),
-    (f"{classification_rate:.1f}%", "tasa clasif."),
     (str(len(uces)), "UCE generadas"),
     (str(classified_uces), "UCE clasificadas"),
     (str(n_ucs), "UC generadas"),
     (str(total_forms), "total formas"),
     (str(analyzed_forms), "formas analizadas"),
     (str(unique_forms), "formas distintas"),
-    (str(hapax), "hapax"),
     (f"{vocabulary_richness:.1f}%", "cobertura vocab."),
 ]
 for col, (val, lbl) in zip(cols_stat, STATS):
@@ -1991,9 +2110,10 @@ st.markdown(
     "Indicadores léxicos (Reinert)</div>",
     unsafe_allow_html=True,
 )
-cols_lex = st.columns(6)
+cols_lex = st.columns(7)
 LEX_STATS = [
     (f"{ttr:.1f}%", "TTR (9–20%)"),
+    (f"{guiraud:.2f}", "Guiraud"),
     (f"{hapax_pct:.1f}%", "hápax % (≥50%)"),
     (f"{zipf_slope:.2f}", "pendiente Zipf (a)"),
     (str(ctest), "CTEST"),
@@ -7812,7 +7932,7 @@ def _trajectory_charts(uces_all: List[Dict]) -> go.Figure:
         rows=4,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.06,
+        vertical_spacing=0.10,
         subplot_titles=[
             "Cambio temático",
             "Riqueza léxica (TTR)",
@@ -7901,7 +8021,7 @@ def _trajectory_charts(uces_all: List[Dict]) -> go.Figure:
     # FIX 2: PLOTLY_LAYOUT passed positionally so 'margin' overrides it cleanly
     fig.update_layout(
         PLOTLY_LAYOUT,
-        height=400,
+        height=600,
         showlegend=False,
         margin=dict(t=40, b=20, l=60, r=10),
         xaxis4_title="UCE",
@@ -7919,7 +8039,6 @@ def _human_label(key: str, val) -> str:
     MAP = {
         "ttr": "Riqueza léxica (TTR)",
         "guiraud": "Índice Guiraud",
-        "hapax_ratio": "Palabras únicas (%)",
         "diversidad_semantica": "Diversidad semántica",
         "topic_shift": "Cambio temático",
         "prof_sint_max": "Profundidad sintáctica",
@@ -9255,6 +9374,19 @@ def html_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _highlight_search(html: str, search: str) -> str:
+    """Envuelve en <i> las apariciones de `search` (insensible a mayúsculas),
+    solo dentro de nodos de texto para no romper el marcado de anotaciones."""
+    if not search:
+        return html
+    pattern = re.compile(r"(" + re.escape(html_escape(search)) + r")", re.IGNORECASE)
+    parts = re.split(r"(<[^>]+>)", html)
+    return "".join(
+        part if part.startswith("<") else pattern.sub(r"<i>\1</i>", part)
+        for part in parts
+    )
+
+
 def _build_onclick(tab_name: str, filters: Dict[str, Any]) -> str:
     if not filters:
         return ""
@@ -9289,6 +9421,7 @@ def render_annotated_uce(
     colors: Dict = COLORS,
     theme: Dict = T,
     cls_colors: List = class_colors,
+    search: str = "",
 ) -> str:
     texto = uce.get("texto", "")
     texto_len = len(texto)
@@ -9625,7 +9758,8 @@ def render_annotated_uce(
 
     # ── Assemble HTML ──────────────────────────────────────────────────
     if not spans:
-        return f'<span class="annotated-text">{html_escape(texto)}</span>'
+        result = f'<span class="annotated-text">{html_escape(texto)}</span>'
+        return _highlight_search(result, search) if search else result
 
     spans.sort(key=lambda x: (x[0], -(x[1] - x[0]), -x[4]))
 
@@ -9648,7 +9782,8 @@ def render_annotated_uce(
     if cursor < texto_len:
         html_parts.append(html_escape(texto[cursor:]))
 
-    return f'<span class="annotated-text">{"".join(html_parts)}</span>'
+    result = f'<span class="annotated-text">{"".join(html_parts)}</span>'
+    return _highlight_search(result, search) if search else result
 
 
 # ══════════════════════════════════════════════════════════════
@@ -9662,6 +9797,7 @@ def render_paragraph_card(
     inspect_col: str,
     active_layers: set,
     CAT_MAP: Dict,
+    search: str = "",
 ):
     is_stable = any(u.get("is_stable", False) for u in par_uces)
     matching = [u for u in par_uces if _uce_matches_subcat_filters(u)]
@@ -9724,7 +9860,7 @@ def render_paragraph_card(
                 )
                 border_style = ""
 
-            annotated_html = render_annotated_uce(uce, active_layers)
+            annotated_html = render_annotated_uce(uce, active_layers, search=search)
             html_parts.append(
                 f'<span style="{border_style}opacity:{opacity};">'
                 f"{siglum}{annotated_html}</span> "
@@ -9803,6 +9939,18 @@ def render_paragraph_card(
             f"{''.join(html_parts)}</div>"
             f"{js_script}"
         )
+        click = _ANNOTATED_CARD(
+            html=final_html,
+            key=f"card_{par_key}",
+        )
+        if click and click.get("ts") != st.session_state.get(
+            "last_card_click_ts", {}
+        ).get(f"card_{par_key}"):
+            st.session_state.setdefault("last_card_click_ts", {})[f"card_{par_key}"] = (
+                click.get("ts")
+            )
+            _set_multiple_filters(click["tab"], click["filters"])
+
         st.iframe(
             final_html,
             height=max(300, len(par_uces) * 110),
@@ -10883,6 +11031,14 @@ with tab_a:
             selected_docs = all_doc_ids_a
 
     with top_cols[1]:
+        search_query = st.text_input(
+            "Search",
+            key="tab_a_search",
+            label_visibility="collapsed",
+            placeholder="Search corpus…",
+        ).strip()
+
+    with top_cols[2]:
         LAYERS = {
             "neg": "Negación",
             "pron": "Pronombres",
@@ -11316,7 +11472,7 @@ with tab_a:
     # COLUMNA DERECHA: corpus anotado
     # ══════════════════════════════════════════════════════════
     with col_b:
-        with st.container(height=1000, border=False):
+        with st.container(height=1200, border=False):
             CAT_MAP = {
                 "verbos": "Verbos",
                 "negaciones": "Negaciones",
@@ -11391,6 +11547,13 @@ with tab_a:
             else:
                 st.session_state.pop("highlight_entity", None)
 
+            # ── Search filter: restrict to UCEs matching the query ────────
+            if search_query:
+                _sq = search_query.lower()
+                corpus_uces = [
+                    u for u in corpus_uces if _sq in (u.get("texto", "") or "").lower()
+                ]
+
             # ── Agrupación por párrafo y renderizado ─────────────────────
             def _par_key(uid: str) -> str:
                 parts = uid.split("_")
@@ -11401,7 +11564,14 @@ with tab_a:
                 corpus_uces, key=lambda u: _par_key(u.get("id", ""))
             ):
                 par_uces = list(group)
-                render_paragraph_card(pk, par_uces, inspect_col, active_layers, CAT_MAP)
+                render_paragraph_card(
+                    pk,
+                    par_uces,
+                    inspect_col,
+                    active_layers,
+                    CAT_MAP,
+                    search=search_query,
+                )
 
 
 with tab_b:
@@ -12936,7 +13106,7 @@ with tab_d:
           <div class="info-row"><span class="info-key">método</span><span class="info-val">{sh(clustering_method)}</span></div>
           <div class="info-row"><span class="info-key">vocabulario</span><span class="info-val">{analyzed_forms} términos</span></div>
           <div class="info-row"><span class="info-key">hapax</span><span class="info-val">{hapax}</span></div>
-          <div class="info-row"><span class="info-key">riqueza léxica</span><span class="info-val">{vocabulary_richness:.1f}%</span></div>
+          <div class="info-row"><span class="info-key">cobertura vocab.</span><span class="info-val">{vocabulary_richness:.1f}%</span></div>
         </div>
         """,
             unsafe_allow_html=True,
@@ -12992,77 +13162,14 @@ with tab_e:
     ds_state = st.session_state.discourse_state
     ds_log = st.session_state.discourse_log
 
-    _AGENT_OPTIONS = {
-        "Todos los agentes": None,
-        "Ontológico-Cognitivo": "Ontológico-Cognitivo",
-        "Diversidades_epistémicas": "Diversidades_epistémicas",
-        "Performativo-Narrativo": "Performativo-Narrativo",
-    }
+    _agent_names = list_discourse_agent_names()
+    _agent_options = ["Todos los agentes"] + _agent_names
 
-    with st.container(border=True):
-        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
-        with c1:
-            agent_label = st.selectbox(
-                "Agente de discurso",
-                list(_AGENT_OPTIONS.keys()),
-                index=0,
-                key="reii_disc_agent",
-            )
-        with c2:
-            store = st.checkbox("Guardar estado", value=True, key="reii_disc_store")
-        with c3:
-            workflow = (
-                st.text_input(
-                    "Etiqueta workflow (opcional)",
-                    value="",
-                    key="reii_disc_workflow",
-                )
-                or None
-            )
-        with c4:
-            run_clicked = st.button(
-                "▶ Ejecutar" if not ds_state["finished"] else "▶ Volver a ejecutar",
-                key="reii_disc_run",
-                disabled=ds_state["running"],
-                width="stretch",
-            )
+    if st.session_state.get("reii_disc_agent") not in _agent_options:
+        st.session_state["reii_disc_agent"] = _agent_options[0]
 
-    if run_clicked:
-        if not os.path.exists(GRAMMAR_CONFIG_PATH) or not os.path.exists(
-            DISCOURSE_CONFIG_PATH
-        ):
-            st.error(
-                "Falta el archivo de configuración del agente de discurso "
-                f"(`{GRAMMAR_CONFIG_PATH}` o `{DISCOURSE_CONFIG_PATH}`). "
-                "No se puede ejecutar el análisis."
-            )
-        else:
-            st.session_state.discourse_log = []
-            ds_state["running"] = True
-            ds_state["finished"] = False
-            ds_state["exit_code"] = None
-            ds_state["refreshed"] = False
-            threading.Thread(
-                target=_discourse_runner,
-                args=(
-                    st.session_state.discourse_log,
-                    ds_state,
-                    _AGENT_OPTIONS[agent_label],
-                    store,
-                    workflow,
-                ),
-                daemon=True,
-            ).start()
-            st.rerun()
-
-    if ds_state["running"]:
-        st.info("⏳ Ejecutando el análisis de discurso… (puede tardar varios minutos)")
-        with st.expander(f"📋 Log del análisis ({len(ds_log)} líneas)", expanded=True):
-            if ds_log:
-                st.code("\n".join(ds_log[-300:]))
-            else:
-                st.caption("Iniciando…")
-    elif ds_state["finished"]:
+    if ds_state["finished"]:
+        # ── AFTER VIEW ──────────────────────────────────────────────
         if ds_state["exit_code"] == 0:
             st.success("✅ Análisis de discurso completado.")
             with st.expander(
@@ -13083,10 +13190,184 @@ with tab_e:
             ):
                 st.code("\n".join(ds_log[-300:]))
 
-    # ── Polling: mientras el análisis corre, re-renderiza cada 2s
-    if ds_state["running"]:
-        time.sleep(2)
-        st.rerun()
+        if st.button("← Volver a configuración", key="reii_disc_back", width="stretch"):
+            ds_state["finished"] = False
+            ds_state["refreshed"] = False
+            ds_state["exit_code"] = None
+            ds_state["running"] = False
+            st.rerun()
+
+    if not ds_state["finished"]:
+        # ── BEFORE VIEW ─────────────────────────────────────────────
+        with st.container(border=True):
+            c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+            with c1:
+                agent_label = st.selectbox(
+                    "Agente de discurso",
+                    _agent_options,
+                    index=0,
+                    key="reii_disc_agent",
+                )
+            with c2:
+                store = st.checkbox("Guardar estado", value=True, key="reii_disc_store")
+            with c3:
+                workflow = (
+                    st.text_input(
+                        "Etiqueta workflow (opcional)",
+                        value="",
+                        key="reii_disc_workflow",
+                    )
+                    or None
+                )
+            with c4:
+                run_clicked = st.button(
+                    "▶ Ejecutar",
+                    key="reii_disc_run",
+                    disabled=ds_state["running"],
+                    width="stretch",
+                )
+
+        if run_clicked:
+            if not os.path.exists(GRAMMAR_CONFIG_PATH) or not os.path.exists(
+                DISCOURSE_CONFIG_PATH
+            ):
+                st.error(
+                    "Falta el archivo de configuración del agente de discurso "
+                    f"(`{GRAMMAR_CONFIG_PATH}` o `{DISCOURSE_CONFIG_PATH}`). "
+                    "No se puede ejecutar el análisis."
+                )
+            else:
+                st.session_state.discourse_log = []
+                ds_state["running"] = True
+                ds_state["finished"] = False
+                ds_state["exit_code"] = None
+                ds_state["refreshed"] = False
+                threading.Thread(
+                    target=_discourse_runner,
+                    args=(
+                        st.session_state.discourse_log,
+                        ds_state,
+                        None if agent_label == "Todos los agentes" else agent_label,
+                        store,
+                        workflow,
+                    ),
+                    daemon=True,
+                ).start()
+                st.rerun()
+
+        if ds_state["running"]:
+            st.info(
+                "⏳ Ejecutando el análisis de discurso… (puede tardar varios minutos)"
+            )
+            with st.expander(
+                f"📋 Log del análisis ({len(ds_log)} líneas)", expanded=True
+            ):
+                if ds_log:
+                    st.code("\n".join(ds_log[-300:]))
+                else:
+                    st.caption("Iniciando…")
+
+        # ── Polling: mientras el análisis corre, re-renderiza cada 2s
+        if ds_state["running"]:
+            time.sleep(2)
+            st.rerun()
+
+        # ── CRUD: editor de configuración de agentes IA ──
+        st.divider()
+        st.subheader("⚙️ Configuración de agentes IA")
+
+        gram = load_grammar_config()
+        with st.expander("📝 Resumidor gramatical (ia/0.json)", expanded=False):
+            st.text_input("Nombre", value=gram.get("name", ""), key="ia_gram_name")
+            st.text_input("Rol", value=gram.get("role", ""), key="ia_gram_role")
+            st.text_area(
+                "Instrucciones",
+                value=gram.get("instructions", ""),
+                key="ia_gram_instructions",
+                height=120,
+            )
+            st.text_area(
+                "json_schema (JSON)",
+                value=to_json_text(gram.get("json_schema", {})),
+                key="ia_gram_json_schema",
+                height=120,
+            )
+            st.text_area(
+                "few_shot_examples (JSON)",
+                value=to_json_text(gram.get("few_shot_examples", [])),
+                key="ia_gram_few_shot",
+                height=120,
+            )
+            if st.button("💾 Guardar resumidor", key="ia_gram_save", width="stretch"):
+                _save_grammar_from_widgets()
+
+        st.subheader("🤖 Agentes de discurso (ia/1.json)")
+        disc = load_discourse_config()
+        for _name in list(disc.keys()):
+            _agent = disc[_name]
+            _k = _sanitize_key(_name)
+            with st.expander(f"🤖 {_name}", expanded=False):
+                st.text_input(
+                    "Nombre", value=_agent.get("name", _name), key=f"ia_ag_{_k}_name"
+                )
+                st.text_input(
+                    "Rol", value=_agent.get("role", ""), key=f"ia_ag_{_k}_role"
+                )
+                st.text_area(
+                    "Instrucciones",
+                    value=_agent.get("instructions", ""),
+                    key=f"ia_ag_{_k}_instructions",
+                    height=120,
+                )
+                st.text_area(
+                    "json_schema (JSON)",
+                    value=to_json_text(_agent.get("json_schema", {})),
+                    key=f"ia_ag_{_k}_json_schema",
+                    height=120,
+                )
+                st.text_area(
+                    "few_shot_examples (JSON)",
+                    value=to_json_text(_agent.get("few_shot_examples", [])),
+                    key=f"ia_ag_{_k}_few_shot",
+                    height=120,
+                )
+                st.text_input(
+                    "Categorías gramaticales (separadas por coma)",
+                    value=to_list_text(_agent.get("gram_cats", [])),
+                    key=f"ia_ag_{_k}_gram_cats",
+                )
+                st.text_input(
+                    "Categorías discursivas (separadas por coma)",
+                    value=to_list_text(_agent.get("disc_cats", [])),
+                    key=f"ia_ag_{_k}_disc_cats",
+                )
+                _c1, _c2 = st.columns(2)
+                with _c1:
+                    if st.button("💾 Guardar", key=f"ia_ag_{_k}_save", width="stretch"):
+                        _save_agent_from_widgets(_name)
+                with _c2:
+                    if st.button("🗑️ Eliminar", key=f"ia_ag_{_k}_del", width="stretch"):
+                        _delete_agent(_name)
+
+        st.subheader("➕ Nuevo agente")
+        st.text_input("Nombre del nuevo agente", key="ia_new_agent_name")
+        if st.button("Crear agente", key="ia_new_agent_create", width="stretch"):
+            _create_agent()
+
+        _inactive = list_inactive_agent_files()
+        if _inactive:
+            with st.expander(
+                "ℹ️ Agentes inactivos (no conectados al análisis)", expanded=False
+            ):
+                st.caption(
+                    "Estos archivos existen en `ia/` pero NO están conectados al "
+                    "orquestador (`DebugOrchestrator` solo carga `0.json` y `1.json`). "
+                    "No son editables desde aquí."
+                )
+                st.code(", ".join(_inactive))
+
+        # ── Stop BEFORE view; results block below only renders in AFTER view
+        st.stop()
 
     import hashlib as _hlib
     from collections import defaultdict as _ddict
