@@ -1178,6 +1178,30 @@ def get_negation_scope(neg_token: Any) -> Any:
     return alcance
 
 
+def es_coletilla_interrogativa(token: Any) -> bool:
+    """
+    Detecta coletillas interrogativas al final de la oración
+    (p. ej. "..., ¿no?", "..., no?", "..., ¿verdad?").
+
+    Retorna True si el token es la última partícula de una coletilla
+    separada por coma y seguida de signo de interrogación. Estas
+    coletillas no expresan negación, así que deben excluirse del
+    análisis de negación.
+    """
+    if token.is_punct:
+        return False
+    sent = token.sent
+    # El token debe ser la última palabra (no puntuación) de la oración
+    no_punct = [t for t in sent if not t.is_punct]
+    if not no_punct or no_punct[-1] != token:
+        return False
+    # La oración debe terminar en signo de interrogación
+    if not sent.text.rstrip().endswith("?"):
+        return False
+    # Debe haber una coma antes del token (separación de la coletilla)
+    return any(t.text == "," for t in sent if t.i < token.i)
+
+
 def correct_pronoun_dependency(dep: str, morph_case: Optional[List[str]]) -> str:
     """
     Corrige la dependencia de un pronombre según la morfología.
@@ -1288,8 +1312,7 @@ def es_pasiva_refleja(verbo_token: Any) -> bool:
     # "se" is tagged obj, which would otherwise be a false passive-reflexive
     # (e.g. "Ella se lava" = she washes herself, not a passive).
     tiene_se = any(
-        _is_se_clitic(c) and _dep_base(c) == "expl"
-        for c in verbo_token.children
+        _is_se_clitic(c) and _dep_base(c) == "expl" for c in verbo_token.children
     )
     if not tiene_se:
         return False

@@ -5,9 +5,14 @@ import json
 import math
 import os
 import re
+import subprocess
+import sys
+import threading
+import time
 from collections import Counter, defaultdict
 from datetime import datetime
 from itertools import combinations, groupby
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
@@ -21,7 +26,17 @@ from scipy.signal import savgol_filter
 from scipy.stats import fisher_exact, pearsonr
 from sklearn.preprocessing import LabelEncoder
 
-from reii.config import CORPUS_NAME, DISCOURSE_STATE_PATH, WORKFLOW_DB_PATH
+from reii.batch_processor import BatchProcessor
+from reii.config import (
+    BATCH_DB_PATH,
+    CORPUS_NAME,
+    DISCOURSE_CONFIG_PATH,
+    DISCOURSE_STATE_PATH,
+    GRAMMAR_CONFIG_PATH,
+    TRANSCRIPTS_DIR,
+    WORKFLOW_CONFIG_PATH,
+    WORKFLOW_DB_PATH,
+)
 
 st.set_page_config(
     page_title="ALCESTE · Dashboard",
@@ -29,6 +44,658 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+
+# ══════════════════════════════════════════════════════════════
+# PROCESAMIENTO POR LOTES (ENTREVISTAS)
+# ══════════════════════════════════════════════════════════════
+
+
+def _batch_worker(
+    bp: "BatchProcessor",
+    queue: List[str],
+    log: List[str],
+    state: Dict[str, Any],
+) -> None:
+    """Procesa la cola en segundo plano.
+
+    Revisa ``state["paused"]`` entre archivos: si el usuario pausa, el
+    worker termina el archivo en curso y se detiene. ``state`` es un dict
+    mutable compartido con la UI (evita tocar ``st.session_state`` desde
+    el hilo).
+    """
+    while queue and not state["paused"]:
+        path = Path(queue.pop(0))
+        nombre = path.name
+        log.append(f"▶ Procesando {nombre}…")
+        try:
+            record = bp.process_file(path, log_cb=lambda m: log.append(m))
+            bp.save_record(record)
+            icono = "✅" if record.get("estado") == "completado" else "❌"
+            log.append(f"{icono} {nombre}: {record.get('estado')}")
+        except Exception as e:
+            log.append(f"❌ {nombre}: {type(e).__name__}: {e}")
+    if state["paused"]:
+        log.append("⏸ Lote pausado.")
+    else:
+        log.append("✅ Lote completado.")
+    state["running"] = False
+    state["finished"] = True
+
+
+def _workflow_runner(
+    log: List[str],
+    state: Dict[str, Any],
+    params: Dict[str, Any],
+) -> None:
+    """Ejecuta el workflow principal en un subproceso y captura su salida.
+
+    El workflow (``main_workflow_clasico.py``) lee los JSON exportados en
+    ``data/txt_outputs/tmp/`` y escribe ``data/workflow_data.json``. Se corre
+    como subproceso para no bloquear el hilo de Streamlit; su stdout/stderr
+    se vuelcan línea a línea en ``log`` para mostrarlo en vivo.
+    """
+    # Persistir los parámetros elegidos para que el subproceso los lea.
+    os.makedirs(os.path.dirname(WORKFLOW_CONFIG_PATH), exist_ok=True)
+    with open(WORKFLOW_CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(params, f, ensure_ascii=False, indent=2)
+
+    script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "main_workflow_clasico.py",
+    )
+    log.append(f"🚀 Ejecutando workflow: python {script}")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for linea in proc.stdout:
+            linea = linea.rstrip()
+            if linea:
+                log.append(linea)
+        code = proc.wait()
+        if code == 0:
+            log.append("✅ Workflow completado sin errores.")
+        else:
+            log.append(f"❌ Workflow terminó con código {code}.")
+    except Exception as e:
+        log.append(f"❌ Error al ejecutar el workflow: {type(e).__name__}: {e}")
+    state["running"] = False
+    state["finished"] = True
+    state["exit_code"] = code if "code" in locals() else -1
+
+
+def _discourse_runner(
+    log: List[str],
+    state: Dict[str, Any],
+    agent_name: Optional[str],
+    store: bool,
+    workflow: Optional[str],
+) -> None:
+    """Ejecuta el agente de análisis de discurso en un hilo en segundo plano.
+
+    ``DebugOrchestrator`` es pesado (carga ``workflow_data.json`` ~56MB y
+    construye el resumen gramatical), así que se corre en un hilo para no
+    bloquear la UI. La salida ``print`` del agente se captura línea a línea
+    en ``log`` para mostrarla en vivo.
+    """
+    import contextlib
+
+    from reii.config import (
+        DISCOURSE_CONFIG_PATH,
+        DISCOURSE_STATE_PATH,
+        GRAMMAR_CONFIG_PATH,
+        WORKFLOW_DB_PATH,
+    )
+    from reii.ia_discursiva import DebugOrchestrator
+
+    class _LogStream:
+        def __init__(self, log: List[str]):
+            self.log = log
+            self._buf = ""
+
+        def write(self, s: str) -> int:
+            self._buf += s
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                if line.strip():
+                    self.log.append(line)
+            return len(s)
+
+        def flush(self) -> None:
+            if self._buf.strip():
+                self.log.append(self._buf)
+                self._buf = ""
+
+    stream = _LogStream(log)
+    try:
+        with contextlib.redirect_stdout(stream):
+            mon = DebugOrchestrator(
+                grammar_config_path=GRAMMAR_CONFIG_PATH,
+                discourse_config_path=DISCOURSE_CONFIG_PATH,
+                workflow_data_path=WORKFLOW_DB_PATH,
+                state_path=DISCOURSE_STATE_PATH,
+            )
+            if agent_name is None:
+                mon.run_all_discourse_agents(store=store, workflow=workflow)
+            else:
+                mon.run_discourse_agent(
+                    agent_name=agent_name, store=store, workflow=workflow
+                )
+        log.append("✅ Análisis de discurso completado.")
+        state["exit_code"] = 0
+    except Exception as e:
+        log.append(f"❌ Error: {type(e).__name__}: {e}")
+        state["exit_code"] = -1
+    finally:
+        state["running"] = False
+        state["finished"] = True
+
+
+def render_batch_tab():
+    """Interfaz de procesamiento por lotes de transcripciones de entrevistas.
+
+    Incluye: subida de archivos, selección de transcripciones, ejecución del
+    pipeline de dos etapas (segmentación + extracción) con cola pausable,
+    log de errores en vivo y gestión de los documentos procesados
+    persistidos en la base JSON.
+    """
+    st.title("Procesamiento por lotes (entrevistas)")
+    st.caption(
+        "Pipeline de dos etapas: segmentación estructural (Ruta 1) y "
+        "extracción/mapeo de respuestas (Ruta 2) sobre la guía de 32 preguntas."
+    )
+
+    if st.session_state.get("show_batch_view"):
+        if st.button("← Volver al dashboard", key="reii_back_to_dashboard"):
+            st.session_state.show_batch_view = False
+            st.rerun()
+
+    bp = BatchProcessor(db_path=BATCH_DB_PATH)
+
+    # ── Estado de la cola (persistente entre reruns) ─────────────────
+    if "batch_queue" not in st.session_state:
+        st.session_state.batch_queue = []  # List[str] de rutas pendientes
+    if "batch_log" not in st.session_state:
+        st.session_state.batch_log = []  # List[str] de mensajes de progreso/error
+    if "batch_worker_state" not in st.session_state:
+        # dict mutable compartido con el hilo worker (no tocar session_state
+        # desde el hilo): {"paused": bool, "running": bool, "finished": bool}
+        st.session_state.batch_worker_state = {
+            "paused": False,
+            "running": False,
+            "finished": False,
+        }
+
+    # ── 1. Subida y selección de archivos ────────────────────────────
+    st.subheader("1 · Archivos de transcripción")
+    uploaded = st.file_uploader(
+        "Subir transcripciones (.txt, .json, .md)",
+        type=["txt", "json", "md"],
+        accept_multiple_files=True,
+        key="reii_batch_uploader",
+    )
+    if uploaded:
+        os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
+        saved_names = []
+        skipped_names = []
+        for up in uploaded:
+            dest = os.path.join(TRANSCRIPTS_DIR, up.name)
+            if os.path.exists(dest):
+                skipped_names.append(up.name)
+                continue
+            with open(dest, "wb") as f:
+                f.write(up.getbuffer())
+            saved_names.append(up.name)
+        if saved_names:
+            st.success(
+                f"Se guardaron {len(saved_names)} archivo(s) en `{TRANSCRIPTS_DIR}`: "
+                + ", ".join(saved_names)
+            )
+        if skipped_names:
+            st.info("Ya existían y no se sobrescribieron: " + ", ".join(skipped_names))
+
+    discovered = bp.discover_files()
+    if not discovered:
+        st.info(
+            f"No se encontraron transcripciones en `{TRANSCRIPTS_DIR}`. "
+            "Sube archivos arriba o colócalos en el directorio."
+        )
+        return
+
+    file_names = [p.name for p in discovered]
+    selected = st.multiselect(
+        "Transcripciones disponibles",
+        options=file_names,
+        default=file_names,
+        key="reii_batch_selected",
+    )
+    if not selected:
+        st.warning("Selecciona al menos una transcripción para procesar.")
+        return
+    targets = [p for p in discovered if p.name in selected]
+
+    # ── 2. Estado de los documentos (consciente de lo ya procesado) ────
+    st.subheader("2 · Estado de los documentos")
+    records = bp.load_all()
+    by_archivo = {r.get("archivo"): r for r in records}
+
+    filas_estado = []
+    for p in discovered:
+        rec = by_archivo.get(p.name)
+        if rec is None:
+            filas_estado.append(
+                {"Archivo": p.name, "Estado": "⏳ Pendiente", "Fecha": "—"}
+            )
+        elif rec.get("estado") == "completado":
+            filas_estado.append(
+                {
+                    "Archivo": p.name,
+                    "Estado": "✅ Procesado",
+                    "Fecha": rec.get("fecha_procesamiento", "—"),
+                }
+            )
+        else:
+            filas_estado.append(
+                {
+                    "Archivo": p.name,
+                    "Estado": "❌ Error",
+                    "Fecha": rec.get("fecha_procesamiento", "—"),
+                }
+            )
+    if filas_estado:
+        st.dataframe(
+            pd.DataFrame(filas_estado),
+            width="stretch",
+            hide_index=True,
+            key="reii_batch_status_table",
+        )
+        n_ok = sum(1 for f in filas_estado if f["Estado"] == "✅ Procesado")
+        n_err = sum(1 for f in filas_estado if f["Estado"] == "❌ Error")
+        n_pend = sum(1 for f in filas_estado if f["Estado"] == "⏳ Pendiente")
+        st.caption(
+            f"{n_ok} procesado(s) · {n_pend} pendiente(s) · {n_err} con error "
+            f"(de {len(filas_estado)} transcripciones)."
+        )
+
+    # ── 3. Cola de procesamiento (pausar / reanudar) ─────────────────
+    st.subheader("3 · Cola de procesamiento")
+
+    ws = st.session_state.batch_worker_state
+    running = ws["running"]
+    paused = ws["paused"]
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        if st.button(
+            "▶ Procesar seleccionados",
+            type="primary",
+            key="reii_batch_start",
+            disabled=running,
+        ):
+            # Encola los pendientes; los que fallaron (estado "error") se
+            # reintentan automáticamente.
+            pendientes = [
+                p
+                for p in targets
+                if p.name not in by_archivo
+                or by_archivo[p.name].get("estado") == "error"
+            ]
+            if not pendientes:
+                st.info("Todos los seleccionados ya están procesados.")
+            else:
+                st.session_state.batch_queue = [str(p) for p in pendientes]
+                st.session_state.batch_log = []
+                ws["paused"] = False
+                ws["finished"] = False
+                ws["running"] = True
+                threading.Thread(
+                    target=_batch_worker,
+                    args=(
+                        bp,
+                        st.session_state.batch_queue,
+                        st.session_state.batch_log,
+                        ws,
+                    ),
+                    daemon=True,
+                ).start()
+                st.rerun()
+    with col2:
+        if st.button(
+            "⏸ Pausar",
+            key="reii_batch_pause",
+            disabled=not running or paused,
+        ):
+            ws["paused"] = True
+            st.rerun()
+    with col3:
+        if st.button(
+            "▶ Reanudar",
+            key="reii_batch_resume",
+            disabled=not running or not paused,
+        ):
+            ws["paused"] = False
+            st.rerun()
+    with col4:
+        if st.button(
+            "✖ Detener y vaciar",
+            key="reii_batch_clear",
+            disabled=not running and not st.session_state.batch_queue,
+        ):
+            ws["paused"] = True
+            st.session_state.batch_queue = []
+            st.rerun()
+
+    n_cola = len(st.session_state.batch_queue)
+    if running:
+        if paused:
+            st.warning(
+                "⏸ Pausa solicitada — se detendrá al terminar el archivo actual."
+            )
+        else:
+            st.info(f"⏳ Procesando en segundo plano… {n_cola} archivo(s) en cola.")
+    elif ws["finished"]:
+        st.success("✅ Lote completado.")
+    elif n_cola:
+        st.caption(f"Cola: {n_cola} archivo(s) pendiente(s) · pausada.")
+
+    # ── 4. Log de procesamiento (errores en vivo) ────────────────────
+    st.subheader("4 · Log de procesamiento")
+    with st.expander(
+        f"📋 Log de procesamiento ({len(st.session_state.batch_log)} líneas)",
+        expanded=bool(st.session_state.batch_log) or running,
+    ):
+        if st.session_state.batch_log:
+            st.code("\n".join(st.session_state.batch_log[-300:]))
+        else:
+            st.caption("Sin actividad registrada todavía.")
+
+    # ── 5. Parámetros del análisis ────────────────────────────────────
+    st.subheader("5 · Parámetros del análisis")
+    params: Dict[str, Any] = {}
+
+    # --- Segmentación / NLP ---
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        params["use_bigrams"] = st.radio(
+            "Bigramas",
+            [True, False],
+            index=0,
+            format_func=lambda v: "Sí" if v else "No",
+            key="reii_p_use_bigrams",
+        )
+        params["stem_backend"] = st.selectbox(
+            "Stemming",
+            ["snowball", "none"],
+            index=0,
+            key="reii_p_stem_backend",
+        )
+    with c2:
+        params["min_uce_words"] = st.number_input(
+            "Mín. palabras por UCE",
+            min_value=1,
+            value=3,
+            key="reii_p_min_uce_words",
+        )
+        params["tsj"] = st.number_input(
+            "Frecuencia mínima (tsj)",
+            min_value=1,
+            value=3,
+            key="reii_p_tsj",
+        )
+    with c3:
+        mf0 = st.number_input(
+            "min_forms_uc (mín)", min_value=1, value=10, key="reii_p_mf0"
+        )
+        mf1 = st.number_input(
+            "min_forms_uc (máx)", min_value=1, value=14, key="reii_p_mf1"
+        )
+        params["min_forms_uc"] = [int(mf0), int(mf1)]
+
+    # --- CDH / Clasificación ---
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        params["use_cdh"] = st.radio(
+            "CDH",
+            [True, False],
+            index=0,
+            format_func=lambda v: "Sí" if v else "No",
+            key="reii_p_use_cdh",
+        )
+    with c2:
+        params["pseudocount"] = st.number_input(
+            "Pseudocount",
+            min_value=0.0,
+            value=0.01,
+            step=0.01,
+            key="reii_p_pseudocount",
+        )
+    with c3:
+        params["use_cah_per_class"] = st.radio(
+            "CAH por clase",
+            [True, False],
+            index=0,
+            format_func=lambda v: "Sí" if v else "No",
+            key="reii_p_use_cah_per_class",
+            disabled=not params["use_cdh"],
+        )
+        params["cah_per_class_top_terms"] = st.number_input(
+            "Términos CAH por clase",
+            min_value=1,
+            value=50,
+            key="reii_p_cah_top",
+            disabled=not params["use_cdh"] or not params["use_cah_per_class"],
+        )
+
+    # --- Análisis complementarios ---
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        params["use_projection"] = st.radio(
+            "Proyección (AFC)",
+            [True, False],
+            index=0,
+            format_func=lambda v: "Sí" if v else "No",
+            key="reii_p_use_projection",
+        )
+        params["analyze_metadata"] = st.radio(
+            "Metadatos",
+            [True, False],
+            index=0,
+            format_func=lambda v: "Sí" if v else "No",
+            key="reii_p_analyze_metadata",
+        )
+    with c2:
+        params["use_network_analysis"] = st.radio(
+            "Red semántica",
+            [True, False],
+            index=0,
+            format_func=lambda v: "Sí" if v else "No",
+            key="reii_p_use_network",
+        )
+        params["use_term_stability"] = st.radio(
+            "Estabilidad de términos",
+            [True, False],
+            index=0,
+            format_func=lambda v: "Sí" if v else "No",
+            key="reii_p_use_term_stability",
+        )
+    with c3:
+        params["use_llm_synthesis"] = st.radio(
+            "Síntesis LLM",
+            [True, False],
+            index=0,
+            format_func=lambda v: "Sí" if v else "No",
+            key="reii_p_use_llm",
+        )
+        params["use_multivariate_analysis"] = st.radio(
+            "Análisis multivariado",
+            [True, False],
+            index=1,
+            format_func=lambda v: "Sí" if v else "No",
+            key="reii_p_use_multivariate",
+        )
+        params["multivariate_metadata"] = st.multiselect(
+            "Columnas multivariado",
+            ["Edad_Cat", "Sexo", "Ocupacion_Cat", "Procedencia_Cat"],
+            default=["Edad_Cat", "Sexo", "Ocupacion_Cat", "Procedencia_Cat"],
+            key="reii_p_multivariate_metadata",
+            disabled=not params["use_multivariate_analysis"],
+        )
+
+    # --- Random Forest + SHAP ---
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        params["use_rf_shap"] = st.radio(
+            "Random Forest + SHAP",
+            [True, False],
+            index=1,
+            format_func=lambda v: "Sí" if v else "No",
+            key="reii_p_use_rf_shap",
+        )
+    with c2:
+        params["rf_n_estimators"] = st.number_input(
+            "RF n_estimators",
+            min_value=1,
+            value=200,
+            key="reii_p_rf_n",
+            disabled=not params["use_rf_shap"],
+        )
+        params["rf_max_depth"] = st.number_input(
+            "RF max_depth",
+            min_value=1,
+            value=8,
+            key="reii_p_rf_depth",
+            disabled=not params["use_rf_shap"],
+        )
+    with c3:
+        params["rf_outlier_method"] = st.selectbox(
+            "RF outliers",
+            ["iqr", "zscore"],
+            index=0,
+            key="reii_p_rf_outlier",
+            disabled=not params["use_rf_shap"],
+        )
+        params["rf_cat_encoding"] = st.selectbox(
+            "RF cat encoding",
+            ["onehot", "frequency", "target"],
+            index=1,
+            key="reii_p_rf_cat",
+            disabled=not params["use_rf_shap"],
+        )
+
+    # --- Optimización ---
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        params["optimize"] = st.radio(
+            "Optimizar",
+            [True, False],
+            index=0,
+            format_func=lambda v: "Sí" if v else "No",
+            key="reii_p_optimize",
+        )
+    with c2:
+        params["optimize_trials"] = st.number_input(
+            "Trials de optimización",
+            min_value=1,
+            value=100,
+            key="reii_p_optimize_trials",
+            disabled=not params["optimize"],
+        )
+    with c3:
+        params["random_state"] = st.number_input(
+            "random_state", value=42, key="reii_p_random_state"
+        )
+
+    # ── 6. Exportar al workflow principal ────────────────────────────
+    st.subheader("6 · Exportar al workflow")
+
+    # Estado del subproceso del workflow (persistente entre reruns)
+    if "workflow_state" not in st.session_state:
+        st.session_state.workflow_state = {
+            "running": False,
+            "finished": False,
+            "exit_code": None,
+        }
+    if "workflow_log" not in st.session_state:
+        st.session_state.workflow_log = []
+
+    wf_state = st.session_state.workflow_state
+    wf_log = st.session_state.workflow_log
+
+    if st.button(
+        "📤 Exportar y correr workflow",
+        key="reii_batch_export",
+        disabled=wf_state["running"],
+    ):
+        try:
+            exportado = bp.exportar_para_workflow()
+            n_json = len(exportado["json"])
+            if not n_json:
+                st.info("No hay entrevistas completadas para exportar.")
+            else:
+                st.session_state.workflow_log = [
+                    f"📤 Se exportaron {n_json} entrevista(s) a `data/txt_outputs/tmp/`."
+                ]
+                wf_state["running"] = True
+                wf_state["finished"] = False
+                wf_state["exit_code"] = None
+                threading.Thread(
+                    target=_workflow_runner,
+                    args=(st.session_state.workflow_log, wf_state, params),
+                    daemon=True,
+                ).start()
+                st.rerun()
+        except Exception as e:
+            st.error(f"❌ Error al exportar: {e}")
+
+    if wf_state["running"]:
+        st.info("⏳ Corriendo el workflow principal… (puede tardar varios minutos)")
+        with st.expander(
+            f"📋 Log del workflow ({len(wf_log)} líneas)",
+            expanded=True,
+        ):
+            if wf_log:
+                st.code("\n".join(wf_log[-300:]))
+            else:
+                st.caption("Iniciando…")
+    elif wf_state["finished"]:
+        if wf_state["exit_code"] == 0:
+            st.success("✅ Workflow completado. Cargando el dashboard…")
+            with st.expander(
+                f"📋 Log del workflow ({len(wf_log)} líneas)",
+                expanded=False,
+            ):
+                st.code("\n".join(wf_log[-300:]))
+            # El workflow ya escribió data/workflow_data.json: al re-renderizar
+            # la página principal, load_merged_data() encontrará las UCEs y
+            # mostrará el dashboard habitual. Solo re-renderiza si el archivo
+            # existe; si no, deja el log visible para diagnosticar.
+            if os.path.exists(WORKFLOW_DB_PATH):
+                st.rerun()
+        else:
+            st.error(
+                f"❌ El workflow terminó con código {wf_state['exit_code']}. "
+                "Revisa el log para ver el error."
+            )
+            with st.expander(
+                f"📋 Log del workflow ({len(wf_log)} líneas)",
+                expanded=True,
+            ):
+                st.code("\n".join(wf_log[-300:]))
+
+    # ── Polling: mientras el worker o el workflow corren, re-renderiza
+    # cada 2s para mostrar el log en vivo.
+    if st.session_state.batch_worker_state["running"] or wf_state["running"]:
+        time.sleep(2)
+        st.rerun()
+
 
 # ─────────────────────────────────────────────────────────────
 # PUENTE JAVASCRIPT -> PYTHON (Decláralo a nivel global)
@@ -163,20 +830,23 @@ _CONFIDENCE_RANK = {"alta": 3, "media": 2, "baja": 1}
 # ─────────────────────────────────────────────────────────────
 # DATA LOADING
 # ─────────────────────────────────────────────────────────────
-@st.cache_resource
+@st.cache_data(ttl=30)
 def load_workflow_data():
     path = WORKFLOW_DB_PATH
     if not os.path.exists(path):
-        st.warning(
-            f"⚠️ No se encontró la base de datos del workflow en `{path}`. "
-            "Ejecuta el servicio `workflow` primero o monta el archivo correcto."
-        )
         return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    # Reintenta brevemente: el workflow puede estar reescribiendo el archivo
+    # (aunque ya escribe de forma atómica, un rerun puede caer justo en medio).
+    for _ in range(5):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            time.sleep(0.2)
+    return {}
 
 
-@st.cache_resource
+@st.cache_data(ttl=30)
 def load_discourse_state():
     path = DISCOURSE_STATE_PATH
     if not os.path.exists(path):
@@ -185,7 +855,7 @@ def load_discourse_state():
         return json.load(f)
 
 
-@st.cache_resource
+@st.cache_data(ttl=30)
 def load_merged_data():
     wf = load_workflow_data()
     if not wf:
@@ -222,13 +892,10 @@ def load_merged_data():
 data = load_merged_data()
 uces = data.get("uces", [])
 
-if not uces:
-    st.title("ALCESTE · Dashboard")
-    st.info(
-        "No hay datos del workflow disponibles todavía. "
-        "Ejecuta primero el servicio `workflow` o monta un `data/workflow_data.json` válido."
-    )
-    st.caption(f"Ruta esperada dentro del contenedor: `{WORKFLOW_DB_PATH}`")
+if not uces or st.session_state.get("show_batch_view"):
+    # Sin datos del workflow: la página principal es el procesamiento
+    # por lotes (subir/exportar entrevistas) en lugar del dashboard.
+    render_batch_tab()
     st.stop()
 
 
@@ -1279,7 +1946,7 @@ with hdr_col:
       <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-low);
                   letter-spacing:.04em">
         Clasificación doble (121) · {clustering_method} ·
-        min_forms={min_forms_uc} · tsj={tsj} · ctest={ctest}{'' if use_ctest else ' (off)'} · {fecha}
+        min_forms={min_forms_uc} · tsj={tsj} · ctest={ctest}{"" if use_ctest else " (off)"} · {fecha}
       </div>
     </div>
     """,
@@ -1291,6 +1958,9 @@ with toggle_col:
     if st.button(mode_label, key="toggle_mode", width="stretch"):
         st.session_state.dark_mode = not _dm
         st.cache_data.clear()
+        st.rerun()
+    if st.button("← Lotes", key="go_to_batch", width="stretch"):
+        st.session_state.show_batch_view = True
         st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1633,6 +2303,7 @@ if not class_list:
     )
     st.stop()
 
+
 def _document_label(uce: Dict) -> str:
     """Return a stable, readable label for a document represented by a UCE."""
     doc_id = uce.get("doc_id", "")
@@ -1727,7 +2398,9 @@ def _document_class_crosstab() -> tuple[pd.DataFrame, Dict[Tuple[int, str], str]
             neither = (total_uces_classified - doc_total) - outside_class
             if min(outside_doc, outside_class, neither) < 0:
                 continue
-            _, p_value = fisher_exact([[observed, outside_doc], [outside_class, neither]])
+            _, p_value = fisher_exact(
+                [[observed, outside_doc], [outside_class, neither]]
+            )
             rest_rate = outside_class / (total_uces_classified - doc_total)
             direction = 1.0 if observed / doc_total > rest_rate else -1.0
             p_values.append(p_value)
@@ -1755,7 +2428,9 @@ def _document_class_crosstab() -> tuple[pd.DataFrame, Dict[Tuple[int, str], str]
     return display.reset_index(drop=True), cell_styles, details
 
 
-def _document_form_crosstab(top_n: int) -> tuple[pd.DataFrame, Dict[Tuple[int, str], str], Dict, int]:
+def _document_form_crosstab(
+    top_n: int,
+) -> tuple[pd.DataFrame, Dict[Tuple[int, str], str], Dict, int]:
     """Count forms by document and use exact, FDR-corrected enrichment tests."""
     records = []
     labels: Dict[str, str] = {}
@@ -1805,7 +2480,9 @@ def _document_form_crosstab(top_n: int) -> tuple[pd.DataFrame, Dict[Tuple[int, s
             neither = (total_forms - doc_total) - outside_form
             if min(outside_doc, outside_form, neither) < 0:
                 continue
-            _, p_value = fisher_exact([[observed, outside_doc], [outside_form, neither]])
+            _, p_value = fisher_exact(
+                [[observed, outside_doc], [outside_form, neither]]
+            )
             rest_rate = outside_form / (total_forms - doc_total)
             direction = 1.0 if observed / doc_total > rest_rate else -1.0
             p_values.append(p_value)
@@ -1815,7 +2492,9 @@ def _document_form_crosstab(top_n: int) -> tuple[pd.DataFrame, Dict[Tuple[int, s
     adjusted_p = _fdr_bh(p_values)
     for (row_idx, form, direction), q_value in zip(test_cells, adjusted_p):
         if q_value < 0.05:
-            cell_styles[(row_idx, form)] = _significance_style("over" if direction > 0 else "under")
+            cell_styles[(row_idx, form)] = _significance_style(
+                "over" if direction > 0 else "under"
+            )
 
     display = counts.copy()
     display.insert(0, "Documento", [labels[doc_key] for doc_key in display.index])
@@ -12047,7 +12726,9 @@ with tab_d:
                     "(Fisher exacto frente al resto del corpus, q < 0.05 con corrección FDR)."
                 )
             else:
-                st.caption("Sin color inferencial: no hay celdas con tamaño muestral suficiente para probar.")
+                st.caption(
+                    "Sin color inferencial: no hay celdas con tamaño muestral suficiente para probar."
+                )
             st.dataframe(
                 _styled_crosstab(document_class_table, class_cell_styles),
                 hide_index=True,
@@ -12070,7 +12751,9 @@ with tab_d:
             step=5,
             key="td_document_form_limit",
         )
-        document_form_table, form_cell_styles, form_test, total_unique_forms = _document_form_crosstab(top_forms)
+        document_form_table, form_cell_styles, form_test, total_unique_forms = (
+            _document_form_crosstab(top_forms)
+        )
         st.caption(
             "Frecuencia de formas léxicas (`formas_tokens`) por documento. "
             f"Mostrando las {min(top_forms, total_unique_forms)} más frecuentes de {total_unique_forms:,}."
@@ -12084,7 +12767,9 @@ with tab_d:
                     "(Fisher exacto frente al resto del corpus, q < 0.05 con corrección FDR)."
                 )
             else:
-                st.caption("Sin color inferencial: no hay celdas con tamaño muestral suficiente para probar.")
+                st.caption(
+                    "Sin color inferencial: no hay celdas con tamaño muestral suficiente para probar."
+                )
             st.dataframe(
                 _styled_crosstab(document_form_table, form_cell_styles),
                 hide_index=True,
@@ -12291,6 +12976,118 @@ with tab_d:
 # PESTAÑA E
 # ─────────────────────────────────────────────────────────────
 with tab_e:
+    # ════════════════════════════════════════════════════════════════════════
+    # CONTROL: ejecutar / volver a ejecutar el análisis de discurso
+    # ════════════════════════════════════════════════════════════════════════
+    if "discourse_state" not in st.session_state:
+        st.session_state.discourse_state = {
+            "running": False,
+            "finished": False,
+            "exit_code": None,
+            "refreshed": False,
+        }
+    if "discourse_log" not in st.session_state:
+        st.session_state.discourse_log = []
+
+    ds_state = st.session_state.discourse_state
+    ds_log = st.session_state.discourse_log
+
+    _AGENT_OPTIONS = {
+        "Todos los agentes": None,
+        "Ontológico-Cognitivo": "Ontológico-Cognitivo",
+        "Diversidades_epistémicas": "Diversidades_epistémicas",
+        "Performativo-Narrativo": "Performativo-Narrativo",
+    }
+
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+        with c1:
+            agent_label = st.selectbox(
+                "Agente de discurso",
+                list(_AGENT_OPTIONS.keys()),
+                index=0,
+                key="reii_disc_agent",
+            )
+        with c2:
+            store = st.checkbox("Guardar estado", value=True, key="reii_disc_store")
+        with c3:
+            workflow = (
+                st.text_input(
+                    "Etiqueta workflow (opcional)",
+                    value="",
+                    key="reii_disc_workflow",
+                )
+                or None
+            )
+        with c4:
+            run_clicked = st.button(
+                "▶ Ejecutar" if not ds_state["finished"] else "▶ Volver a ejecutar",
+                key="reii_disc_run",
+                disabled=ds_state["running"],
+                width="stretch",
+            )
+
+    if run_clicked:
+        if not os.path.exists(GRAMMAR_CONFIG_PATH) or not os.path.exists(
+            DISCOURSE_CONFIG_PATH
+        ):
+            st.error(
+                "Falta el archivo de configuración del agente de discurso "
+                f"(`{GRAMMAR_CONFIG_PATH}` o `{DISCOURSE_CONFIG_PATH}`). "
+                "No se puede ejecutar el análisis."
+            )
+        else:
+            st.session_state.discourse_log = []
+            ds_state["running"] = True
+            ds_state["finished"] = False
+            ds_state["exit_code"] = None
+            ds_state["refreshed"] = False
+            threading.Thread(
+                target=_discourse_runner,
+                args=(
+                    st.session_state.discourse_log,
+                    ds_state,
+                    _AGENT_OPTIONS[agent_label],
+                    store,
+                    workflow,
+                ),
+                daemon=True,
+            ).start()
+            st.rerun()
+
+    if ds_state["running"]:
+        st.info("⏳ Ejecutando el análisis de discurso… (puede tardar varios minutos)")
+        with st.expander(f"📋 Log del análisis ({len(ds_log)} líneas)", expanded=True):
+            if ds_log:
+                st.code("\n".join(ds_log[-300:]))
+            else:
+                st.caption("Iniciando…")
+    elif ds_state["finished"]:
+        if ds_state["exit_code"] == 0:
+            st.success("✅ Análisis de discurso completado.")
+            with st.expander(
+                f"📋 Log del análisis ({len(ds_log)} líneas)", expanded=False
+            ):
+                st.code("\n".join(ds_log[-300:]))
+            if not ds_state.get("refreshed", False):
+                ds_state["refreshed"] = True
+                load_discourse_state.clear()
+                st.rerun()
+        else:
+            st.error(
+                f"❌ El análisis terminó con error (código {ds_state['exit_code']}). "
+                "Revisa el log."
+            )
+            with st.expander(
+                f"📋 Log del análisis ({len(ds_log)} líneas)", expanded=True
+            ):
+                st.code("\n".join(ds_log[-300:]))
+
+    # ── Polling: mientras el análisis corre, re-renderiza cada 2s
+    if ds_state["running"]:
+        time.sleep(2)
+        st.rerun()
+
     import hashlib as _hlib
     from collections import defaultdict as _ddict
     from itertools import combinations as _combs

@@ -9,7 +9,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import requests
@@ -26,12 +26,15 @@ except ImportError:
 
 from reii.config import (
     DATA_DIR,
-    DEEPSEEK_API_KEY,
-    DEEPSEEK_API_URL,
     DISCOURSE_CONFIG_PATH,
     DISCOURSE_STATE_PATH,
     GRAMMAR_CONFIG_PATH,
+    LLM_FALLBACK_MODEL,
+    LLM_MAX_RETRIES,
     LLM_MODEL,
+    LLM_TIMEOUT,
+    TOGETHER_API_KEY,
+    TOGETHER_API_URL,
     WORKFLOW_DB_PATH,
 )
 from reii.gram.gramatical_analyzer import UCE, PredicateFrame
@@ -44,8 +47,8 @@ STATE_FILE = Path(DISCOURSE_STATE_PATH)
 # ─────────────────────────────────────────────
 # Configuración API
 # ─────────────────────────────────────────────
-if not DEEPSEEK_API_KEY:
-    print("⚠️  DEEPSEEK_API_KEY no definida.")
+if not TOGETHER_API_KEY:
+    print("⚠️  TOGETHER_API_KEY no definida.")
 
 
 # ─────────────────────────────────────────────
@@ -675,18 +678,30 @@ def _render_pos_cluster_table(
 
 
 # ─────────────────────────────────────────────
-# Cliente DeepSeek
+# Cliente LLM (Together AI)
 # ─────────────────────────────────────────────
 
 
 def call_deepseek_structured(
     messages: List[Dict[str, str]],
     schema: Dict,
-    max_retries: int = 3,
+    max_retries: int = LLM_MAX_RETRIES,
     temperature: float = 0.2,
+    log_cb: Optional[Callable[[str], None]] = None,
 ) -> Dict:
+    """Llama al modelo con salida JSON validada contra ``schema``.
+
+    ``log_cb`` (opcional) recibe cada mensaje de progreso/error para
+    mostrarlo en la UI; si no se provee, solo se imprime en consola.
+    """
+
+    def _log(msg: str) -> None:
+        print(msg)
+        if log_cb is not None:
+            log_cb(msg)
+
     if not isinstance(schema, dict) or "type" not in schema:
-        print("❌ Esquema JSON inválido. Usando fallback vacío.")
+        _log("❌ Esquema JSON inválido. Usando fallback vacío.")
         schema = {
             "type": "object",
             "properties": {
@@ -705,147 +720,222 @@ def call_deepseek_structured(
     }
 
     headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Authorization": f"Bearer {TOGETHER_API_KEY}",
         "Content-Type": "application/json",
     }
 
     original_messages = messages.copy()
 
-    for attempt in range(max_retries + 1):
-        payload = {
-            "model": LLM_MODEL,
-            "messages": messages,
-            "tools": [tool_def],
-            "tool_choice": {
-                "type": "function",
-                "function": {"name": "emit_annotations"},
-            },
-            #  "response_format": {"type": "json_object"},
-            "temperature": temperature,
-        }
+    # Modelo principal → modelo de respaldo si el esquema falla repetidamente.
+    for model in (LLM_MODEL, LLM_FALLBACK_MODEL):
+        messages = original_messages.copy()
+        _log(f"🧠 Usando modelo: {model}")
+        use_auto_tool_choice = False
 
-        try:
-            resp = requests.post(
-                DEEPSEEK_API_URL, headers=headers, json=payload, timeout=120
-            )
-        except requests.exceptions.RequestException as e:
-            print(f"⚠️ Error de red: {e}. Reintentando en {2**attempt}s...")
-            time.sleep(2**attempt)
-            continue
+        for attempt in range(max_retries + 1):
+            payload = {
+                "model": model,
+                "messages": messages,
+                "tools": [tool_def],
+                "tool_choice": (
+                    "auto"
+                    if use_auto_tool_choice
+                    else {
+                        "type": "function",
+                        "function": {"name": "emit_annotations"},
+                    }
+                ),
+                "temperature": temperature,
+                "stream": True,
+            }
+            # Desactivar razonamiento solo en el modelo principal; el de
+            # respaldo puede rechazar el parámetro con un 400.
+            if model == LLM_MODEL:
+                payload["reasoning_effort"] = "none"
 
-        if resp.status_code == 429:
-            wait = 2**attempt
-            print(f"⏳ Rate limit. Esperando {wait}s...")
-            time.sleep(wait)
-            continue
-
-        if resp.status_code != 200:
-            print(f"⚠️ Error HTTP {resp.status_code}: {resp.text[:200]}")
-            if resp.status_code == 400 and "tool_choice" in resp.text.lower():
-                print("   → Cambiando tool_choice a 'auto'...")
-                payload["tool_choice"] = "auto"
-                continue
-            time.sleep(2)
-            continue
-
-        data = resp.json()
-        msg = data["choices"][0].get("message", {})
-        tool_calls = msg.get("tool_calls")
-
-        if tool_calls:
-            json_str = tool_calls[0]["function"]["arguments"]
-        else:
-            json_str = msg.get("content", "{}")
-
-        # ─── Parse & Repair ─────────────────────────────────────────────
-        parsed = None
-        error_message = None
-
-        try:
-            parsed = json.loads(json_str)
-        except json.JSONDecodeError as e:
-            print(f"⚠️ JSON malformado (intento {attempt + 1}): {e}")
-            error_message = f"JSON syntax error: {e}"
             try:
-                repaired = repair_json(json_str)
-                parsed = json.loads(repaired)
-                print("   ✅ JSON reparado exitosamente.")
-                error_message = None  # Clear error if repair succeeded
-            except Exception as repair_err:
-                print(f"   ❌ La reparación falló: {repair_err}")
-                error_message = f"JSON repair failed: {repair_err}"
-
-        if parsed is None:
-            if attempt < max_retries:
-                # Build tool response messages
-                tool_msgs = []
-                for tc in tool_calls or []:
-                    tool_msgs.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "content": f"Error: {error_message}. PPlease correct the JSON output to match the schema.",
-                        }
-                    )
-                messages = (
-                    original_messages
-                    + [
-                        {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": tool_calls,
-                        },
-                    ]
-                    + tool_msgs
+                resp = requests.post(
+                    TOGETHER_API_URL,
+                    headers=headers,
+                    json=payload,
+                    stream=True,
+                    timeout=(30, LLM_TIMEOUT),
                 )
-                print("   🔁 Solicitando corrección al modelo (vía tool message)...")
+            except requests.exceptions.RequestException as e:
+                _log(f"⚠️ Error de red: {e}. Reintentando en {2**attempt}s...")
+                time.sleep(2**attempt)
                 continue
-            else:
-                print("❌ Máximo de reintentos alcanzado. Devolviendo vacío.")
-                return {"annotations": []}
 
-        if "annotations" in parsed:
-            for ann in parsed["annotations"]:
-                ann.setdefault("confidence", "baja")
-                if not ann.get("spans"):
-                    ann["spans"] = []
-
-        # ─── Schema Validation ─────────────────────────────────────────
-        try:
-            validate(instance=parsed, schema=schema)
-            return parsed  # Success!
-        except ValidationError as val_err:
-            print(
-                f"⚠️ JSON válido pero no cumple el esquema (intento {attempt + 1}): {val_err.message}"
-            )
-            if attempt < max_retries:
-                tool_msgs = []
-                for tc in tool_calls or []:
-                    tool_msgs.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "content": f"Schema validation error: {val_err.message}. Please correct the output to match the schema.",
-                        }
-                    )
-                messages = (
-                    original_messages
-                    + [
-                        {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": tool_calls,
-                        },
-                    ]
-                    + tool_msgs
-                )
-                print(
-                    "   🔁 Solicitando corrección de esquema al modelo (vía tool message)..."
-                )
+            if resp.status_code == 429:
+                wait = 2**attempt
+                _log(f"⏳ Rate limit. Esperando {wait}s...")
+                time.sleep(wait)
                 continue
-            else:
-                print("❌ Máximo de reintentos alcanzado. Devolviendo vacío.")
-                return {"annotations": []}
+
+            if resp.status_code != 200:
+                _log(f"⚠️ Error HTTP {resp.status_code}: {resp.text[:200]}")
+                if resp.status_code == 400 and "tool_choice" in resp.text.lower():
+                    _log("   → Cambiando tool_choice a 'auto'...")
+                    use_auto_tool_choice = True
+                    continue
+                time.sleep(2)
+                continue
+
+            # ─── Streaming: acumula la respuesta en tiempo real ───────
+            # Con ``stream=True`` el timeout es de "silencio": si el modelo
+            # sigue enviando fragmentos no hay timeout; solo corta si deja
+            # de llegar data durante ``LLM_TIMEOUT`` segundos.
+            json_str = ""
+            tool_calls = None
+            n_chunks = 0
+            try:
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    line = line.decode("utf-8", errors="replace")
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[len("data:") :].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    n_chunks += 1
+                    if n_chunks == 1:
+                        _log("📥 Recibiendo respuesta (streaming)…")
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+                    if delta.get("tool_calls"):
+                        tc = delta["tool_calls"][0]
+                        if tool_calls is None:
+                            tool_calls = [tc]  # conserva id/name para el retry
+                        args = tc.get("function", {}).get("arguments", "")
+                        if args:
+                            json_str += args
+                    content = delta.get("content")
+                    if content:
+                        json_str += content
+                    if n_chunks % 200 == 0:
+                        _log(
+                            f"   … {n_chunks} fragmentos · {len(json_str)} caracteres."
+                        )
+            except requests.exceptions.RequestException as e:
+                _log(
+                    f"⚠️ Stream interrumpido tras {n_chunks} fragmentos: {e}. "
+                    f"Reintentando en {2**attempt}s..."
+                )
+                time.sleep(2**attempt)
+                continue
+
+            if not json_str:
+                _log("⚠️ Respuesta vacía del modelo.")
+                if attempt < max_retries:
+                    time.sleep(2)
+                    continue
+                _log(
+                    "❌ Máximo de reintentos alcanzado. Probando modelo de respaldo..."
+                )
+                break
+
+            _log(f"   ✅ Respuesta completa ({len(json_str)} caracteres).")
+
+            # ─── Parse & Repair ─────────────────────────────────────────────
+            parsed = None
+            error_message = None
+
+            try:
+                parsed = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                _log(f"⚠️ JSON malformado (intento {attempt + 1}): {e}")
+                error_message = f"JSON syntax error: {e}"
+                try:
+                    repaired = repair_json(json_str)
+                    parsed = json.loads(repaired)
+                    _log("   ✅ JSON reparado exitosamente.")
+                    error_message = None  # Clear error if repair succeeded
+                except Exception as repair_err:
+                    _log(f"   ❌ La reparación falló: {repair_err}")
+                    error_message = f"JSON repair failed: {repair_err}"
+
+            if parsed is None:
+                if attempt < max_retries:
+                    # Build tool response messages
+                    tool_msgs = []
+                    for tc in tool_calls or []:
+                        tool_msgs.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": f"Error: {error_message}. Please correct the JSON output to match the schema.",
+                            }
+                        )
+                    messages = (
+                        original_messages
+                        + [
+                            {
+                                "role": "assistant",
+                                "content": None if tool_calls else json_str,
+                                **({"tool_calls": tool_calls} if tool_calls else {}),
+                            },
+                        ]
+                        + tool_msgs
+                    )
+                    _log("   🔁 Solicitando corrección al modelo (vía tool message)...")
+                    continue
+                else:
+                    _log(
+                        "❌ Máximo de reintentos alcanzado. Probando modelo de respaldo..."
+                    )
+                    break
+
+            if "annotations" in parsed:
+                for ann in parsed["annotations"]:
+                    ann.setdefault("confidence", "baja")
+                    if not ann.get("spans"):
+                        ann["spans"] = []
+
+            # ─── Schema Validation ─────────────────────────────────────────
+            try:
+                validate(instance=parsed, schema=schema)
+                return parsed  # Success!
+            except ValidationError as val_err:
+                _log(
+                    f"⚠️ JSON válido pero no cumple el esquema (intento {attempt + 1}): {val_err.message}"
+                )
+                if attempt < max_retries:
+                    tool_msgs = []
+                    for tc in tool_calls or []:
+                        tool_msgs.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": f"Schema validation error: {val_err.message}. Please correct the output to match the schema.",
+                            }
+                        )
+                    messages = (
+                        original_messages
+                        + [
+                            {
+                                "role": "assistant",
+                                "content": None if tool_calls else json_str,
+                                **({"tool_calls": tool_calls} if tool_calls else {}),
+                            },
+                        ]
+                        + tool_msgs
+                    )
+                    _log(
+                        "   🔁 Solicitando corrección de esquema al modelo (vía tool message)..."
+                    )
+                    continue
+                else:
+                    _log(
+                        "❌ Máximo de reintentos alcanzado. Probando modelo de respaldo..."
+                    )
+                    break
 
     return {"annotations": []}
 

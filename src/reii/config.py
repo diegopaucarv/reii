@@ -53,7 +53,14 @@ NLI_MODEL: str = os.environ.get("REII_NLI_MODEL", "facebook/bart-large-mnli")
 # ---------------------------------------------------------------------------
 # LLM
 # ---------------------------------------------------------------------------
-LLM_MODEL: str = os.environ.get("REII_LLM_MODEL", "deepseek-chat")
+LLM_MODEL: str = os.environ.get("REII_LLM_MODEL", "deepseek-ai/DeepSeek-V4.1-Flash")
+LLM_FALLBACK_MODEL: str = os.environ.get(
+    "REII_LLM_FALLBACK_MODEL", "Prism-ML/Ternary-Bonsai-27B"
+)
+LLM_MAX_RETRIES: int = int(os.environ.get("REII_LLM_MAX_RETRIES", "5"))
+# Timeout de "silencio" en segundos: con streaming, es el tiempo máximo sin
+# recibir datos del modelo (no el tiempo total de generación).
+LLM_TIMEOUT: int = int(os.environ.get("REII_LLM_TIMEOUT", "300"))
 
 # ---------------------------------------------------------------------------
 # Stanza
@@ -76,6 +83,15 @@ DB_PATH: str = str(
 )
 WORKFLOW_DB_PATH: str = str(
     ROOT_DIR / os.environ.get("REII_WORKFLOW_DB_PATH", "data/workflow_data.json")
+)
+WORKFLOW_CONFIG_PATH: str = str(
+    ROOT_DIR / os.environ.get("REII_WORKFLOW_CONFIG_PATH", "data/workflow_config.json")
+)
+BATCH_DB_PATH: str = str(
+    ROOT_DIR / os.environ.get("REII_BATCH_DB_PATH", "data/entrevistas.json")
+)
+TRANSCRIPTS_DIR: str = str(
+    ROOT_DIR / os.environ.get("REII_TRANSCRIPTS_DIR", "data/entrevistas")
 )
 BEST_PARAMS_PATH: str = str(
     ROOT_DIR / os.environ.get("REII_BEST_PARAMS_PATH", "data/best_params.json")
@@ -122,12 +138,18 @@ USE_GENSIM_EMBEDDINGS: bool = (
 # ---------------------------------------------------------------------------
 # API keys / tokens
 # ---------------------------------------------------------------------------
-DEEPSEEK_API_KEY: str = os.environ.get("DEEPSEEK_API_KEY", "")
-DEEPSEEK_API_URL: str = os.environ.get(
-    "DEEPSEEK_API_URL", "https://api.deepseek.com/v1/chat/completions"
+TOGETHER_API_KEY: str = os.environ.get("TOGETHER_API_KEY", "")
+TOGETHER_API_URL: str = os.environ.get(
+    "TOGETHER_API_URL", "https://api.together.ai/v1/chat/completions"
 )
 # Base URL for OpenAI-compatible client (strips the /v1/chat/completions path)
+TOGETHER_BASE_URL: str = TOGETHER_API_URL.rsplit("/v1/", 1)[0]
+
+# Backward-compatible aliases (deprecated — prefer TOGETHER_*)
+DEEPSEEK_API_KEY: str = os.environ.get("DEEPSEEK_API_KEY", TOGETHER_API_KEY)
+DEEPSEEK_API_URL: str = os.environ.get("DEEPSEEK_API_URL", TOGETHER_API_URL)
 DEEPSEEK_BASE_URL: str = DEEPSEEK_API_URL.rsplit("/v1/", 1)[0]
+
 HF_TOKEN: str = os.environ.get("HF_TOKEN", "")
 
 # ---------------------------------------------------------------------------

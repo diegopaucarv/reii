@@ -28,7 +28,14 @@ services:
       - REII_DISCOURSE_STATE_PATH=data/discourse_state.json
       - REII_GRAMMAR_CONFIG_PATH=ia/0.json
       - REII_DISCOURSE_CONFIG_PATH=ia/1.json
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - REII_BATCH_DB_PATH=data/entrevistas.json
+      - REII_TRANSCRIPTS_DIR=data/entrevistas
+      - TOGETHER_API_KEY=${TOGETHER_API_KEY:-}
+      - TOGETHER_API_URL=${TOGETHER_API_URL:-https://api.together.ai/v1/chat/completions}
+      - REII_LLM_MODEL=${REII_LLM_MODEL:-deepseek-ai/DeepSeek-V4.1-Flash}
+      - REII_LLM_FALLBACK_MODEL=${REII_LLM_FALLBACK_MODEL:-Prism-ML/Ternary-Bonsai-27B}
+      - REII_LLM_MAX_RETRIES=${REII_LLM_MAX_RETRIES:-5}
+      - REII_LLM_TIMEOUT=${REII_LLM_TIMEOUT:-300}
       - HF_TOKEN=${HF_TOKEN:-}
     restart: unless-stopped
     command: >
@@ -60,7 +67,14 @@ services:
       - REII_DISCOURSE_STATE_PATH=data/discourse_state.json
       - REII_GRAMMAR_CONFIG_PATH=ia/0.json
       - REII_DISCOURSE_CONFIG_PATH=ia/1.json
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - REII_BATCH_DB_PATH=data/entrevistas.json
+      - REII_TRANSCRIPTS_DIR=data/entrevistas
+      - TOGETHER_API_KEY=${TOGETHER_API_KEY:-}
+      - TOGETHER_API_URL=${TOGETHER_API_URL:-https://api.together.ai/v1/chat/completions}
+      - REII_LLM_MODEL=${REII_LLM_MODEL:-deepseek-ai/DeepSeek-V4.1-Flash}
+      - REII_LLM_FALLBACK_MODEL=${REII_LLM_FALLBACK_MODEL:-Prism-ML/Ternary-Bonsai-27B}
+      - REII_LLM_MAX_RETRIES=${REII_LLM_MAX_RETRIES:-5}
+      - REII_LLM_TIMEOUT=${REII_LLM_TIMEOUT:-300}
       - HF_TOKEN=${HF_TOKEN:-}
     profiles: ["batch"]
     command: python src/reii/main_workflow_clasico.py

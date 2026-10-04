@@ -104,6 +104,7 @@ from reii.lang.es import (
     correct_pronoun_dependency,
     corregir_lema_para_clitico,
     detect_contraction,
+    es_coletilla_interrogativa,
     es_impersonal_se,
     es_media_se,
     es_pasiva_refleja,
@@ -215,8 +216,11 @@ def fix_colloquial_npi_deps(doc: Doc) -> Doc:
                 for word in token.sent:
                     if word.pos_ in ("VERB", "AUX"):
                         # Is this verb actually negated? Look at its children.
+                        # Coletillas interrogativas ("..., ¿no?") no cuentan.
                         is_negated = any(
-                            c.lower_ in negation_markers for c in word.children
+                            c.lower_ in negation_markers
+                            and not es_coletilla_interrogativa(c)
+                            for c in word.children
                         )
 
                         if is_negated:
@@ -344,10 +348,12 @@ class Config:
     db_path: str = DB_PATH
     use_subtlex_analytics: bool = True  # activa cálculos avanzados de SUBTLEX
     subtlex_analytics_cache: bool = True  # cachea resultados por UCE (evita recalc)
-    if stanza_use_gpu:
-        device = "cpu"
-    else:
-        device = "cuda"
+    # Dispositivo para modelos de torch (GLiNER, GPT-2, etc.). Se decide por
+    # disponibilidad real de CUDA, no por la bandera de Stanza (que solo aplica
+    # a Stanza). Antes estaba invertido y forzaba "cuda" en máquinas sin GPU.
+    device: str = field(
+        default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu"
+    )
 
 
 # ============================================================================
@@ -3771,6 +3777,9 @@ def extraer_negaciones(span: Span, offset_mapper: OffsetMapper) -> List[Dict]:
         )
         if not is_neg:
             continue
+        # Coletillas interrogativas ("..., ¿no?") no expresan negación
+        if es_coletilla_interrogativa(token):
+            continue
         alcance = get_negation_scope(token)
         tipo = tipo_negacion(token, alcance)  # <-- nueva función
         local_start = token.idx
@@ -5496,67 +5505,86 @@ class PipelineGramatical:
             docs_nlp = list(self.nlp.pipe(textos, batch_size=32))
             prev_span = None
             for uce, doc_spacy in zip(doc_uces, docs_nlp):
-                span = doc_spacy[:]
-                mapper = OffsetMapper(uce.start_char or 0)  # ← construct ONCE per UCE
-                self._enriquecer_uce_desde_span(uce, span, prev_span)
-                uce.token_surprisals = self._calcular_token_surprisals(span, mapper)
-                uce.negaciones = extraer_negaciones(span, mapper)
-                uce.entidades = ner(
-                    span, gliner_model=self.gliner_model, offset_mapper=mapper
-                )
-                uce.pronombres = extraer_pronombres_y_prodrop(span, mapper)
-                uce.verbos = extraer_verbos_enriquecido(
-                    span,
-                    deriver=self._morph_deriver,
-                    sub_clf=self.sub_clf,
-                    offset_mapper=mapper,
-                )
-                uce.cuantificadores = extraer_cuantificadores(
-                    span,
-                    self.we_analyzer,
-                    self.config.use_wordnet_quantifiers,
-                    self.marcadores_matcher,
-                    offset_mapper=mapper,
-                )
-                marcadores, densidad, _ = extraer_marcadores_discursivos(
-                    span,
-                    self.marcadores_matcher,
-                    self.surprisal_source,
-                    uce.texto,
-                    offset_mapper=mapper,
-                )
-                uce.marcadores_discursivos = marcadores
+                # Una UCE problemática no debe abortar el enriquecimiento del
+                # documento completo (ni del corpus): se registra y se sigue.
+                try:
+                    span = doc_spacy[:]
+                    mapper = OffsetMapper(
+                        uce.start_char or 0
+                    )  # ← construct ONCE per UCE
+                    self._enriquecer_uce_desde_span(uce, span, prev_span)
+                    uce.token_surprisals = self._calcular_token_surprisals(span, mapper)
+                    uce.negaciones = extraer_negaciones(span, mapper)
+                    uce.entidades = ner(
+                        span, gliner_model=self.gliner_model, offset_mapper=mapper
+                    )
+                    uce.pronombres = extraer_pronombres_y_prodrop(span, mapper)
+                    uce.verbos = extraer_verbos_enriquecido(
+                        span,
+                        deriver=self._morph_deriver,
+                        sub_clf=self.sub_clf,
+                        offset_mapper=mapper,
+                    )
+                    uce.cuantificadores = extraer_cuantificadores(
+                        span,
+                        self.we_analyzer,
+                        self.config.use_wordnet_quantifiers,
+                        self.marcadores_matcher,
+                        offset_mapper=mapper,
+                    )
+                    marcadores, densidad, _ = extraer_marcadores_discursivos(
+                        span,
+                        self.marcadores_matcher,
+                        self.surprisal_source,
+                        uce.texto,
+                        offset_mapper=mapper,
+                    )
+                    uce.marcadores_discursivos = marcadores
 
-                for adv_m in extraer_adverbios_robusto(
-                    span, self.adverb_matcher, offset_mapper=mapper
-                ):
-                    ctx = extraer_contexto_inteligente(doc_spacy, adv_m["root"])
-                    cat, conf = self._clasificar_adverbio_con_cache(ctx, adv_m["text"])
-                    uce.adverbios.append(
-                        {
-                            "texto": adv_m["text"],
-                            "categoria": cat,
-                            "confianza": conf,
-                            "es_multipalabra": adv_m["is_multiword"],
-                            "char_start": adv_m[
-                                "char_start"
-                            ],  # already global from extractor
-                            "char_end": adv_m["char_end"],
-                        }
+                    for adv_m in extraer_adverbios_robusto(
+                        span, self.adverb_matcher, offset_mapper=mapper
+                    ):
+                        ctx = extraer_contexto_inteligente(doc_spacy, adv_m["root"])
+                        cat, conf = self._clasificar_adverbio_con_cache(
+                            ctx, adv_m["text"]
+                        )
+                        uce.adverbios.append(
+                            {
+                                "texto": adv_m["text"],
+                                "categoria": cat,
+                                "confianza": conf,
+                                "es_multipalabra": adv_m["is_multiword"],
+                                "char_start": adv_m[
+                                    "char_start"
+                                ],  # already global from extractor
+                                "char_end": adv_m["char_end"],
+                            }
+                        )
+
+                    prev_span = span
+                except Exception as e:
+                    logger.warning(
+                        "Enriquecimiento falló para UCE %s (doc %s): %s",
+                        uce.id,
+                        origen_key,
+                        e,
                     )
 
-                # Registro (SUBTLEX)
-                if self.surprisal_source and hasattr(
-                    self.surprisal_source, "clasificar_registro"
-                ):
+            # Registro (SUBTLEX) — una sola vez por documento, no por UCE
+            if self.surprisal_source and hasattr(
+                self.surprisal_source, "clasificar_registro"
+            ):
+                try:
                     enriched_rows = self.surprisal_source.enriquecer_uces(doc_uces)
                     for uce_e, row in zip(doc_uces, enriched_rows):
                         uce_e.metricas_lexicas.update(
                             {k: v for k, v in row.items() if k != "uce_id"}
                         )
                     self._oov_analysis = self.surprisal_source.analisis_oov(doc_uces)
-
-                prev_span = span
+                except Exception as e:
+                    logger.warning(
+                        "Registro SUBTLEX falló para doc %s: %s", origen_key, e
+                    )
 
             # ──────────────────────────────────────────────────────────────
             # 4. Predicate frame extraction (still no clustering)

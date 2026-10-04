@@ -1,0 +1,461 @@
+{
+  "output": {
+    "segmentos": [
+      {
+        "numero_pregunta": 0,
+        "seccion_entrevista": "TEXTO_NO_ASIGNADO",
+        "texto_literal": "Ok, ya están rojitos. Si dejas de estar rojo, me vistas. Muy buenas tardes. Estamos en la entrevista Señor Sulturada, profundidad. Se llama sobre representaciones sociales sobre los riesgos del cambio climático y sus efectos en la salud. ¿Puedes decirnos por favor tu pseudónimo?"
+      },
+      {
+        "numero_pregunta": 0,
+        "seccion_entrevista": "TEXTO_NO_ASIGNADO",
+        "texto_literal": "Es tulipán rosado."
+      },
+      {
+        "numero_pregunta": 0,
+        "seccion_entrevista": "TEXTO_NO_ASIGNADO",
+        "texto_literal": "Tulipán rosado, wow, ya, qué bonito. Señorita, tulipán rosado. Ya sabes que lo que nosotros vamos a registrar aquí pues son tus opiniones, tus creencias, tu forma de ver la realidad con respecto a la problemática del cambio climático, tus impresiones, tus percepciones. Esos aspectos a nosotros nos interesaría el día conocerlo de modo que eres libre de decir las cosas que tú quieres, con cada pregunta. Bueno, dentro de nuestras preguntas están… ¿Qué edad tienes, tulipán rosado? 25. ¿Cuál es tu ocupación si es que trabajas además de ser estudiante de educación primaria?"
+      },
+      {
+        "numero_pregunta": 4,
+        "seccion_entrevista": "I. Datos sociodemográficos y perfil profesional",
+        "texto_literal": "Trabajo en un grupo musical, soy cantante."
+      },
+      {
+        "numero_pregunta": 4,
+        "seccion_entrevista": "I. Datos sociodemográficos y perfil profesional",
+        "texto_literal": "Wow, qué tipo de cantante."
+      },
+      {
+        "numero_pregunta": 4,
+        "seccion_entrevista": "I. Datos sociodemográficos y perfil profesional",
+        "texto_literal": "Música variada. ¿Música variada? Pero cuál es tu fuerte? La cumbia."
+      },
+      {
+        "numero_pregunta": 4,
+        "seccion_entrevista": "I. Datos sociodemográficos y perfil profesional",
+        "texto_literal": "Así estamos usando, o sea bien. Ya eres conocida acá en el medio. En el medio estudiantil me estoy definiendo. Bueno, esa la vez hobby, esa la vez fuente de trabajo. Así es. Procedencia. ¿De dónde has ido? ¿De dónde vienes?"
+      },
+      {
+        "numero_pregunta": 5,
+        "seccion_entrevista": "I. Datos sociodemográficos y perfil profesional",
+        "texto_literal": "No estoy aquí en la ciudad de Guamanga."
+      },
+      {
+        "numero_pregunta": 5,
+        "seccion_entrevista": "I. Datos sociodemográficos y perfil profesional",
+        "texto_literal": "Guamangina, 100% de corazón. Perfecto. ¿En qué distrito vives actualmente? Carminar. Carminar, está un poquito lejos de aquí. Carrera que estudias."
+      },
+      {
+        "numero_pregunta": 7,
+        "seccion_entrevista": "I. Datos sociodemográficos y perfil profesional",
+        "texto_literal": "Educación primaria."
+      },
+      {
+        "numero_pregunta": 7,
+        "seccion_entrevista": "I. Datos sociodemográficos y perfil profesional",
+        "texto_literal": "Especialidad primaria. Vamos a decir las preguntas de fondo. Las preguntas de fondo son, cuando piensas en cambio climático, ¿qué se te viene a la cabeza? ¿Podrías darnos la respuesta? ¿Veo a profundizar en ella?"
+      },
+      {
+        "numero_pregunta": 11,
+        "seccion_entrevista": "II. Concepciones e información general sobre el cambio climático",
+        "texto_literal": "Bueno, cuando escucho la palabra cambio climático, se me viene la cabeza a cambios en lo que es el aumento de la radiación solar, lluvias en tiempos que no deberían suscitarse, también los vientos, vientos bastante fuertes, que todos estos fenómenos naturales se han venido perjudicando a todo lo que viene a ser los productores de primera necesidad. Bueno, eso es lo que generalmente pienso sobre los cambios climáticos, que estos han generado algunas dificultades en la necesidad."
+      },
+      {
+        "numero_pregunta": 12,
+        "seccion_entrevista": "II. Concepciones e información general sobre el cambio climático",
+        "texto_literal": "Un poco para andar ahí. ¿Esto se da en la zona urbana o rural?"
+      },
+      {
+        "numero_pregunta": 12,
+        "seccion_entrevista": "II. Concepciones e información general sobre el cambio climático",
+        "texto_literal": "Bueno, en la zona urbana también ha habido tanto como en las zonas rurales, sin embargo, el mayor riesgo lo han corrido en las zonas rurales. ¿Altoandina? Altoandina es pues lo que han habido heladas, y ello ha, consecuencia de esto, ha habido la menor producción, lo que es en los tubérculos, lo que es papa, lo que son los ollucos y algunos otros alimentos que son producidos por las zonas altoandinas."
+      },
+      {
+        "numero_pregunta": 12,
+        "seccion_entrevista": "II. Concepciones e información general sobre el cambio climático",
+        "texto_literal": "En este caso, esta situación ha mermado, ha contribuido a generar alguna situación problemática?"
+      },
+      {
+        "numero_pregunta": 12,
+        "seccion_entrevista": "II. Concepciones e información general sobre el cambio climático",
+        "texto_literal": "Sí, por ejemplo, una de las situaciones que ha generado se la aumentó de los precios en estos productos, y también la escasez de esos productos. Y otro es que también pues al agregarse, al haber escasez en estos productos, el alza de sus precios entonces genera, genera una mayor, un incremento de indó que son los, este no, en el, lo que viene a hacer la economía de los primeros alimentos básicos, en primer ración. Entiendo."
+      },
+      {
+        "numero_pregunta": 12,
+        "seccion_entrevista": "II. Concepciones e información general sobre el cambio climático",
+        "texto_literal": "Y un poco abundando en esta situación, en este dato que queremos, digamos, cuál sería la causa o el origen de lo que en este momento venimos conversando?"
+      },
+      {
+        "numero_pregunta": 12,
+        "seccion_entrevista": "II. Concepciones e información general sobre el cambio climático",
+        "texto_literal": "Bueno, pienso que el origen de estos cambios climáticos se viene dando por la contaminación ambiental que ha ido en mayor incremento. He visto, y también en las calles, la falta de educación ambiental, y no sólo en la ciudad de Guamanga, sino también en la ciudad de Lima, en otras ciudades que el uso de los plásticos ha ido a aumento y esto pues sé que un plástico o una bolsa fabricada pues demora más de, más de 100 años en degradarse. Entonces hace que esto se contaminen del suelo, el arro, el aire, por las fábricas y también la tala excesiva de árboles que hacen que estos cambios se dean y pues sólo traigan consecuencias muy perjudiciales para ser humano."
+      },
+      {
+        "numero_pregunta": 13,
+        "seccion_entrevista": "II. Concepciones e información general sobre el cambio climático",
+        "texto_literal": "Así es, muy bien. En la pregunta número, vamos a continuar por favor. A través de qué medios ha recibido noticias sobre cambios climáticos, noticias o información de estos mensajes, ¿cuál les destacaría como el más importante? Vamos por la primera parte. A través de qué medios ha recibido esta información."
+      },
+      {
+        "numero_pregunta": 13,
+        "seccion_entrevista": "II. Concepciones e información general sobre el cambio climático",
+        "texto_literal": "Bueno, a través de medio televisivo que son las noticias y otros son pues los videos en YouTube y los documentales, la cual doy mayor importancia a estos documentales, puesto que aparte de que nos informen cómo está, nos dan algunas soluciones, nos proponen algunas soluciones en las cuales podemos contribuir en la disminución de la contaminación ambiental."
+      },
+      {
+        "numero_pregunta": 14,
+        "seccion_entrevista": "II. Concepciones e información general sobre el cambio climático",
+        "texto_literal": "Mucha información, entonces, por las medios de información, en este caso, las redes sociales, me estás diciendo que después documentales, qué bien, qué bien. Entonces, yo creo que está bien tu respuesta. Sin embargo, acá nos preguntan de todas estas noticias que has venido recibiendo, ¿cuál les destacaría como aquella que es más importante, más relevante, de mayor impacto"
+      },
+      {
+        "numero_pregunta": 14,
+        "seccion_entrevista": "II. Concepciones e información general sobre el cambio climático",
+        "texto_literal": "acá en la región, siempre buscando, viendo nuestro país y viendo la región. ¿Por qué te acoce lo global? Claro. Bueno, doy más relevancia a las informaciones que vemos en el medio de las noticias y también lo que se ve día a día, ¿no? Lo que yo veo día a día en tan solo en una zona pequeña que es el distrito de mal, esta zona, sino también genere enfermedades."
+      },
+      {
+        "numero_pregunta": 14,
+        "seccion_entrevista": "II. Concepciones e información general sobre el cambio climático",
+        "texto_literal": "¿Cómo así, cómo así, genial enfermedades? ¿Qué pasa en Carmo en Alto?"
+      },
+      {
+        "numero_pregunta": 14,
+        "seccion_entrevista": "II. Concepciones e información general sobre el cambio climático",
+        "texto_literal": "Bueno, no, los carros y colectores pasan, ahí tienen horarios, donde se sabe ya la gente que debería sacar su basura cuando el carro y colectores estén camino. Pero ¿qué pasa con las personas? Los sacan días antes y esas bolsas de basura que están llenas de distintos materiales que han usado, incluso hay carnes, pollos y esto, pues los perros hacen que se dispersen todo."
+      },
+      {
+        "numero_pregunta": 16,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Entonces, te interesan las noticias, locales en otros pasos, en otros pasos, más que en las otras, con relación a cambio climático. ¿Percibes diferencias entre cómo es hoy en día el clima de la región y cómo solía ser antes, de cuando estabas más chiquita o tu padre te comentaba, ¿no? Sí."
+      },
+      {
+        "numero_pregunta": 16,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "A ver. Sí, yo siento una gran diferencia cuando yo tenía 7 o 8 años, estaba en la primaria y yo sabía cuáles eran las temporadas de lluvia y sabíamos que esas temporadas de lluvia ya la gente tenía que cuidarse, tenía que prever algunos embrios y no había ningún problema, ¿no? No había ningún problema. No veía que existían demasiados huaicos, demasiados derrumbes y tampoco, no sé si porque era niña no tomaba tan importancia a las noticias, pero tampoco veía demasiados perjudicados a los agricultores. Entonces comparando, haciendo una comparación delante, si ahora el actualidad, si ve una gran diferencia, puesto que ahora no sabes si el mes que debe de ver lluvias, no sabe si eso se va a dar puesto que ha habido sequías en la temporada de lluvias y en la temporada de sol hace lluvia, ¿no? Entonces eso hace que la gente que produce alimentos no tenga producción, la producción que se esperaba. O nula. O nula incluso, ¿no? Ya. Entonces ve esa gran diferencia delante y de una actualidad."
+      },
+      {
+        "numero_pregunta": 17,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Hay una gran cambio que ha habido. Dentro de esto, hace desde cuánto tiempo, más o menos en términos de años estamos hablando, porque viene me agurriendo todo esto."
+      },
+      {
+        "numero_pregunta": 17,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Ah, esos cambios veo viendo cuando yo tenía, ahora tengo 25 años, les estaríamos hablando más o menos de hace 10 años atrás. Oh, regular."
+      },
+      {
+        "numero_pregunta": 17,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Y tu padre comentaba también sobre ese tema, ¿no?"
+      },
+      {
+        "numero_pregunta": 17,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Sí, mis padres también lo comentaban. ¿Y los han vivido aquí siempre? Siempre."
+      },
+      {
+        "numero_pregunta": 17,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Ellos viven en otra zona. Ah, y también producen lo que es papas o llucos. Entonces hace 10 años estás habiendo esos cambios, ¿no? Sí. ¿Y todo esto qué significa para ti? Todo esto que estaba viendo en este momento, ¿hay usted a qué tiene 25 años?"
+      },
+      {
+        "numero_pregunta": 18,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Bueno, para mí significa una irresponsabilidad de parte de nosotros, los seres humanos, que no medimos el consumo de muchos productos que dañan nuestro planeta. Y si no sabemos cuidar nuestro espacio, pues seguramente vamos a seguir destruyéndolo como hemos estado haciendo hasta ahora. Y si no tomamos conciencia de ello, seguramente las consecuencias les vamos a ir viendo más adelante. Las nuevas generaciones. Ah, las nuevas generaciones y a las que dejamos, pues vamos a dejar un mundo mucho más, una tierra mucho más peligrosa, poco productiva. Incluso difícil de adaptarse."
+      },
+      {
+        "numero_pregunta": 19,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Entiendo. Muy interesante tu reflexión. ¿Ya? Seguimos entonces. ¿Cómo influye para ti el cambio climático en la vida de las personas? La vida la entendemos como aquello que acontece que sucede en el día a día. En el día a día hay muchos eventos. Es sí, me uno minutos te estoy devolviendo la llamada, ya. Por favor, minutos. Entonces te decía de que la vida es lo que el cotidiano hacemos, tanto en nuestro hogar, en nuestro hogar, en nuestro laboral, etcétera. Esa es la vida que ocurre todo. ¿Cómo influye este cambio climático en la vida de las personas, en esa señora, en esa medicada, en ese grupo familiar?"
+      },
+      {
+        "numero_pregunta": 19,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Bueno, el cambio climático influye bastante en la persona."
+      },
+      {
+        "numero_pregunta": 19,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "¿En qué tipo de personas, por ejemplo?"
+      },
+      {
+        "numero_pregunta": 19,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Por ejemplo, en una persona este..."
+      },
+      {
+        "numero_pregunta": 19,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Habran personas que son adulta mayores, hablan personas que son niños. Así es. Nos consideramos de pronto habrá un otro grupo más vulnerables. Así es. Que no están necesariamente... Entonces veamos en esto cuando vemos personas. ¿Cómo influye el cambio climático en la vida de las personas?"
+      },
+      {
+        "numero_pregunta": 19,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Bueno, en este aspecto podría tomar una persona adulta, ¿no? Una persona adulta que en esta persona va a influir de manera... Estos cambios influyen de manera importante porque el hecho de saber que la radiación solar está cada vez más fuerte va a influir en su estado de salud, en el estado emocional y también en su estado económico. No, uno en el estado de salud, si esta persona no se protege, pues, este, no, va a hacer que estos estados radiaciones solares generan algunos dolores de cabeza, generan, este, incluso, dificultad en la vista y también generan algunas quemaduras en las piel, si no te proteges, ¿no? Con el protector solar. En el estado de ánimo, en el estado emocional, también influye bastante porque a veces la radiación solar también nos genera un poco de estrés, cansancio y eso hace que cuando llegues a casa, después de un largo trabajo, de un día bastante, este, donde has agotado, donde has agotado todas tus fuerzas cognitivas como también físicas, dejas algunas actividades y te pones a descansar y el hecho de dejar las cosas para mañana genera estrés en la persona, genera ansiedad y preocupación."
+      },
+      {
+        "numero_pregunta": 19,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Muy bien, estamos entonces en este parte de la vida de las personas como influye, ¿no? Si influye de esa manera, en todo caso, ¿por qué? ¿Por qué no se hace nada? ¿Por qué no actúan?"
+      },
+      {
+        "numero_pregunta": 19,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Yo pienso que porque la gente, la mayoría de las personas, creen que esto es una situación que no tiene mucha importancia,"
+      },
+      {
+        "numero_pregunta": 19,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "que creen que es algo superficial, que no... Que va a"
+      },
+      {
+        "numero_pregunta": 19,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "pasar, que va a pasar, que simplemente es temporal, ¿no? No le dan importancia de vida a este tipo de problemas. ¿Cómo crees que el cambio climático puede afectar la salud de las personas?"
+      },
+      {
+        "numero_pregunta": 21,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Bueno, el cambio climático, en general, en de cierta manera, en de cierta manera perjudicial, como es en el este, ¿no? Al ver un cambio, al generarse un cambio climático, pues se genera a veces algunos fenómenos naturales que se dan, por ejemplo, ¿no? En los huaicos. Los huaicos pues llevan piedras, tierras, barros, lodo, entonces el río se contamina y ese río contaminado tal vez está siendo consumido por personas que no tienen adaptado en su comunidad los servicios básicos, entonces genera diarrea, genera malestaria de estomacal, ¿no? Y algunas otras enfermedades y aparte también la radiación solar fuerte, como decía anteriormente, genera dolores de cabeza, estrés, cansancio, algunos, incluso, sienten fatigarse, no? Sufocación."
+      },
+      {
+        "numero_pregunta": 21,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Muy bien, entonces, afecta a las salud de las personas, ¿no?"
+      },
+      {
+        "numero_pregunta": 21,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Entonces, se ha referido a los adultos, ¿no? A los adultos también. Pero también, ¿trabajas con niños? ¿Cómo que cosas has visto ahí? ¿Se ven afectados los colores? Sí, se ven afectados los escolares cuando la radiación es muy intensa, están muy acalorados, inquietos, ya no salen a jugar, ya no salen a jugar y a veces se queda en el salón, se sienten muy estresados, aburridos y eso genera que la atención en ellos, la concentración, sea muy, este, deible, escasa."
+      },
+      {
+        "numero_pregunta": 21,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "¿Se están afectando? ¿Pero se te han enfermado estos chiquitos?"
+      },
+      {
+        "numero_pregunta": 21,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Sí, algunos se han enfermado. ¿De qué? Algunos se han enfermado de la tifuidea, puesto que las frutas han estado en un ambiente donde llegó demasiada radiación, más la contaminación en algún lugar, entonces comieron alguna fruta sin ser muy bien lavada, tuvieron tifuidea una semana, faltaron las clases."
+      },
+      {
+        "numero_pregunta": 21,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "¿Todo el lado? Sí, imagino que se contagiaron un grupo. Sí, sí. De esa manera, tú has observado que les han afectado."
+      },
+      {
+        "numero_pregunta": 22,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "De esa manera. Y en su familia, personas cercanas, tu grupo estudiantil, no más cercano, tu vecino, ¿de qué manera les ha afectado el cambio climático a esas otras personas? Ya no tu propio, tus papiomiembros de tu familia, sino un poquito más allá. Sí, también puede ser la familia, en el problema. Bueno, los cambios climáticos han afectado, por ejemplo, tengo compañeros que viven en zonas rurales y ha habido algunos derrumbes por algunas lluvias que se han habido y no llegan a clases a tiempo. Y otro es, tengo familiares que también siembran lo que son las papas y esas personas, la producción que tenían planeado no llegó a ser la que ellos pensaban y fracasaron, que es la producción y la venta de sus alimentos."
+      },
+      {
+        "numero_pregunta": 22,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "Se había afectado tremendamente. Esta experiencia que tú has visto, bueno, al respecto, ¿cómo podías tú representar eso que te han dicho tus compañeros de alguna manera? ¿Cómo te lo imaginas tú que eso pasó? Un poco así. ¿Te han contado ellos esas circunstancias difíciles como fue los derrumbes? ¿Te han afectado, te han contado?"
+      },
+      {
+        "numero_pregunta": 22,
+        "seccion_entrevista": "III. Percepciones del entorno y efectos directos",
+        "texto_literal": "¿Qué fue lo que también yo le he pasado y también mis compañeros me lo comentaron. Los derrumbes en las carreteras son bastante... Más frecuentes. Más frecuentes. Incluso ha habido muchos accidentes aquí en Guamanga, del Camino Aseya, Yacucho, Asealima y incluso ha habido parientes que han fallecido. Ha puesto que las carreteras están... los derrumbes de algunas montañas se vienen hacia abajo y tapa todo lo que es, todo lo que es la carretera y no se puede pasar. Incluso hay demasiado lobos, donde hay llantas que se quedan ahí atrapados, incluso hay carros que se quedan. ¿Y sus viviendas? Y también ha habido viviendas afectadas, que se les ha llevado los huaicos y en algunos casos los vientos se les llevó el techo y todo eso ha sido bastante perjuicial."
+      },
+      {
+        "numero_pregunta": 23,
+        "seccion_entrevista": "IV. El rol de la educación universitaria",
+        "texto_literal": "Hola, muy disolador perder su vivienda. Bien, entonces eso. ¿Consideras que en la educación universitaria le ofrecen a ustedes conocimientos suficientes sobre el cambio climático y sus efectos? Sí o no? ¿Y por qué? No."
+      },
+      {
+        "numero_pregunta": 23,
+        "seccion_entrevista": "IV. El rol de la educación universitaria",
+        "texto_literal": "Bueno, de acuerdo de lo que, de acuerdo de la preparación que he tenido y tenemos algunos cursos como esa educación ambiental, hemos hablado sobre lo que es geografía, lo que es cartografía y todo eso. Sin embargo, no nos hemos hablado a grandes rasgos sobre el cambio climático, pero no a profundidad donde… y tampoco me hubiese gustado que hagamos proyectos que nos permitan dar soluciones efectivas, soluciones significativas que podamos contribuir a esto de que no sea tan perjudicial para nosotros los universitarios y si nosotros aprendemos, los enseñamos a nuestra comunidad, a nuestro distrito y así la ayuda sea masiva. Sin embargo, en la universidad no ha habido única pien o habido cierta importancia en esto del cambio climático. Eso lo se habló, se habla de esto, pero no se da soluciones."
+      },
+      {
+        "numero_pregunta": 23,
+        "seccion_entrevista": "IV. El rol de la educación universitaria",
+        "texto_literal": "Interesante lo que me estás diciendo, ¿no? Tremendamente. Vamos un poco a analizar ahora el por qué, ¿no? ¿Por qué piensa que está pasando esto, que la universidad tampoco logra desarrollar proyectos? ¿Sólo que se dijo eso?"
+      },
+      {
+        "numero_pregunta": 23,
+        "seccion_entrevista": "IV. El rol de la educación universitaria",
+        "texto_literal": "Tal vez estos de los proyectos seren en otras escuelas profesionales. Tal vez en otras escuelas si sepan este tipo de proyectos, lo hagan, no tengo conocimiento. Y si tuvieran este tipo de proyectos, me gustaría que lo hagan. Estas informaciones, esos proyectos sean masivos, ¿no? Que nosotros como profesores vamos a también formar niños, estudiantes que sepan estas cosas y que estén informados, que estén prevenidos, preparados para este tipo de situaciones. Y no sea una sorpresa. Ajá, y no sea algo que ellos desconozcan, ¿no? Entonces, sería importante que este tipo de temas se den en todas las escuelas y se den la importancia necesaria para que todos estemos preparados, porque no solo las personas que están allá en lo que viene a ser en las zonas rurales son los afectados, sino también las urbanas, porque de ellos son que... Ellos producen, nosotros compramos y si ellos no producen, no hay de donde comprar."
+      },
+      {
+        "numero_pregunta": 24,
+        "seccion_entrevista": "IV. El rol de la educación universitaria",
+        "texto_literal": "Es una cadena, ¿verdad? Tremenda. Muy importante, por cierto. Está el tema alimentario. Así es. Y no hay eso. Hoy en día es de los niños. Muy bien se ven afectados. Entonces, vamos a pasar a la siguiente. En su plan de estudios como estudiante de educación, ha desarrollado estos temas en alguna de tus asignaturas. Ya me dijo usted algo de eso, ¿no? El curso de educación ambiental y en la cultura y ecología. ¿En cuál de las asignaturas...? No, ya las almojas las asignaturas. Más bien la pregunta es ¿qué aprendiste dentro de estas asignaturas? Y si consideras suficiente o adecuado a esa que he recibido."
+      },
+      {
+        "numero_pregunta": 24,
+        "seccion_entrevista": "IV. El rol de la educación universitaria",
+        "texto_literal": "Sí, aprendí que todo, todo ser que existe en este... en ese planeta tiene una función. Por tanto contribuye a lo que vine a hacer, ¿no? A un gusanito, una hormiga. Ayuda a que el planeta aún tenga vida, ¿no? Y que hay que saberla cuidar, hay que saberla proteger. Entonces, sin embargo, no la considero completamente suficiente para poder prevenir este tipo de situaciones. Y me gustaría, ¿no?, que sería un poco más... que se..."
+      },
+      {
+        "numero_pregunta": 24,
+        "seccion_entrevista": "IV. El rol de la educación universitaria",
+        "texto_literal": "¿Más teorías o más prácticas? Más prácticas. Más prácticas. Porque teorías si la hemos tratado. ¿Esta práctica sería solo de los estudiantes de educación? ¿O usted piensa que de pronto también con las otras carreras que hacen... ¿Qué también tienen interés en este problema?"
+      },
+      {
+        "numero_pregunta": 24,
+        "seccion_entrevista": "IV. El rol de la educación universitaria",
+        "texto_literal": "Exacto, que todas las carreras de la Universidad de las 27 Escuelas Profesionales tengan este tipo de escena de información que haya una área específica para este tipo de..."
+      },
+      {
+        "numero_pregunta": 24,
+        "seccion_entrevista": "IV. El rol de la educación universitaria",
+        "texto_literal": "Desarrollando su proyecto. Así es, desarrollando un proyecto. Desarrollando su proyecto. Bien, entonces, ¿está viendo ya las soluciones desde ahora? Que a veces problemas son tan complejos que una sola profesión no lo puede ahorrar."
+      },
+      {
+        "numero_pregunta": 24,
+        "seccion_entrevista": "IV. El rol de la educación universitaria",
+        "texto_literal": "No lo puede ahorrar, claro. Sí, así es."
+      },
+      {
+        "numero_pregunta": 25,
+        "seccion_entrevista": "IV. El rol de la educación universitaria",
+        "texto_literal": "Pero usted tiene mucha cercanía a la comunidad. ¿Considere importante abordar, ya estamos hablando, de esta pregunta, entonces, como consecuencia de esto, vamos a decir la pregunta del plan de estudio que ha sido abordada, que aprendió usted allí, ¿no? Ahora, ¿considere importante abordar el cambio climático, entonces, en la educación, y por qué?"
+      },
+      {
+        "numero_pregunta": 25,
+        "seccion_entrevista": "IV. El rol de la educación universitaria",
+        "texto_literal": "Sí, la considero importante, porque es una situación que se está dando actualmente y se va a seguir dando. El cambio climático es un tema vital, esta importancia es vital para que los niños aprendan, entiendan de que al darse un cambio climático genera problemas primero mundiales, después se vienen nacionales, después locales, lo cual va a perjudicar de cualquier forma en su vida cotidiana. Entonces, si nosotros educamos a los chicos a realizar proyectos desde pequeños, y es los proyectos que lo pongamos en práctica con ellos, y ellos sepan cómo puede manejar este tipo de situaciones en su casa,"
+      },
+      {
+        "numero_pregunta": 25,
+        "seccion_entrevista": "IV. El rol de la educación universitaria",
+        "texto_literal": "primeramente, y después en su comunidad, y así esto, se va haciendo más masiva. Muy bien, ya he dicho todo. Otra pregunta es, si tuviese la oportunidad de cambiar, ustedes la llaman para integrar una comisión conjuntamente con sus compañeros, y si tuvieras tu oportunidad de cambiar o aportar a tu plan de estudios o alguna asignatura en particular que se relacione con cambio climático, ¿qué cambiaría en tu plan de estudios?"
+      },
+      {
+        "numero_pregunta": 26,
+        "seccion_entrevista": "IV. El rol de la educación universitaria",
+        "texto_literal": "Cambiaría lo que vine a hacer en el plan de estudios sobre educación ambiental, solo hemos llevado teóricamente, y hemos llevado una práctica, un proyecto pequeñito sobre los gusanos que generan ceda. Entonces, cambiaría con más proyectos, más proyectos que nos permitan generar cambios, primero en nuestra escuela, después en toda la universidad, en lo que son el uso de los materiales resíos, resíos orgánicos, y cambiaría lo que es la alimentación en los cafetines, porque esto viene a ser algunas cosas que, en vez de ayudarnos a nosotros, a alguna vez nos enfermen."
+      },
+      {
+        "numero_pregunta": 27,
+        "seccion_entrevista": "V. Acciones de mitigación y proyección docente",
+        "texto_literal": "Muy bien, entonces, había muchas cositas que hacer, dentro de todo esto, y usted desde el primer oportunidad ciudad. Eso te ha dicho, ¿no? Hola, gente. Usted o alguien entre sus compañeros y profesores, ¿han asumido alguna acción o actividad en particular aportando a la mitigación del cambio climático? Puede ser dentro de una asignatura, o puede ser como un voluntariado o algo así. Cuéntame si ha habido esa experiencia."
+      },
+      {
+        "numero_pregunta": 27,
+        "seccion_entrevista": "V. Acciones de mitigación y proyección docente",
+        "texto_literal": "Bueno, si hay algunas asignaturas, hubo profesores que nos recomendaron plantar árboles, árboles frutales, tener un lugar en el que en la universidad... ¿Sí, viste la entrada? Hay unos plantoncitos. Entonces, hemos plantado muchas flores, algunas plantas frutales, que permitan que mientras hay más árboles, mejores el oxígeno. Entonces, ese tipo de proyectos, así chiquitos que los profesores nos mandaron hacer, y otro es los tachos, ¿no? donde se puede reciclar, los tachos orgánicos, y todo ello que nos permite separar... ¿Lacificar? ¿Lacificar?"
+      },
+      {
+        "numero_pregunta": 27,
+        "seccion_entrevista": "V. Acciones de mitigación y proyección docente",
+        "texto_literal": "Muy bien, los tachos. Perfecto. Entonces, pasamos a la siguiente. Pero, ¿crees que esa acción es suficiente?"
+      },
+      {
+        "numero_pregunta": 27,
+        "seccion_entrevista": "V. Acciones de mitigación y proyección docente",
+        "texto_literal": "Bueno, esa acción no es el de total suficiente, sin embargo, sí ayuda un poco a reducir lo que es, ¿no? Mejorar el ambiente, por ejemplo, con las plantas. Sin embargo, no es suficiente porque así nosotros... ¿Qué necesita? ...se clasifiquen, pues lo dejamos ahí, ya no sabemos más de lo que es clasifica, y como que la ayuda es muy escasa."
+      },
+      {
+        "numero_pregunta": 27,
+        "seccion_entrevista": "V. Acciones de mitigación y proyección docente",
+        "texto_literal": "¿Y por qué la ayuda es escasa? ¿No están interesadas las especies?"
+      },
+      {
+        "numero_pregunta": 27,
+        "seccion_entrevista": "V. Acciones de mitigación y proyección docente",
+        "texto_literal": "Sí, porque las autoridades no le toman interés a esto, no le dan la importancia de vida, puesto que creen que no es relevante, y creen que no afecta al estudiante, sin embargo, sí nos afecta, ¿no?"
+      },
+      {
+        "numero_pregunta": 27,
+        "seccion_entrevista": "V. Acciones de mitigación y proyección docente",
+        "texto_literal": "Mmm-hmm. Ya. Él es afecto, pero no hay respuesta de parte de las autoridades, es lo que me está diciendo, ¿no? Sí. ¿Qué podría hacerse con acción sostenible, es decir, como una acción que perdure en el tiempo, ¿no? Para el problema del cambio climático, ya sea acá, dentro de la universidad, ya sea en su región, en el ámbito que usted más conoce?"
+      },
+      {
+        "numero_pregunta": 28,
+        "seccion_entrevista": "V. Acciones de mitigación y proyección docente",
+        "texto_literal": "Bueno, ¿no? Me gustaría que se hicieran, en cada lugar hubiera esos tachitos porque los tachos son escasos aquí en la ciudad, en los parques al, pero igual la gente no tiene una educación ambiental y llena los tachos hasta que estén rebalzando de basura, y también en algunas ocasiones no cuidan los parques, y bueno, ¿no? La solución, otra solución sería también que existiera una multa para aquellas personas, o también he visto en otros lugares que hay incentivos para aquellas personas para todos los hogares que se paran, clasifican las basuras, empezando del hogar, porque actualmente los carros recolectores recogen la basura tal cual. No las clasificamos."
+      },
+      {
+        "numero_pregunta": 28,
+        "seccion_entrevista": "V. Acciones de mitigación y proyección docente",
+        "texto_literal": "No las clasificamos, no hay esa iniciativa todavía de parte del municipio."
+      },
+      {
+        "numero_pregunta": 28,
+        "seccion_entrevista": "V. Acciones de mitigación y proyección docente",
+        "texto_literal": "No hay esa iniciativa, pero sería bueno que haya para que para ellos también los trabajadores de los recolectores sean más fácil clasificar esto y evitar"
+      },
+      {
+        "numero_pregunta": 28,
+        "seccion_entrevista": "V. Acciones de mitigación y proyección docente",
+        "texto_literal": "tanta contaminación para el eso. Hay unas bolsas especiales que entregan los municipios, y ya sabes que esas bolsas se enganjadas para desclato, que son botellas y las que son cajas, unas cosas así, y un carro recolector específico para los rotipos de basura. Así es. Esta posibilidad, entonces, todavía no está en la mente de las personas que tienen que tomar decisión por lo que veo. Así es. Bien, entonces, como ha sido sostenible mucho por hacer, ¿no? Sí."
+      },
+      {
+        "numero_pregunta": 28,
+        "seccion_entrevista": "V. Acciones de mitigación y proyección docente",
+        "texto_literal": "¿Y en qué aportaría esa iniciativa que estás diciendo?"
+      },
+      {
+        "numero_pregunta": 28,
+        "seccion_entrevista": "V. Acciones de mitigación y proyección docente",
+        "texto_literal": "Aportaría en que la gente estuviera un poco más de criterio al momento de echar basura, ¿no? Al clasificarlos, sepan los padres, los hijos, y también los nietos, ¿no? Y todos los integrantes de la familia, que las basuras no se echan en su lugar, sino que hay que clasificarla. Y al ser clasificadas, pues, evitamos menos contaminación. Y ayudamos a que esos materiales se puedan algunos reutilizar."
+      },
+      {
+        "numero_pregunta": 29,
+        "seccion_entrevista": "V. Acciones de mitigación y proyección docente",
+        "texto_literal": "Muy bien. Como futuro docente, ¿te interesaría enseñar sobre este tema? ¿A quiénes? ¿Qué les enseñarías? ¿Y cómo?"
+      },
+      {
+        "numero_pregunta": 29,
+        "seccion_entrevista": "V. Acciones de mitigación y proyección docente",
+        "texto_literal": "Bueno, como futuro docente, me gusta bastante el tema ambiental, lo que más aún viene a ser el cambio climático. Y me aplicaría en el aula, ¿no? Teniendo, primero, haciendo que los pequeños sepan cuidar una planta, sean responsables de esa, que esa planta crezca, que esa planta sea abonada, y me gustaría enseñarles a aquellos que tengan su propio bono orgánico. Y que en casa también puedan sembrar, como por ejemplo, algunos productos como la lechuga, los ajos, la cebolla. Y de esta manera, ayuden en casa disminuyendo lo que es los gastos económicos, y además de ello, desestresen su tiempo sabiendo este cultivar plantas, y que se sientan satisfechos de que ellos sean responsables de cuidar sus propias plantas."
+      },
+      {
+        "numero_pregunta": 30,
+        "seccion_entrevista": "VI. Perspectiva futura y responsabilidad social",
+        "texto_literal": "¿Crees que estos cambios climáticos con el tiempo se incrementarán? ¿Se mantendrá igual? ¿O mejorará la situación? ¿En qué sentido y por qué?"
+      },
+      {
+        "numero_pregunta": 30,
+        "seccion_entrevista": "VI. Perspectiva futura y responsabilidad social",
+        "texto_literal": "Bueno, creo que si estamos siendo como hasta ahora, que la gente, no toma conciencia de esta contaminación y de esto de cambio climático, pues incluso empeoraría. Pero si hubieran decisiones importantes desde el Estado, desde nuestro gobierno implementar algunos proyectos en casa, incentivos para todas las familias que sepan clasificar, disminuiríamos bastante y también me gustaría que hubieran proyectos donde los fines de semanas no se haga uso absoluto de los transportes, se use más en las bicicletas y tipos que así evitamos también la contaminación."
+      },
+      {
+        "numero_pregunta": 30,
+        "seccion_entrevista": "VI. Perspectiva futura y responsabilidad social",
+        "texto_literal": "¿Como con el mismo país de saludado?"
+      },
+      {
+        "numero_pregunta": 30,
+        "seccion_entrevista": "VI. Perspectiva futura y responsabilidad social",
+        "texto_literal": "Así es, en otros países ya lo hace."
+      },
+      {
+        "numero_pregunta": 30,
+        "seccion_entrevista": "VI. Perspectiva futura y responsabilidad social",
+        "texto_literal": "Las ciclovías. Muy bien, creo que usted que se está haciendo algo acá en el país o en la región, en esta región, por el cambio climático desde la mirada, digamos, de tu realidad donde tú más te mueves en el ámbito de la toma de decisiones que pueden ser en este caso las autoridades propias de la región, o las autoridades locales, en ese municipio o las propias comunidades organizadas o millones de bases, etc. ¿Cree la pregunta? ¿Usted que se está haciendo algo en mi país o en la región por el cambio climático?"
+      },
+      {
+        "numero_pregunta": 31,
+        "seccion_entrevista": "VI. Perspectiva futura y responsabilidad social",
+        "texto_literal": "Yo pienso que no..."
+      },
+      {
+        "numero_pregunta": 31,
+        "seccion_entrevista": "VI. Perspectiva futura y responsabilidad social",
+        "texto_literal": "No hay control en lo que viene a hacer en la educación ambiental. Como le digo, hay personas que sacan la basura en el tiempo no debido y entonces esto perjudica a los estudiantes quienes pasan todos los días por esas calles y otro es que las autoridades no le dan importancia también a donde están las calles y también lo que vienen a hacer y tenemos mucha responsabilidad también con los canes que ya que estos orinan en la calle en cualquier lugar"
+      },
+      {
+        "numero_pregunta": 31,
+        "seccion_entrevista": "VI. Perspectiva futura y responsabilidad social",
+        "texto_literal": "y ahí hay bastantes perritos en las calles y generan algo alguna contaminación ellos desechan disparan toda la basura por hambre y se desechan en busca de comida."
+      },
+      {
+        "numero_pregunta": 32,
+        "seccion_entrevista": "VI. Perspectiva futura y responsabilidad social",
+        "texto_literal": "¿Qué cree usted que deberíamos hacer entonces como sociedad para enfrentar este cambio climático?"
+      },
+      {
+        "numero_pregunta": 32,
+        "seccion_entrevista": "VI. Perspectiva futura y responsabilidad social",
+        "texto_literal": "Como sociedad me gustaría que unamos fuerzas y que tengamos estoy segura de que existen grandes expertes estudiantes especialistas en esto de los cambios climáticos y que seguramente hay proyectos interesantes en los cuales debemos aportar debemos debemos empezar desde casa enseñar a nuestros pequeños y también aportar en lo que viene a hacer en lo que es en la universidad nosotros como profesionales vamos a salir afuera y si fuera se necesita cambiar la idea y dar la importancia a esto también hacer"
+      },
+      {
+        "numero_pregunta": 0,
+        "seccion_entrevista": "TEXTO_NO_ASIGNADO",
+        "texto_literal": "muchas gracias tu nombre verdadero Tully Pax muy bien, ha estado bien tus respuestas vamos a darle pase a otra compañera que venga me dejas tu consentimiento informado por favor que venga y me traes la asistencia que les dejé la anantes firmando por favor y si fuera por favor por favor un segundo voy a hacer una coordinación para ver si fuera muy bien estará bien si fuera ¿no pasaba el mismo? si si si se la estoy soñando mi padre si quehappy gracias ni la chiquita lecito si fuera juicio aaaa ah un un No, no no no bueno ¿Qué es eso? ¿Qué es eso? ¿Qué es eso? ¿Qué es eso? ¿Qué es eso? ¿Qué es eso? ¿Qué es eso? ¿Qué es eso? ¿Qué es eso? ¿Qué es eso? ¿Qué es eso? ¿Qué es eso? ¿Qué es eso? ¿Qué es eso? Entonces, sí, yo creo que podemos empezar. Ok, nuevamente. ¿Hol para activar? ¿Hol para activar? ¿Qué es eso? ¿Qué dice? ¿Délice Hol para activar? ¡Pah, voy a estar! ¡Hol para activar! ¡Hol para activar! Ok ¡Halo, halo, halo! ¿Probando? ¿Halo, halo, probando? ¿Halo, probando? ¡Halo, halo! Pero es como que sí, porque está en rojo, mira. Parece que sí, ¿no? Está en rojo. No reclice. Debe estar grabando. ¿Pero eso? ¿Cómo dice no estar grabando? ¿Cómo hago? También. ¡Halo! ¡Ahora se puede agarrar mi saldo! ¿Aca? Vamos a subir a Hol, nuevamente. ¿No marca cero, Ceres? No, no veo. ¿De lice? ¡Para activar! ¡Délice!"
+      }
+    ]
+  }
+}

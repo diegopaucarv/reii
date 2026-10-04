@@ -39,12 +39,13 @@ from transformers import utils
 from reii.config import (
     BEST_PARAMS_PATH,
     CORPUS_NAME,
-    DEEPSEEK_BASE_URL,
     EMBEDDING_MODEL_NAME,
     LLM_MODEL,
     OUTPUT_DASHBOARD,
     OUTPUT_NETWORK_GEXF,
     SPACY_MODEL,
+    TOGETHER_API_KEY,
+    TOGETHER_BASE_URL,
     WORKFLOW_DB_PATH,
 )
 from reii.config import (
@@ -155,7 +156,11 @@ def obtener_llave_maestra(nombre):
 
 # 0. Cargamos tu metadata usando la llave maestra
 metadata_csv = os.path.join(REII_DATA_DIR, "Refined_Database.csv")
-df_meta = pd.read_csv(metadata_csv, sep=";")
+df_meta = (
+    pd.read_csv(metadata_csv, sep=";")
+    if os.path.exists(metadata_csv)
+    else pd.DataFrame()
+)
 meta_dict = {}
 
 for _, row in df_meta.iterrows():
@@ -294,7 +299,7 @@ class Config:
     n_permutations: int = 1000
 
     use_llm_synthesis: bool = True
-    deepseek_api_key: str = ""
+    together_api_key: str = TOGETHER_API_KEY
     llm_model: str = LLM_MODEL
     synthesis_similarity_threshold: float = 0.6
 
@@ -1066,8 +1071,12 @@ class Database:
 
     def _save(self):
         self.data["doc_metadata"] = self.doc_metadata  # include in save
-        with open(self.path, "w", encoding="utf-8") as f:
+        # Escritura atómica (temp + replace): evita que el dashboard lea un
+        # archivo a medio escribir mientras el workflow guarda (JSON corrupto).
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.data, f, indent=2, ensure_ascii=False, cls=_NumpyEncoder)
+        os.replace(tmp, self.path)
 
     def _upsert(self, collection_name: str, items: List, key: str = "id"):
         existing = {x[key] for x in self.data.get(collection_name, [])}
@@ -5331,9 +5340,9 @@ class SynthesisGenerator:
     def __init__(self, config: Config):
         self.config = config
         self.client = (
-            OpenAI(api_key=config.deepseek_api_key, base_url=DEEPSEEK_BASE_URL)
+            OpenAI(api_key=config.together_api_key, base_url=TOGETHER_BASE_URL)
             if config.use_llm_synthesis
-            and config.deepseek_api_key
+            and config.together_api_key
             and _OPENAI_AVAILABLE
             else None
         )
@@ -5379,6 +5388,7 @@ class SynthesisGenerator:
                 ],
                 temperature=0.7,
                 max_tokens=max_tokens,
+                extra_body={"reasoning_effort": "none"},
             )
             return r.choices[0].message.content.strip()
         except Exception as e:
