@@ -2,14 +2,15 @@
   "workflow_mode": "🧠 Transformer (requiere GPU)",
   "use_bigrams": true,
   "stem_backend": "snowball",
-  "min_uce_words": 3,
+  "min_uce_words": 2,
+  "uce_target_size": 18,
   "tsj": 3,
   "min_forms_uc": [
     10,
     14
   ],
   "use_cdh": true,
-  "pseudocount": 0.01,
+  "pseudocount": 0.0,
   "use_cah_per_class": true,
   "cah_per_class_top_terms": 50,
   "use_projection": true,

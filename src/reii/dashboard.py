@@ -118,7 +118,7 @@ def _workflow_runner(
 ) -> None:
     """Ejecuta el workflow principal en un subproceso y captura su salida.
 
-    El workflow (``main_workflow_clasico.py``) lee los JSON exportados en
+    El workflow (``main_workflow.py``) lee los JSON exportados en
     ``data/txt_outputs/tmp/`` y escribe ``data/workflow_data.json``. Se corre
     como subproceso para no bloquear el hilo de Streamlit; su stdout/stderr
     se vuelcan línea a línea en ``log`` para mostrarlo en vivo.
@@ -128,7 +128,7 @@ def _workflow_runner(
     with open(WORKFLOW_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(params, f, ensure_ascii=False, indent=2)
 
-    mode = state.get("workflow_mode", "classic")
+    mode = params.get("workflow_mode", "classic")
     if mode == "transformer":
         script = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "main_workflow.py"
@@ -560,7 +560,7 @@ def render_batch_tab():
             "Classic: spaCy, lexecon, RF/SHAP. "
             "Transformer: embeddings fine-tuned, BERTopic, jerárquico."
         )
-    params["workflow_mode"] = mode
+        params["workflow_mode"] = mode
     c1, c2, c3 = st.columns(3)
     with c1:
         params["use_bigrams"] = st.radio(
@@ -580,16 +580,28 @@ def render_batch_tab():
         params["min_uce_words"] = st.number_input(
             "Mín. palabras por UCE",
             min_value=1,
-            value=3,
+            value=2,  # era 3; Recomendación C del plan
             key="reii_p_min_uce_words",
+            help="UCEs con menos palabras que este umbral se descartan. "
+            "Reinert/IRaMuTeQ recomienda 2.",
         )
+        params["uce_target_size"] = st.number_input(
+            "Objetivo palabras por UCE",
+            min_value=8,
+            max_value=60,
+            value=18,  # era 40 por getattr; Recomendación C
+            step=1,
+            key="reii_p_uce_target_size",
+            help="Ventana objetivo al segmentar. Reinert/IRaMuTeQ usan 12–18. "
+            "Subirlo fragmenta menos pero diluye la señal temática.",
+        )
+    with c3:
         params["tsj"] = st.number_input(
             "Frecuencia mínima (tsj)",
             min_value=1,
             value=3,
             key="reii_p_tsj",
         )
-    with c3:
         mf0 = st.number_input(
             "min_forms_uc (mín)", min_value=1, value=10, key="reii_p_mf0"
         )
@@ -611,9 +623,8 @@ def render_batch_tab():
     with c2:
         params["pseudocount"] = st.number_input(
             "Pseudocount",
-            min_value=0.0,
-            value=0.01,
-            step=0.01,
+            disabled=True,
+            value=0.00,
             key="reii_p_pseudocount",
         )
     with c3:
