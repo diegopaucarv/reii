@@ -1,0 +1,35 @@
+{
+  "workflow_mode": "🧠 Transformer (requiere GPU)",
+  "use_bigrams": true,
+  "stem_backend": "snowball",
+  "min_uce_words": 3,
+  "tsj": 3,
+  "min_forms_uc": [
+    10,
+    14
+  ],
+  "use_cdh": true,
+  "pseudocount": 0.01,
+  "use_cah_per_class": true,
+  "cah_per_class_top_terms": 50,
+  "use_projection": true,
+  "analyze_metadata": true,
+  "use_network_analysis": true,
+  "use_term_stability": true,
+  "use_llm_synthesis": true,
+  "use_multivariate_analysis": true,
+  "multivariate_metadata": [
+    "Edad_Cat",
+    "Sexo",
+    "Ocupacion_Cat",
+    "Procedencia_Cat"
+  ],
+  "use_rf_shap": true,
+  "rf_n_estimators": 200,
+  "rf_max_depth": 8,
+  "rf_outlier_method": "iqr",
+  "rf_cat_encoding": "frequency",
+  "optimize": true,
+  "optimize_trials": 100,
+  "random_state": 42
+}

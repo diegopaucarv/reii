@@ -108,3 +108,106 @@ def to_list_text(values: Any) -> str:
     if not isinstance(values, list):
         return ""
     return ", ".join(str(v) for v in values)
+
+
+def load_discourse_state_summary(
+    state_path: str = "",
+) -> Dict[str, int]:
+    """Count saved annotations per agent from the discourse state file.
+
+    Returns ``{agent_name: count}``. Empty dict if the file is missing or
+    unreadable. Used by the dashboard to show what is already processed.
+    """
+    if not state_path:
+        from reii.config import DISCOURSE_STATE_PATH
+
+        state_path = DISCOURSE_STATE_PATH
+    data = _read_json(state_path)
+    if not isinstance(data, dict):
+        return {}
+    counts: Dict[str, int] = {}
+    for annos in data.get("annotations_by_uce", {}).values():
+        if not isinstance(annos, list):
+            continue
+        for a in annos:
+            if not isinstance(a, dict):
+                continue
+            agent = a.get("agent") or "?"
+            counts[agent] = counts.get(agent, 0) + 1
+    return counts
+
+
+# ─────────────────────────────────────────────
+# Workflows (one per discourse JSON in ia/)
+# ─────────────────────────────────────────────
+WORKFLOW_NAMES_PATH = str(IA_DIR / "_workflow_names.json")
+
+
+def list_workflow_files() -> List[str]:
+    """Return sorted filenames of discourse workflow JSONs in ``ia/``.
+
+    A workflow is a dict-of-agents JSON file. The grammar summarizer
+    (``GRAMMAR_CONFIG_PATH``, e.g. ``0.json``) and any ``_``-prefixed
+    metadata files are excluded.
+    """
+    grammar_basename = os.path.basename(GRAMMAR_CONFIG_PATH)
+    out: List[str] = []
+    if not IA_DIR.is_dir():
+        return out
+    for p in sorted(IA_DIR.glob("*.json")):
+        if p.name.startswith("_") or p.name == grammar_basename:
+            continue
+        data = _read_json(str(p))
+        if isinstance(data, dict):
+            out.append(p.name)
+    return out
+
+
+def get_workflow_agents(filename: str) -> List[str]:
+    """Return the agent names inside a workflow JSON file."""
+    data = _read_json(str(IA_DIR / filename))
+    if not isinstance(data, dict):
+        return []
+    return sorted(data.keys())
+
+
+def load_workflow_names() -> Dict[str, str]:
+    """Return ``{filename: display_name}`` for workflows."""
+    data = _read_json(WORKFLOW_NAMES_PATH)
+    return data if isinstance(data, dict) else {}
+
+
+def save_workflow_names(names: Dict[str, str]) -> None:
+    _atomic_write_json(WORKFLOW_NAMES_PATH, names)
+
+
+def load_discourse_state_progress(
+    state_path: str = "",
+) -> Tuple[int, Dict[str, int]]:
+    """Return ``(total_uces, {agent: n_uces_annotated})`` from the state file.
+
+    ``n_uces_annotated`` counts UCEs that have at least one annotation from
+    that agent (not the number of spans). Used to compute per-workflow
+    progress.
+    """
+    if not state_path:
+        from reii.config import DISCOURSE_STATE_PATH
+
+        state_path = DISCOURSE_STATE_PATH
+    data = _read_json(state_path)
+    if not isinstance(data, dict):
+        return 0, {}
+    ann_by_uce = data.get("annotations_by_uce", {})
+    if not isinstance(ann_by_uce, dict):
+        return 0, {}
+    total_uces = len(ann_by_uce)
+    by_agent: Dict[str, int] = {}
+    for annos in ann_by_uce.values():
+        if not isinstance(annos, list):
+            continue
+        agents = {
+            a.get("agent") for a in annos if isinstance(a, dict) and a.get("agent")
+        }
+        for agent in agents:
+            by_agent[agent] = by_agent.get(agent, 0) + 1
+    return total_uces, by_agent

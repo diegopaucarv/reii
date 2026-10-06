@@ -1671,7 +1671,7 @@ class DebugOrchestrator:
     def __init__(
         self,
         grammar_config_path: str,
-        discourse_config_path: str,
+        workflow_config_paths: List[str],
         workflow_data_path: str,
         state_path: str = str(STATE_FILE),
     ):
@@ -1713,8 +1713,16 @@ class DebugOrchestrator:
             _val = getattr(uce, "doc_id", None)
             doc_id = str(_val) if _val is not None else uce.id.split("_")[0]
             self._uces_by_doc[doc_id].append(uce)
-        self.multi_agent = DiscourseMultiAgent(discourse_config_path)
-        self.discourse_agents = self.multi_agent.agents
+        self.multi_agent = None
+        self.workflows: Dict[str, DiscourseMultiAgent] = {}
+        self.discourse_agents: Dict[str, BaseAgent] = {}
+        for path in workflow_config_paths:
+            filename = os.path.basename(path)
+            multi = DiscourseMultiAgent(path)
+            self.workflows[filename] = multi
+            self.discourse_agents.update(multi.agents)
+        if self.workflows:
+            self.multi_agent = next(iter(self.workflows.values()))
 
         state = _load_state(self.state_path)
 
@@ -1972,7 +1980,14 @@ class DebugOrchestrator:
                             (u for u in self.uces if u.id == span.uce_id), None
                         )
                         if target:
-                            target.discourse_annotations.append(anno.to_dict())
+                            # Dedup: never store the same agent+quote twice
+                            dup = any(
+                                a.get("agent") == anno.agent
+                                and a.get("quote") == span.quote
+                                for a in target.discourse_annotations
+                            )
+                            if not dup:
+                                target.discourse_annotations.append(anno.to_dict())
 
         return total_spans_mapped
 
@@ -2000,20 +2015,25 @@ class DebugOrchestrator:
         agent_name: Optional[str] = None,
         store: bool = True,
         workflow: Optional[str] = None,
+        force: bool = False,
     ) -> List[DiscourseAnnotation]:
         """
         Run a single named agent per-document, or all agents if agent_name
         is None.  Each agent receives a gram_cats-filtered grammar summary
         computed freshly for the document being processed.
+
+        Batch-aware: by default, UCEs that already carry an annotation from
+        this agent are skipped (resume support). Pass force=True to
+        re-process everything.
         """
         if agent_name is None:
-            return self.run_all_discourse_agents(store, workflow)
+            return self.run_all_discourse_agents(store, workflow, force)
 
         if agent_name not in self.discourse_agents:
             print(f"❌ Agente '{agent_name}' no existe.")
             return []
 
-        self._ensure_dependencies(agent_name, store, workflow)
+        self._ensure_dependencies(agent_name, store, workflow, force)
 
         agent = self.discourse_agents[agent_name]
         print(f"\n🚀 EJECUTANDO (por documento): {agent_name}")
@@ -2024,9 +2044,28 @@ class DebugOrchestrator:
 
         for doc_id in self._get_doc_ids():
             doc_uces = self._load_uces_for_doc(doc_id)
-            print(f"  📄 {doc_id} ({len(doc_uces)} UCEs)")
 
-            # Per-document structured grammar
+            # ── BATCH-AWARE: skip UCEs already annotated by this agent ──
+            pending = [
+                u
+                for u in doc_uces
+                if force
+                or not any(
+                    a.get("agent") == agent_name for a in u.discourse_annotations
+                )
+            ]
+            if not pending:
+                print(f"  📄 {doc_id} — ya procesado por '{agent_name}', omitiendo.")
+                continue
+            if len(pending) < len(doc_uces):
+                print(
+                    f"  📄 {doc_id} — {len(pending)}/{len(doc_uces)} UCEs pendientes "
+                    f"(omitiendo {len(doc_uces) - len(pending)} ya procesadas)."
+                )
+            else:
+                print(f"  📄 {doc_id} ({len(doc_uces)} UCEs)")
+
+            # Per-document structured grammar (full doc → context intact)
             _, doc_structured = self.grammar_summarizer.summarize(
                 doc_uces, by_cluster=False
             )
@@ -2048,7 +2087,9 @@ class DebugOrchestrator:
                     doc_structured
                 )
 
-            tagged_text, boundaries = self._build_tagged_text_and_map_for(doc_uces)
+            # Tagged text only from pending UCEs (already-processed ones stay
+            # out of the prompt, but their annotations remain as context).
+            tagged_text, boundaries = self._build_tagged_text_and_map_for(pending)
             if len(tagged_text) > self.MAX_TAGGED_CHARS:
                 tagged_text = tagged_text[: self.MAX_TAGGED_CHARS]
 
@@ -2072,18 +2113,49 @@ class DebugOrchestrator:
         return all_annos
 
     def run_all_discourse_agents(
-        self, store: bool = True, workflow: Optional[str] = None
+        self,
+        store: bool = True,
+        workflow: Optional[str] = None,
+        force: bool = False,
     ) -> List[DiscourseAnnotation]:
-        """Run every agent in topological order, each per-document."""
-        print("\n🚀 ANÁLISIS GLOBAL (todos los agentes, por documento)")
+        """Run every workflow (and every agent within) in topological order."""
+        print("\n🚀 ANÁLISIS GLOBAL (todos los workflows, por documento)")
         all_annos: List[DiscourseAnnotation] = []
-        for agent_name in self.multi_agent.disc_execution_order:
-            annos = self.run_discourse_agent(agent_name, store, workflow)
+        for wf_file in self.workflows:
+            annos = self.run_workflow(wf_file, store, workflow, force)
+            all_annos.extend(annos)
+        return all_annos
+
+    def run_workflow(
+        self,
+        workflow_file: str,
+        store: bool = True,
+        workflow: Optional[str] = None,
+        force: bool = False,
+    ) -> List[DiscourseAnnotation]:
+        """Run every agent of a single workflow (a JSON file in ``ia/``).
+
+        ``workflow_file`` is the filename (e.g. ``"1.json"``). Agents run in
+        topological order; already-processed UCEs are skipped unless
+        ``force`` is True.
+        """
+        if workflow_file not in self.workflows:
+            print(f"❌ Workflow '{workflow_file}' no existe.")
+            return []
+        multi = self.workflows[workflow_file]
+        print(f"\n🚀 EJECUTANDO WORKFLOW: {workflow_file}")
+        all_annos: List[DiscourseAnnotation] = []
+        for agent_name in multi.disc_execution_order:
+            annos = self.run_discourse_agent(agent_name, store, workflow, force)
             all_annos.extend(annos)
         return all_annos
 
     def _ensure_dependencies(
-        self, agent_name: str, store: bool, workflow: Optional[str] = None
+        self,
+        agent_name: str,
+        store: bool,
+        workflow: Optional[str] = None,
+        force: bool = False,
     ):
         agent = self.discourse_agents[agent_name]
         for dep_name in agent.disc_cats:
@@ -2093,7 +2165,7 @@ class DebugOrchestrator:
             )
             if not has:
                 print(f"🔁 Dependencia faltante '{dep_name}'. Ejecutando primero…")
-                self.run_discourse_agent(dep_name, store, workflow)
+                self.run_discourse_agent(dep_name, store, workflow, force)
 
     def list_agents(self):
         print("\n📋 AGENTES DISPONIBLES:")
@@ -2181,9 +2253,17 @@ class ClassStatsReporter:
 # Punto de entrada
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
+    ia_dir = os.path.dirname(GRAMMAR_CONFIG_PATH)
+    workflow_paths = [
+        os.path.join(ia_dir, f)
+        for f in sorted(os.listdir(ia_dir))
+        if f.endswith(".json")
+        and f != os.path.basename(GRAMMAR_CONFIG_PATH)
+        and not f.startswith("_")
+    ]
     mon = DebugOrchestrator(
         grammar_config_path=GRAMMAR_CONFIG_PATH,
-        discourse_config_path=DISCOURSE_CONFIG_PATH,
+        workflow_config_paths=workflow_paths,
         workflow_data_path=WORKFLOW_DB_PATH,
         state_path=DISCOURSE_STATE_PATH,
     )
@@ -2191,7 +2271,7 @@ if __name__ == "__main__":
     mon.list_agents()
     print("\n📊 Stats actuales:", mon.get_annotation_stats())
 
-    mon.run_discourse_agent(
+    mon.run_all_discourse_agents(
         workflow="Ontológico-Cognitivo"
     )  # "Ontológico-Cognitivo" "Diversidades_epistémicas" "Performativo-Narrativo"
     # Por qué piensan, qué piensan y cómo lo expresan

@@ -47,6 +47,7 @@ from reii.config import (
     TOGETHER_API_KEY,
     TOGETHER_BASE_URL,
     WORKFLOW_DB_PATH,
+    WORKFLOW_SQLITE_PATH
 )
 from reii.config import (
     DATA_DIR as REII_DATA_DIR,
@@ -61,6 +62,20 @@ from reii.gram.gramatical_analyzer import (
     WordEmbeddingsAnalyzer,
     train_adverb_classifier,
 )
+
+# Contrato dinámico de UCE para la fase abductiva.
+# NUNCA modificar uce.cluster_id desde _project_liminal_uces().
+#   uce.projected_cluster_id : Optional[int]   → clase más cercana
+#   uce.projection_distance  : Optional[float] → d²_χ² mínima
+#   uce.projection_margin    : Optional[float] → d²_χ²(2ª) − d²_χ²(1ª)
+#   uce.projection_ratio     : Optional[float] → d²_χ²(2ª) / d²_χ²(1ª)
+_UCE_PROJECTION_FIELDS = (
+    "projected_cluster_id",
+    "projection_distance",
+    "projection_margin",
+    "projection_ratio",
+)
+
 from reii.gram.gramatical_analyzer import (
     Config as GramConfig,
 )
@@ -247,7 +262,8 @@ class Config:
     )
     stem_backend: str = "snowball"  # 'snowball' | 'none'
 
-    min_uce_words: int = 3
+    min_uce_words: int = 2  # era 3; alineado con C (UCEs cortas)
+    uce_target_size: int = 18  # era getattr(..., 40); rango Reinert 12–18
     min_forms_uc: List[int] = field(default_factory=lambda: [13, 17])
 
     tsj: int = 3
@@ -263,7 +279,7 @@ class Config:
 
     use_cdh: bool = True
 
-    pseudocount: float = 0.01
+    pseudocount: float = 0.00
     swap_iterations: int = 2
     n_perm_cdh: int = 100
     perm_min_uc_size: int = 50
@@ -286,6 +302,17 @@ class Config:
     gap_n_references: int = 10
 
     fdr_alpha: float = 0.05
+    # ── Proyección liminal (operación ABDUCTIVA, no inductiva) ──────────
+    # Las UCEs que no sobreviven la triple intersección NO son parte del
+    # corpus analítico. Este flag permite proyectarlas sobre los centroides
+    # de clase ya consolidados, escribiendo en campos SEPARADOS
+    # (projected_cluster_id, projection_distance, ...) que ningún cálculo
+    # de φ, AFC, inercia o estabilidad de términos consume.
+    # Default False: ALCESTE puro.
+    use_liminal_projection: bool = False
+    # Umbral opcional de confianza: si d2_second / d2_best < este valor,
+    # la UCE queda sin proyección (ambigua entre clases).
+    liminal_projection_min_ratio: float = 1.10
 
     use_projection: bool = True
     projection_method: str = "afc"
@@ -330,10 +357,27 @@ class Config:
     rf_cat_encoding: str = "frequency"  # 'onehot', 'frequency', 'target'
     rf_min_samples_for_tuning: int = 30
 
+    # ── Optimizer (Optuna) ──────────────────────────────────────────────
     optimize: bool = False
-    optimize_trials: int = 50
+    optimize_trials: int = 200
+    optimize_sampler: str = "tpe"            # "tpe" | "random" | "cmaes"
+    optimize_pruner: str = "median"          # "median" | "hyperband" | "none"
+    optimize_storage: Optional[str] = None   # ej. "sqlite:///reii_optuna.db"
+    optimize_study_name: str = "reii_search"
+    optimize_n_startup_trials: int = 25
+    optimize_multivariate: bool = True
+    optimize_prune_n_startup: int = 15
+    # Multi-objective: (ARI↑, coverage↑, −K↑  ≡ K↓)
+    optimize_directions: Tuple[str, ...] = ("maximize", "maximize", "minimize")
+    # Preferencia sobre el frente de Pareto al seleccionar la solución final
+    optimize_preference: str = "max_ari"     # "max_ari" | "max_coverage" | "knee"
+    # Gate duro de cobertura (Recomendación A) — prune si cae por debajo
+    optimize_coverage_gate: float = 0.65
+
     prune_small_clusters: bool = False
     min_class_size: int = 19
+
+
     db_local_path: str = WORKFLOW_DB_PATH
     subtlex_df_path: Optional[str] = None
     random_state: int = 42
@@ -367,6 +411,10 @@ class Config:
     hdbscan_uce_metric: str = "euclidean"  # "euclidean" | "cosine"
 
 
+    # Ruta de la DB SQLite. Si None, se deriva de db_local_path.
+    db_sqlite_path: Optional[str] = WORKFLOW_SQLITE_PATH
+    # Escribir también el JSON de compatibilidad durante la transición.
+    dual_write_json: bool = True
 # ══════════════════════════════════════════════════════════════════════
 # (Skipping boilerplate UCE, UC, CDHNode, Database, Segmentador for brevity - assume unchanged from base code except POS filtering)
 # ══════════════════════════════════════════════════════════════════════
@@ -470,6 +518,7 @@ class CDHNode:
     depth: int = 0
     n_ucs: int = 0
     is_leaf: bool = False
+    is_terminal_consolidated: bool = False  # NEW: hoja por falta de significancia
     indices: List[int] = field(default_factory=list)
     children: List["CDHNode"] = field(default_factory=list)
 
@@ -479,6 +528,7 @@ class CDHNode:
             "depth": self.depth,
             "n_ucs": self.n_ucs,
             "is_leaf": self.is_leaf,
+            "is_terminal_consolidated": self.is_terminal_consolidated,
             "indices": self.indices,
             "children": [c.to_dict() for c in self.children],
         }
@@ -1037,47 +1087,75 @@ class UCBuilder:
 
 
 class Database:
-    def __init__(self, config: Config):
-        self.config = config
-        self.path = config.db_local_path
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        self._load()
-        self.doc_metadata = {}  # new
+    """
+    Persistencia híbrida: SQLite (primaria) + JSON (export opcional).
 
-    def _load(self):
+    Durante la transición:
+      · `dual_write=True`  → escribe a SQL y a JSON (default)
+      · `dual_write=False` → solo SQL
+
+    El contrato público (save_uces, save_ucs, etc.) NO cambia — todo el
+    pipeline sigue funcionando sin tocar el orquestador.
+    """
+    def __init__(self, config: Config, dual_write: bool = True):
+        self.config = config
+        self.path = config.db_local_path              # JSON (compat)
+        self.sqlite_path = config.db_sqlite_path      # SQLite (primaria)
+        self.dual_write = dual_write
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        os.makedirs(os.path.dirname(self.sqlite_path), exist_ok=True)
+
+        # Buffer en memoria: replicamos la interfaz dict anterior
+        self.data = self._load_json_dict()
+        self.doc_metadata = self.data.get("doc_metadata", {})
+
+    # ── Carga inicial ─────────────────────────────────────────────────────
+    def _load_json_dict(self) -> Dict[str, Any]:
         if os.path.exists(self.path):
             with open(self.path, "r", encoding="utf-8") as f:
-                self.data = json.load(f)
-        else:
-            self.data = {
-                "uces": [],
-                "ucs": [],
-                "sintesis_por_clase": [],
-                "terminos": [],
-                "vocabulario": [],
-                "multivariate": {},
-                "network": {},
-                "term_stability": [],
-                "forma_index": {},
-                "cah_terminos": {},
-                "afc_result": {},
-                "cdh_tree_umbral1": {},
-                "cdh_tree_umbral2": {},
-                "shap_analysis": {},
-            }
-        # Load doc_metadata if present
-        self.doc_metadata = self.data.get("doc_metadata", {})
-        # For backward compatibility, if old UCEs have full metadata, we can extract them
+                return json.load(f)
+        return {
+            "uces": [], "ucs": [], "sintesis_por_clase": [], "terminos": [],
+            "vocabulario": [], "multivariate": {}, "network": {},
+            "term_stability": [], "forma_index": {}, "cah_terminos": {},
+            "afc_result": {}, "cdh_tree_umbral1": {}, "cdh_tree_umbral2": {},
+            "shap_analysis": {},
+        }
 
+    # ── Persistencia ──────────────────────────────────────────────────────
     def _save(self):
-        self.data["doc_metadata"] = self.doc_metadata  # include in save
-        # Escritura atómica (temp + replace): evita que el dashboard lea un
-        # archivo a medio escribir mientras el workflow guarda (JSON corrupto).
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, indent=2, ensure_ascii=False, cls=_NumpyEncoder)
-        os.replace(tmp, self.path)
+        if self.dual_write:
+            self.data["doc_metadata"] = self.doc_metadata
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False,
+                          cls=_NumpyEncoder)
+            os.replace(tmp, self.path)
+        # SQL: reconstrucción total a partir de self.data (idempotente)
+        try:
+            from reii.backend.migrate import (
+                migrate_documents, migrate_uces, migrate_ucs,
+                migrate_clusters, migrate_terms, migrate_annotations,
+                migrate_network, migrate_kv,
+            )
+            from reii.backend.db import connect
+            conn = connect(self.sqlite_path)
+            try:
+                migrate_documents(conn, self.data)
+                migrate_uces(conn, self.data)
+                migrate_ucs(conn, self.data)
+                migrate_clusters(conn, self.data)
+                migrate_terms(conn, self.data)
+                migrate_annotations(conn, self.data)
+                migrate_network(conn, self.data)
+                migrate_kv(conn, self.data)
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.error("SQLite save failed: %s", e)
+            raise
 
+    # ── API pública (contrato sin cambios) ────────────────────────────────
     def _upsert(self, collection_name: str, items: List, key: str = "id"):
         existing = {x[key] for x in self.data.get(collection_name, [])}
         for item in items:
@@ -1086,7 +1164,8 @@ class Database:
                 self.data.setdefault(collection_name, []).append(d)
             else:
                 self.data[collection_name] = [
-                    x if x[key] != d[key] else d for x in self.data[collection_name]
+                    x if x[key] != d[key] else d
+                    for x in self.data[collection_name]
                 ]
 
     def save_uces(self, uces):
@@ -1125,19 +1204,14 @@ class Database:
         for d in uce_dicts:
             doc_id = d.get("doc_id")
             local_idx = d.get("local_idx")
-            # Same thing here: grab section_id from the metadata dict
             section_id = d.get("metadata", {}).get("section_id", "0")
-
             if doc_id is not None and local_idx is not None:
                 d["id"] = f"{doc_id}_{section_id}_{local_idx}"
             else:
                 import uuid
-
                 d["id"] = str(uuid.uuid4())
-                print(f"UCE sin doc_id/local_idx, se asignó UUID: {d['id']}")
             uces.append(UCE.from_dict(d))
         return uces
-
 
 # ══════════════════════════════════════════════════════════════════════
 # BERTOPIC COMPLEMENTARIO (Placeholder)
@@ -1181,7 +1255,7 @@ class SegmentadorALCESTE:
         if len(doc) == 0:
             return []
 
-        ideal_size = getattr(self.config, "uce_target_size", 40)
+        ideal_size = getattr(self.config, "uce_target_size", 12)
         window = int(ideal_size * 0.4)
 
         weights = np.array(
@@ -2281,11 +2355,31 @@ class MatrizBuilder:
                 yield "_".join(t)
 
     def construir_vocabulario(self, objects: List) -> List[str]:
-        counter = Counter()
+        """
+        Poda explícita en dos pasadas:
+        1. Frecuencia documental  (f_j^doc >= tsj)
+        2. Frecuencia absoluta    (f_j      >= min_term_abs_freq)
+
+        Sustituye la suma de un pseudoconteo global. Elimina hapax y términos
+        ultra-raros en lugar de rellenarlos con ε (que densificaba la matriz y
+        deformaba las masas marginales del AFC).
+        """
+        doc_freq = Counter()
+        raw_freq = Counter()
         for obj in objects:
-            # Document frequency logic
-            counter.update(set(self._iter_terms(obj)))
-        return sorted(t for t, cnt in counter.items() if cnt >= self.config.tsj)
+            terms = list(self._iter_terms(obj))
+            doc_freq.update(set(terms))
+            raw_freq.update(terms)
+
+        min_doc = self.config.tsj
+        min_abs = max(1, getattr(self.config, "min_term_abs_freq", 2))
+
+        vocab = [
+            t
+            for t, cnt in doc_freq.items()
+            if cnt >= min_doc and raw_freq[t] >= min_abs
+        ]
+        return sorted(vocab)
 
     def construir_matriz(self, objects: List, vocabulario: List[str]) -> np.ndarray:
         idx = {t: i for i, t in enumerate(vocabulario)}
@@ -2297,15 +2391,32 @@ class MatrizBuilder:
         return mat
 
     def construir_matriz_dispersa(self, objects: List, vocabulario: List[str]):
-        from scipy.sparse import csr_matrix, dok_matrix
+        """
+        Construye la matriz binaria UC × términos directamente en formato CSR.
+
+        Construimos vía COO (una pasada, sin mutación) y convertimos a CSR en
+        una sola operación O(nnz log nnz). El antiguo DOK iteraba celda por
+        celda, lo que saturaba memoria y era órdenes de magnitud más lento.
+        """
+        from scipy.sparse import coo_matrix
 
         idx = {t: i for i, t in enumerate(vocabulario)}
-        mat = dok_matrix((len(objects), len(vocabulario)), dtype=np.int32)
+        rows: List[int] = []
+        cols: List[int] = []
         for i, obj in enumerate(objects):
-            for term in set(self._iter_terms(obj)):  # Binary presence/absence
-                if term in idx:
-                    mat[i, idx[term]] = 1
-        return csr_matrix(mat)
+            for term in set(self._iter_terms(obj)):
+                j = idx.get(term)
+                if j is not None:
+                    rows.append(i)
+                    cols.append(j)
+
+        data = np.ones(len(rows), dtype=np.int32)
+        mat = coo_matrix(
+            (data, (rows, cols)),
+            shape=(len(objects), len(vocabulario)),
+            dtype=np.int32,
+        )
+        return mat.tocsr()
 
     def agregar_por_clase(
         self, mat_uces: np.ndarray, labels_uces: np.ndarray, vocabulario: List[str]
@@ -2502,15 +2613,17 @@ class ClasificadorDescendente:
             return np.zeros(n)
 
         mat = sub_mat.astype(float)
-        pc = self.config.pseudocount
-        row_sums = np.asarray(mat.sum(axis=1)).flatten().reshape(-1) + pc * m
-        col_sums = np.asarray(mat.sum(axis=0)).flatten().reshape(-1) + pc * n
+        # Sin pseudoconteo: preservar masas marginales reales.
+        # Las filas/columnas sin masa se clavan a 1.0 SOLO para evitar 0/0 en
+        # la iteración de promediado recíproco; no contaminan las no-cero.
+        row_sums = np.asarray(mat.sum(axis=1)).flatten().reshape(-1)
+        col_sums = np.asarray(mat.sum(axis=0)).flatten().reshape(-1)
         total = row_sums.sum()
         if total <= 0:
             return np.zeros(n)
 
-        row_sums[row_sums == 0] = 1
-        col_sums[col_sums == 0] = 1
+        row_sums = np.where(row_sums > 0, row_sums, 1.0)
+        col_sums = np.where(col_sums > 0, col_sums, 1.0)
 
         rng = np.random.default_rng(self.config.random_state)
 
@@ -2735,15 +2848,76 @@ class ClasificadorDescendente:
     # Prueba de significancia
     # ──────────────────────────────────────────────
 
-    def _es_significativo(self, coord: np.ndarray, var_obs: float) -> bool:
-        # var_obs is now R² (normalized), so chi2_approx = n * R²
+    def _permutation_pvalue(
+        self,
+        coord: np.ndarray,
+        labels: np.ndarray,
+        n_perm: int = 1000,
+        alpha: float = 0.05,
+    ) -> Tuple[float, bool]:
+        """
+        Test de permutación empírico sobre el split observado.
+
+        H0: las etiquetas son intercambiables; el R² observado no es mayor
+            que el que produciría una asignación aleatoria de las mismas
+            masas a los dos grupos.
+
+        Devuelve (p_valor, significativo).
+        """
         n = len(coord)
-        chi2_approx = n * var_obs
-        if chi2_approx < self.config.chi2_threshold_small:
-            return False
+        n1 = int((labels == 1).sum())
+        n0 = n - n1
+        if n < 4 or n0 == 0 or n1 == 0:
+            return 1.0, False
+
+        grand = coord.mean()
+        ss_total = float(np.sum((coord - grand) ** 2))
+        if ss_total <= 0:
+            return 1.0, False
+
+        m0 = coord[labels == 0].mean()
+        m1 = coord[labels == 1].mean()
+        ss_b_obs = n0 * (m0 - grand) ** 2 + n1 * (m1 - grand) ** 2
+        r2_obs = ss_b_obs / ss_total
+
+        rng = np.random.default_rng(self.config.random_state)
+        n_ge = 0
+        for _ in range(n_perm):
+            perm_idx = rng.permutation(n)
+            perm_in1 = np.zeros(n, dtype=bool)
+            perm_in1[perm_idx[:n1]] = True
+            pm0 = coord[~perm_in1].mean()
+            pm1 = coord[perm_in1].mean()
+            ss_b_perm = n0 * (pm0 - grand) ** 2 + n1 * (pm1 - grand) ** 2
+            if ss_b_perm / ss_total >= r2_obs:
+                n_ge += 1
+
+        p_value = (n_ge + 1) / (n_perm + 1)
+        return p_value, p_value < alpha
+
+    def _es_significativo(
+        self,
+        coord: np.ndarray,
+        labels: np.ndarray,
+        var_obs: float,
+    ) -> bool:
+        """
+        Gate de significancia:
+          1. Piso de R² (descarta splits triviales baratos)
+          2. Test de permutación (reemplaza la aproximación chi² determinista)
+        """
         if var_obs < self.config.min_r2_threshold:
             return False
-        return True
+
+        n_perm = int(getattr(self.config, "n_perm_cdh", 1000))
+        if n_perm <= 0:
+            # Fallback determinista si el usuario desactiva permutaciones
+            n = len(coord)
+            chi2_approx = n * var_obs
+            return chi2_approx >= self.config.chi2_threshold_small
+
+        p_value, sig = self._permutation_pvalue(coord, labels, n_perm=n_perm)
+        return sig
 
     # ──────────────────────────────────────────────
     # Recursión principal
@@ -2758,7 +2932,13 @@ class ClasificadorDescendente:
     ) -> CDHNode:
         n = len(indices)
         if n < self._min_cluster_size or depth >= self.config.max_depth_cdh:
-            node = CDHNode(depth=depth, n_ucs=n, is_leaf=True, indices=indices.tolist())
+            node = CDHNode(
+                depth=depth,
+                n_ucs=n,
+                is_leaf=True,
+                is_terminal_consolidated=True,
+                indices=indices.tolist(),
+            )
             node.label = self._next_leaf()
             return node
         sub_mat = mat_sparse[indices]
@@ -2769,8 +2949,14 @@ class ClasificadorDescendente:
         coord = self._primer_factor(sub_mat, uc_vectors=sub_vecs)  # ← warm-start
         var_obs, labels = self._corte_optimo(coord)
 
-        if not self._es_significativo(coord, var_obs):
-            node = CDHNode(depth=depth, n_ucs=n, is_leaf=True, indices=indices.tolist())
+        if not self._es_significativo(coord, labels, var_obs):
+            node = CDHNode(
+                depth=depth,
+                n_ucs=n,
+                is_leaf=True,
+                is_terminal_consolidated=True,  # BLOQUE 2: Clase Terminal Consolidada
+                indices=indices.tolist(),
+            )
             node.label = self._next_leaf()
             return node
 
@@ -2783,7 +2969,13 @@ class ClasificadorDescendente:
             )
 
         if len(np.unique(labels)) < 2:
-            node = CDHNode(depth=depth, n_ucs=n, is_leaf=True, indices=indices.tolist())
+            node = CDHNode(
+                depth=depth,
+                n_ucs=n,
+                is_leaf=True,
+                is_terminal_consolidated=True,
+                indices=indices.tolist(),
+            )
             node.label = self._next_leaf()
             return node
 
@@ -3634,6 +3826,219 @@ class DoubleClassifier:
     # ═══════════════════════════════════════════════════════════════════
     # VERDICT ASSIGNMENT — triple-method stability
     # ═══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════
+    # Proyección liminal — OPERACIÓN ABDUCTIVA (post-inductiva)
+    # ═══════════════════════════════════════════════════════════════════
+    # Filosofía:
+    #   El pipeline inductivo (CHD + triple intersección) define las clases.
+    #   Las UCEs que no sobreviven NO son parte del corpus analítico. Esta
+    #   función las PROYECTA sobre centroides ya consolidados (nunca
+    #   recalcula φ, AFC, inercia ni estabilidad). Escribe en campos
+    #   separados, dejando uce.cluster_id = None.
+    #
+    #   Invariante respetado:
+    #     · df_terms         → calculado solo sobre uces_est_list
+    #     · afc_result       → calculado solo sobre uces_est_list
+    #     · forma_index      → calculado solo sobre uces_est_list
+    #     · centroides       → calculados solo sobre uces_est_list
+    #     · uce_phi          → solo para uces_est_list
+    #
+    #   Ninguna línea de código inductivo consulta projected_cluster_id.
+    # ═══════════════════════════════════════════════════════════════════
+    def _project_liminal_uces(
+        self,
+        uces_por_doc: List[List[UCE]],
+        primary_stable: List[UCE],
+        voc: List[str],
+    ) -> Dict[str, Any]:
+        """
+        Proyecta UCEs huérfanas sobre los centroides de las clases
+        consolidadas, por distancia χ² en el espacio de perfiles fila.
+
+        Definiciones:
+            perfil_uce_i   = v_i / Σ_j v_ij              (row-normalized)
+            centroide_k    = mean_i∈k (perfil_uce_i)     (media de perfiles)
+            c_j            = masa marginal global del término j
+            d²_χ²(i, k)    = Σ_j (perfil_ij − centroide_kj)² / c_j
+
+        Salida (por UCE huérfana, vía setattr):
+            projected_cluster_id : int    — argmin_k d²_χ²
+            projection_distance  : float  — d²_χ² al ganador
+            projection_margin    : float  — d²_χ²(2º) − d²_χ²(1º)
+            projection_ratio     : float  — d²_χ²(2º) / d²_χ²(1º)
+
+        Si projection_ratio < liminal_projection_min_ratio, la UCE queda
+        SIN proyección (ambigua entre dos o más clases; no forzamos).
+
+        Retorna un dict de métricas para logging y persistencia.
+        """
+        from scipy.sparse import issparse
+
+        summary: Dict[str, Any] = {
+            "n_candidates": 0,
+            "n_projected": 0,
+            "n_ambiguous": 0,
+            "n_empty_profile": 0,
+            "class_histogram": {},
+        }
+        if not primary_stable or not voc:
+            return summary
+
+        stable_ids = {u.id for u in primary_stable}
+        labels_stable = np.array(
+            [u.cluster_id for u in primary_stable if u.cluster_id is not None]
+        )
+        classes = np.unique(labels_stable[labels_stable >= 0])
+        if len(classes) < 2:
+            print(
+                "   [Projection] <2 clases consolidadas — no se puede "
+                "proyectar huérfanas."
+            )
+            return summary
+
+        # ── Centroides en espacio de perfiles fila ─────────────────────────
+        builder = MatrizBuilder(self.config)
+        mat_stable = builder.construir_matriz_dispersa(primary_stable, voc)
+        mat_dense = (
+            mat_stable.toarray().astype(np.float64)
+            if issparse(mat_stable)
+            else np.asarray(mat_stable, dtype=np.float64)
+        )
+
+        n_terms = len(voc)
+        class_centroids: Dict[int, np.ndarray] = {}
+        # Solo UCEs con cluster_id válido entran al centroide
+        valid_mask = np.array([u.cluster_id is not None for u in primary_stable])
+        for k in classes:
+            class_mask = valid_mask & (
+                np.array([u.cluster_id for u in primary_stable]) == k
+            )
+            if not class_mask.any():
+                continue
+            sub = mat_dense[class_mask]
+            row_sums = sub.sum(axis=1, keepdims=True)
+            row_sums = np.where(row_sums > 0, row_sums, 1.0)
+            profiles = sub / row_sums
+            class_centroids[int(k)] = profiles.mean(axis=0)
+
+        if len(class_centroids) < 2:
+            print("   [Projection] Centroides insuficientes — abortando.")
+            return summary
+
+        # ── Marginal global por término (denominador χ²) ────────────────────
+        col_mass = mat_dense.sum(axis=0)
+        col_mass = np.where(col_mass > 0, col_mass, 1e-12)
+        global_marginal = col_mass / col_mass.sum()
+
+        voc_idx = {t: j for j, t in enumerate(voc)}
+        min_ratio = float(getattr(self.config, "liminal_projection_min_ratio", 1.10))
+        class_ids_sorted = sorted(class_centroids.keys())
+
+        for doc_uces in uces_por_doc:
+            for uce in doc_uces:
+                # Solo huérfanas: no estables, sin cluster_id asignado
+                if uce.id in stable_ids:
+                    continue
+                if uce.cluster_id is not None:
+                    continue
+
+                summary["n_candidates"] += 1
+
+                # Vector binario alineado al vocabulario
+                vec = np.zeros(n_terms, dtype=np.float64)
+                for term in set(self._iter_terms_for_uce(uce)):
+                    j = voc_idx.get(term)
+                    if j is not None:
+                        vec[j] = 1.0
+
+                s = vec.sum()
+                if s == 0:
+                    summary["n_empty_profile"] += 1
+                    continue
+                profile = vec / s
+
+                # ── Distancias a cada centroide ─────────────────────────────
+                d2 = np.empty(len(class_ids_sorted), dtype=np.float64)
+                for idx_k, k in enumerate(class_ids_sorted):
+                    diff = profile - class_centroids[k]
+                    d2[idx_k] = float(np.sum(diff * diff / global_marginal))
+
+                order = np.argsort(d2)
+                best_k = class_ids_sorted[int(order[0])]
+                d2_best = float(d2[order[0]])
+
+                # ── Ambigüedad: si solo hay 1 clase no aplica ───────────────
+                if len(class_ids_sorted) >= 2:
+                    d2_second = float(d2[order[1]])
+                    # d2_second siempre ≥ d2_best por construcción
+                    ratio = d2_second / d2_best if d2_best > 1e-12 else float("inf")
+                    margin = d2_second - d2_best
+                else:
+                    ratio = float("inf")
+                    margin = float("inf")
+
+                if ratio < min_ratio:
+                    summary["n_ambiguous"] += 1
+                    # Marcar el intento, pero SIN proyección definitiva
+                    setattr(uce, "projected_cluster_id", None)
+                    setattr(uce, "projection_distance", None)
+                    setattr(uce, "projection_margin", None)
+                    setattr(uce, "projection_ratio", float(ratio))
+                    continue
+
+                # ── Proyección aceptada ─────────────────────────────────────
+                setattr(uce, "projected_cluster_id", int(best_k))
+                setattr(uce, "projection_distance", d2_best)
+                setattr(uce, "projection_margin", float(margin))
+                setattr(uce, "projection_ratio", float(ratio))
+
+                summary["n_projected"] += 1
+                k_str = str(int(best_k))
+                summary["class_histogram"][k_str] = (
+                    summary["class_histogram"].get(k_str, 0) + 1
+                )
+
+        # ── Guardarraíl: invariante inductivo intacto ───────────────────────
+        # Ninguna UCE con projected_cluster_id puede tener también
+        # cluster_id. Si esto se rompe, la fase inductiva quedó contaminada.
+        contaminated = [
+            uce.id
+            for doc in uces_por_doc
+            for uce in doc
+            if getattr(uce, "projected_cluster_id", None) is not None
+            and uce.cluster_id is not None
+            and uce.id not in stable_ids
+        ]
+        if contaminated:
+            raise RuntimeError(
+                f"[Projection] INVARIANTE ROTO: {len(contaminated)} UCEs "
+                f"tienen cluster_id Y projected_cluster_id. Ejemplo: "
+                f"{contaminated[:3]}. Abortando para evitar contaminación."
+            )
+
+        print(
+            f"   [Projection] {summary['n_projected']}/"
+            f"{summary['n_candidates']} UCEs proyectadas "
+            f"({summary['n_ambiguous']} ambiguas, "
+            f"{summary['n_empty_profile']} sin perfil léxico). "
+            f"Nota: NO son parte del corpus inductivo."
+        )
+
+        return summary
+
+    def _iter_terms_for_uce(self, uce):
+        """Réplica local de MatrizBuilder._iter_terms para una UCE suelta."""
+        use_stems = self.config.stem_backend != "none"
+        for s in uce.stems if use_stems else uce.lemmas:
+            yield s
+        if self.config.use_bigrams:
+            for b in uce.bigram_stems if use_stems else uce.bigrams:
+                yield "_".join(b)
+        if self.config.use_trigrams:
+            for t in uce.trigram_stems if use_stems else uce.trigrams:
+            for t in (uce.trigram_stems if use_stems else uce.trigrams):
+                yield "_".join(t)
+
     def _triple_stability_verdicts(
         self,
         uces_por_doc: List[List[UCE]],
@@ -4453,10 +4858,42 @@ class AFC:
         voc: List[str],
         n_components: int = 2,
     ) -> Dict[str, Any]:
-        mat = mat_clases.astype(float) + self.config.pseudocount
+        """
+        AFC sobre matriz clase × términos SIN pseudoconteo.
+
+        Reglas (Bloque 1 del plan):
+          · No sumar ε. Las masas marginales r_i y c_j deben reflejar la
+            estructura real, no una matriz densificada artificialmente.
+          · Poda previa: eliminar columnas con masa < 2 y filas sin masa.
+          · Truncated SVD vía randomized_svd (Krylov/Lanczos) sobre la
+            matriz de residuos estandarizados.
+        """
+        from sklearn.utils.extmath import randomized_svd
+
+        mat = np.asarray(mat_clases, dtype=np.float64)
+        if mat.ndim != 2:
+            return {}
         n_rows, n_cols = mat.shape
+        if n_rows < 2 or n_cols < 2:
+            return {}
+
+        # ── Poda de columnas sin masa y filas vacías (reemplaza al ε) ────────
+        col_mass = mat.sum(axis=0)
+        keep_cols = np.where(col_mass >= 2.0)[0]
+        if len(keep_cols) < 2:
+            return {}
+        mat = mat[:, keep_cols]
+        voc_kept = [voc[j] for j in keep_cols] if voc else None
+
+        row_mass = mat.sum(axis=1)
+        keep_rows = np.where(row_mass > 0)[0]
+        if len(keep_rows) < 2:
+            return {}
+        mat = mat[keep_rows, :]
+        class_ids_kept = np.asarray(class_ids)[keep_rows]
+
         total = mat.sum()
-        if total <= 0 or n_rows < 2 or n_cols < 2:
+        if total <= 0:
             return {}
 
         row_sums = mat.sum(axis=1)
@@ -4464,22 +4901,26 @@ class AFC:
         r = row_sums / total
         c = col_sums / total
 
+        # Residuos estandarizados (Pearson) — sin ε
         E = np.outer(row_sums, col_sums) / total
         S = (mat - E) / np.sqrt(np.maximum(E, 1e-12))
 
-        from scipy.linalg import svd as scipy_svd
-
-        U, s, Vt = scipy_svd(S, full_matrices=False)
-
-        # Drop trivial component
-        if len(s) <= 1:
+        # ── SVD truncada vía Lanczos/randomized ──────────────────────────────
+        k_max = min(n_components + 1, min(S.shape) - 1)
+        if k_max < 2:
             return {}
-        k = min(n_components, len(s) - 1)
-        U_k = U[:, 1 : k + 1]
-        s_k = s[1 : k + 1]
-        Vt_k = Vt[1 : k + 1, :]
+        U, s, Vt = randomized_svd(
+            S, n_components=k_max, n_iter=7, random_state=self.config.random_state
+        )
 
-        # Proper Chi-square coordinates
+        # Descartar componente trivial (autovalor 1 por construcción)
+        U_k = U[:, 1 : n_components + 1]
+        s_k = s[1 : n_components + 1]
+        Vt_k = Vt[1 : n_components + 1, :]
+        k = s_k.shape[0]
+        if k < 1:
+            return {}
+
         row_coords = (U_k * s_k) / np.sqrt(r[:, np.newaxis])
         col_coords = (Vt_k.T * s_k) / np.sqrt(c[:, np.newaxis])
         row_std = U_k / np.sqrt(r[:, np.newaxis])
@@ -4492,7 +4933,7 @@ class AFC:
         )
 
         return {
-            "class_ids": class_ids.tolist(),
+            "class_ids": class_ids_kept.tolist(),
             "row_coords": row_coords.tolist(),
             "col_coords": col_coords.tolist(),
             "row_std": row_std.tolist(),
@@ -4501,6 +4942,10 @@ class AFC:
             "explained_inertia": explained,
             "singular_values": s_k.tolist(),
             "total_inertia": total_inertia,
+            # Metadatos de la poda: el caller debe usar estos, NO voc completo
+            "voc": voc_kept,
+            "kept_cols_idx": keep_cols.tolist(),
+            "kept_rows_idx": keep_rows.tolist(),
         }
 
 
@@ -5540,18 +5985,38 @@ class MultivariateAnalyzer:
 # ══════════════════════════════════════════════════════════════════════
 
 try:
-    from gradient_free_optimizers import PatternSearch as _PatternSearch
+    import optuna
+    from optuna.pruners import HyperbandPruner, MedianPruner, NopPruner
+    from optuna.samplers import CmaEsSampler, RandomSampler, TPESampler
 
-    _GFO_AVAILABLE = True
+    _OPTUNA_AVAILABLE = True
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
 except ImportError:
-    _GFO_AVAILABLE = False
+    _OPTUNA_AVAILABLE = False
 
 
 class Optimizador:
     """
-    Optimizador de hiperparámetros ALCESTE.
-    Incluye caché de segmentación para acelerar las iteraciones y
-    penalizaciones estrictas para asegurar la viabilidad de modelos downstream (RF+SHAP).
+    Optimizador de hiperparámetros REII basado en Optuna.
+
+    Sustituye a PatternSearch (gradient_free_optimizers) con:
+
+      · TPE (Tree-structured Parzen Estimator) con soporte multivariado
+        → modela cada parámetro según su tipo, no asume orden métrico
+          donde no lo hay (categóricos como similarity_threshold).
+      · MedianPruner para early stopping
+        → corta trials que ya mostraron cobertura por debajo del running
+          median, liberando presupuesto para la exploración útil.
+      · NSGA-II multi-objective (ARI, coverage, −K)
+        → elimina la suma ponderada arbitraria del objective antiguo.
+          Devuelve un frente de Pareto de soluciones no-dominadas.
+      · Storage SQLite opcional
+        → persistencia entre sesiones y paralelización de trials.
+      · Reproducibilidad vía sampler seed.
+
+    El espacio de búsqueda y la caché de segmentación/lematización son
+    idénticos al optimizador anterior. Los cambios son en el motor de
+    búsqueda y en la forma del objetivo (escalar → vector de 3 objetivos).
     """
 
     def __init__(
@@ -5569,72 +6034,184 @@ class Optimizador:
         self.we_analyzer = we_analyzer
         self.subtlex_analyzer = subtlex_analyzer
         self.segmentador = SegmentadorALCESTE(config_base)
-        self.uces_por_doc, self.doc_metadata_map = self.segmentador.segmentar_en_uces(
-            corpus_raw
+        self.uces_por_doc, self.doc_metadata_map = (
+            self.segmentador.segmentar_en_uces(corpus_raw)
         )
         start_time = time.time()
         for doc_uces in self.uces_por_doc:
             self.segmentador.lematizar_uces(doc_uces)
 
         self.total_uces = total_uces or sum(len(d) for d in self.uces_por_doc)
+        # Cache del espacio de búsqueda — se llena en optimizar()
+        self._search_space_cached: Dict[str, Any] = {}
         print(
-            f"   [Optimizador] Caché listo en {time.time() - start_time:.2f}s. Total UCEs: {self.total_uces}"
+            f"   [Optimizador] Caché listo en {time.time() - start_time:.2f}s. "
+            f"Total UCEs: {self.total_uces}"
         )
 
-    def save_best_params(self, params: Dict, score: float):
-        """Save best parameters to a JSON file."""
-        best_data = {
-            "params": params,
-            "score": score,
+    # ══════════════════════════════════════════════════════════════════════
+    # Persistencia del frente de Pareto
+    # ══════════════════════════════════════════════════════════════════════
+    def _best_params_path(self) -> str:
+        return os.path.join(
+            os.path.dirname(self.config_base.db_local_path),
+            "best_params.json",
+        )
+
+    def save_pareto_front(self, study: "optuna.Study") -> None:
+        """
+        Guarda el frente de Pareto completo + la solución seleccionada
+        según `optimize_preference`.
+
+        Compatibilidad: incluye alias "params"/"score" para que el lector
+        legacy en WorkflowOrchestrator.ejecutar() siga funcionando sin
+        cambios.
+        """
+        if not study.best_trials:
+            print("   [!] save_pareto_front: frente vacío, nada que guardar.")
+            return
+
+        best_idx = self._select_preference(study)
+        best_trial = study.best_trials[best_idx]
+
+        payload = {
+            # ── Compatibilidad con lector legacy ────────────────────────
+            "params": best_trial.params,
+            "score": float(best_trial.values[0]),
+            # ── Nuevo formato Pareto ────────────────────────────────────
+            "best_params": best_trial.params,
+            "best_values": list(best_trial.values),
+            "preference": self.config_base.optimize_preference,
+            "directions": list(self.config_base.optimize_directions),
+            "objectives": ["ari", "coverage", "neg_k"],
+            "pareto_front": [
+                {
+                    "params": dict(t.params),
+                    "values": list(t.values),
+                    "trial": int(t.number),
+                }
+                for t in study.best_trials
+            ],
+            "n_trials_total": len(study.trials),
+            "n_trials_completed": sum(
+                1
+                for t in study.trials
+                if t.state == optuna.trial.TrialState.COMPLETE
+            ),
+            "n_trials_pruned": sum(
+                1
+                for t in study.trials
+                if t.state == optuna.trial.TrialState.PRUNED
+            ),
             "timestamp": datetime.now().isoformat(),
             "total_uces": self.total_uces,
         }
-        best_path = os.path.join(
-            os.path.dirname(self.config_base.db_local_path), "best_params.json"
-        )
-        with open(best_path, "w", encoding="utf-8") as f:
-            json.dump(best_data, f, indent=2, ensure_ascii=False)
-        print(f"   [Optimizador] Saved best params to {best_path}")
+        path = self._best_params_path()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        print(f"   [Optimizador] Pareto front saved to {path}")
 
     def load_best_params(self) -> Optional[Dict]:
-        """Load best parameters from JSON file if it exists."""
-        best_path = os.path.join(
-            os.path.dirname(self.config_base.db_local_path), "best_params.json"
-        )
-        if not os.path.exists(best_path):
+        """
+        Lee best_params.json en cualquiera de sus dos formatos (legacy
+        escalar o nuevo Pareto) y devuelve el dict de parámetros elegido.
+        """
+        path = self._best_params_path()
+        if not os.path.exists(path):
             return None
-        with open(best_path, "r", encoding="utf-8") as f:
-            best_data = json.load(f)
-        print(
-            f"   [Optimizador] Loaded best params from {best_path} (score={best_data['score']:.4f})"
-        )
-        return best_data["params"]
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        params = data.get("best_params") or data.get("params")
+        if params:
+            print(
+                f"   [Optimizador] Loaded params from {path}: {params}"
+            )
+        return params
 
-    def get_search_space(self) -> Dict[str, List]:
-        f1, f2 = self.config_base.min_forms_uc
+    def _select_preference(self, study: "optuna.Study") -> int:
+        """
+        Elige el índice del trial del frente de Pareto que se aplicará
+        al pipeline definitivo.
+
+        max_ari       → mayor ARI (primer objetivo)
+        max_coverage  → mayor coverage (segundo objetivo)
+        knee          → punto más cercano al ideal normalizado (1, 1, 0)
+        """
+        pref = getattr(self.config_base, "optimize_preference", "max_ari")
+        best = study.best_trials
+        if not best:
+            return 0
+
+        if pref == "max_coverage":
+            return int(max(range(len(best)), key=lambda i: best[i].values[1]))
+
+        if pref == "knee":
+            arr = np.array([t.values for t in best], dtype=np.float64)
+            mins = arr.min(axis=0)
+            maxs = arr.max(axis=0)
+            rng = np.where(maxs > mins, maxs - mins, 1.0)
+            norm = (arr - mins) / rng
+            # (ARI↑, coverage↑, −K↑): ideal normalizado es (1, 1, 1)
+            ideal = np.array([1.0, 1.0, 1.0])
+            return int(np.argmin(np.linalg.norm(norm - ideal, axis=1)))
+
+        # default max_ari
+        return int(max(range(len(best)), key=lambda i: best[i].values[0]))
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Espacio de búsqueda (idéntico al optimizador anterior)
+    # ══════════════════════════════════════════════════════════════════════
+    def get_search_space(self) -> Dict[str, Any]:
+        """
+        Devuelve el espacio de búsqueda como dict tipado.
+
+        Convención:
+          · (lo, hi) con ints → suggest_int
+          · (lo, hi) con floats → suggest_float
+          · [a, b, c] → suggest_categorical
+        """
+        f1, _ = self.config_base.min_forms_uc
         tsj = self.config_base.tsj
         return {
-            "min_forms_uc_1": np.arange(max(2, f1 - 4), f1 + 5, 1).tolist(),
-            "forms_gap": np.arange(2, 8, 1).tolist(),  # ← replaces min_forms_uc_2
-            "tsj": np.arange(max(2, tsj - 2), tsj + 3, 1).tolist(),
-            "pseudocount": [0.0001, 0.001, 0.005],
-            "min_cluster_size_cdh": [0.05, 0.08, 0.10, 0.15, 0.20],  # ← % of UCs
+            "min_forms_uc_1": (max(2, f1 - 4), f1 + 4),
+            "forms_gap": (2, 7),
+            "tsj": (max(2, tsj - 2), tsj + 2),
+            # pseudocount eliminado (BLOQUE 1: siempre 0.0)
+            "min_cluster_size_cdh": [0.05, 0.08, 0.10, 0.15, 0.20],
             "swap_iterations": [1, 2, 5],
-            "use_poisson_tsj": [True, False],
-            "min_r2_threshold": [0.03, 0.05, 0.08, 0.10],  # ← new
+            "min_r2_threshold": [0.03, 0.05, 0.08, 0.10],
             "similarity_threshold": [0.25, 0.35, 0.45, 0.55, 0.65],
             "coref_weight": [0.0, 0.1, 0.2, 0.3, 0.4],
             "uc_window_size": [1, 2, 3, 4, 5],
         }
 
+    @staticmethod
+    def _suggest(trial: "optuna.Trial", space: Dict[str, Any]) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        for k, v in space.items():
+            if isinstance(v, tuple) and len(v) == 2:
+                lo, hi = v
+                if isinstance(lo, int) and isinstance(hi, int):
+                    params[k] = trial.suggest_int(k, lo, hi)
+                else:
+                    params[k] = trial.suggest_float(k, float(lo), float(hi))
+            elif isinstance(v, list):
+                params[k] = trial.suggest_categorical(k, v)
+            else:
+                params[k] = v
+        return params
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Evaluación con caché (idéntica a la anterior)
+    # ══════════════════════════════════════════════════════════════════════
     def _evaluacion_rapida(self, cfg: Config, uc_cfg: UCBuilderConfig = None):
         uc_config_actual = uc_cfg or self.uc_config
         uc_builder = UCBuilder(
             self.we_analyzer, self.subtlex_analyzer, uc_config_actual, self.config_base
         )
-        uc_builder.vectorizer.clear_cache()  # ← prevents retro-key contamination across trials
+        uc_builder.vectorizer.clear_cache()  # evita contaminación entre trials
         double_clf = DoubleClassifier(cfg, self.segmentador, uc_builder)
-        # Inject lemmatization cache (same as parent)
+
         cache_ref = self.uces_por_doc
         for doc_uces in cache_ref:
             for uce in doc_uces:
@@ -5656,20 +6233,40 @@ class Optimizador:
 
         return resultados
 
-    def objetivo(self, params: Dict) -> float:
+    # ══════════════════════════════════════════════════════════════════════
+    # Objetivo multi-objective
+    # ══════════════════════════════════════════════════════════════════════
+    def _evaluate_trial(self, trial: "optuna.Trial"):
+        """
+        Devuelve la tupla (ARI, coverage, −K) o lanza TrialPruned.
+
+        Los gates duros (K fuera de [2,8], coverage < umbral, excepción
+        en la evaluación) se traducen a TrialPruned en vez de a un valor
+        centinela −1e6. Esto evita contaminar el frente de Pareto con
+        puntos artificiales y permite que el sampler aprenda de los
+        trials válidos sin sesgo.
+
+        Nota sobre pruning: reportamos coverage en step=0 justo antes
+        del cálculo de ARI. Como `_evaluacion_rapida` es monolítica, no
+        hay señal intermedia disponible sin refactorizar DoubleClassifier.
+        El MedianPruner por tanto solo descarta trials cuyo coverage ya
+        cayó por debajo del running median — el resto del ahorro viene
+        del gate duro de coverage y del gate de K.
+        """
+        params = self._suggest(trial, self._search_space_cached)
+
         mf1 = params["min_forms_uc_1"]
         mf2 = mf1 + params["forms_gap"]
 
         cfg = copy.deepcopy(self.config_base)
         cfg.min_forms_uc = [mf1, mf2]
         cfg.tsj = params["tsj"]
-        cfg.pseudocount = params["pseudocount"]
+        cfg.pseudocount = 0.0  # BLOQUE 1: nunca sumar ε
         cfg.min_cluster_size_cdh = params["min_cluster_size_cdh"]
         cfg.swap_iterations = params["swap_iterations"]
         cfg.min_r2_threshold = params["min_r2_threshold"]
         cfg.optimize = cfg.use_projection = cfg.use_network_analysis = False
 
-        # Apply UCBuilderConfig hyperparameters (Issue 8 fix)
         uc_cfg = copy.deepcopy(self.uc_config)
         uc_cfg.similarity_threshold = params.get(
             "similarity_threshold", uc_cfg.similarity_threshold
@@ -5678,80 +6275,177 @@ class Optimizador:
         uc_cfg.window_size = params.get("uc_window_size", uc_cfg.window_size)
 
         try:
-            (
-                ucs_est,
-                df_terms,
-                voc,
-                uces_por_doc,
-                resultados_list,
-                labels1_uce,
-                labels2_uce,
-                _,
-                _,
-                _doc_meta,
-            ) = self._evaluacion_rapida(cfg, uc_cfg=uc_cfg)
-        except Exception:
-            return -1e6
+            result = self._evaluacion_rapida(cfg, uc_cfg=uc_cfg)
+        except Exception as e:
+            logger.debug("Trial %d exception: %s", trial.number, e)
+            raise optuna.TrialPruned()
 
-        uces_list = ucs_est
-        labels_uces = np.array([uce.cluster_id for uce in uces_list])
-        n_clusters = len(np.unique(labels_uces))
+        uces_list = result[0] if result else None
+        if not uces_list:
+            raise optuna.TrialPruned()
 
-        # Hard gates — return immediately if outside useful range
-        if n_clusters < 2:
-            return -1e6
-        if n_clusters > 8:
-            # Graded penalty so the optimizer can still navigate toward fewer clusters
-            # -1 per extra cluster so 9 clusters = -1, 20 clusters = -11, etc.
-            return -(n_clusters - 8) * 1.5
+        labels_uces = np.array(
+            [u.cluster_id for u in uces_list if u.cluster_id is not None]
+        )
+        if len(labels_uces) == 0:
+            raise optuna.TrialPruned()
 
-        # We're in the target range (2-8 clusters) — now optimize quality
-        ari = (
-            adjusted_rand_score(labels1_uce, labels2_uce)
-            if labels1_uce is not None and labels2_uce is not None
-            else 0.0
+        n_clusters = int(len(np.unique(labels_uces)))
+
+        # ── Gate duro: K fuera de rango útil ─────────────────────────────
+        if n_clusters < 2 or n_clusters > 8:
+            raise optuna.TrialPruned()
+
+        coverage = len(uces_list) / max(1, self.total_uces)
+        coverage_gate = float(
+            getattr(self.config_base, "optimize_coverage_gate", 0.65)
         )
 
-        if df_terms is not None and hasattr(df_terms, "empty") and not df_terms.empty:
-            n_sig = df_terms["significativo"].sum()
-        else:
-            n_sig = 0
+        # ── Gate duro: coverage insuficiente (Recomendación A) ──────────
+        if coverage < coverage_gate:
+            raise optuna.TrialPruned()
 
-        sig_ratio = n_sig / max(1, len(voc))
-        coverage = len(ucs_est) / max(1, self.total_uces)
-        min_class_count = int(np.min(np.bincount(labels_uces)))
-        balance_penalty = (
-            -2.0 if min_class_count < max(10, len(uces_list) * 0.08) else 0.0
+        # ── Reporte intermedio antes del cálculo caro de ARI ────────────
+        trial.report(coverage, step=0)
+        if trial.should_prune():
+            raise optuna.TrialPruned()
+
+        # ── ARI: métrica headline, se calcula al final ───────────────────
+        labels1_uce = result[5]
+        labels2_uce = result[6]
+        if labels1_uce is None or labels2_uce is None:
+            raise optuna.TrialPruned()
+
+        # Alinear longitudes antes de ARI (por seguridad)
+        n = min(len(labels1_uce), len(labels2_uce))
+        if n < 2:
+            raise optuna.TrialPruned()
+        ari = float(
+            adjusted_rand_score(labels1_uce[:n], labels2_uce[:n])
         )
 
-        score = (
-            2.5 * ari
-            + 0.5 * np.log1p(n_sig)  # log term is essential — penalizes marginal gains
-            + 0.3 * sig_ratio  # original weight
-            + 0.8 * coverage
-            + balance_penalty
-        )
-        return float(score)
+        return ari, float(coverage), -float(n_clusters)
 
-    def optimizar(self, n_trials: int = 50) -> Dict:
-        if not _GFO_AVAILABLE:
+    # ══════════════════════════════════════════════════════════════════════
+    # Orquestación Optuna
+    # ══════════════════════════════════════════════════════════════════════
+    def _make_sampler(self):
+        name = getattr(self.config_base, "optimize_sampler", "tpe")
+        seed = self.config_base.random_state
+        n_startup = int(
+            getattr(self.config_base, "optimize_n_startup_trials", 25)
+        )
+        multivariate = bool(
+            getattr(self.config_base, "optimize_multivariate", True)
+        )
+
+        if name == "tpe":
+            return TPESampler(
+                seed=seed,
+                n_startup_trials=n_startup,
+                multivariate=multivariate,
+            )
+        if name == "random":
+            return RandomSampler(seed=seed)
+        if name == "cmaes":
+            return CmaEsSampler(seed=seed)
+        raise ValueError(f"Sampler desconocido: {name}")
+
+    def _make_pruner(self, n_trials: int):
+        name = getattr(self.config_base, "optimize_pruner", "median")
+        startup = int(getattr(self.config_base, "optimize_prune_n_startup", 15))
+        if name == "median":
+            return MedianPruner(n_startup_trials=startup, n_warmup_steps=0)
+        if name == "hyperband":
+            return HyperbandPruner(min_resource=1, max_resource=n_trials)
+        return NopPruner()
+
+    def optimizar(self, n_trials: int = 200) -> Dict[str, Any]:
+        if not _OPTUNA_AVAILABLE:
             print(
-                "   [!] gradient_free_optimizers no instalado. Saltando optimización."
+                "   [!] optuna no instalado. Ejecuta: pip install optuna"
             )
             return {}
 
-        ss = self.get_search_space()
-        print(f"\n=== Iniciando Búsqueda de Patrones ({n_trials} iteraciones) ===")
-        print(f"   Optimizando para {self.total_uces} UCEs...")
+        # Cache del espacio de búsqueda — se consulta en cada trial
+        self._search_space_cached = self.get_search_space()
 
-        opt = _PatternSearch(ss)
-        opt.search(self.objetivo, n_iter=n_trials)
+        sampler = self._make_sampler()
+        pruner = self._make_pruner(n_trials)
 
-        print(f"   >>> Mejor Score Alcanzado: {opt.best_score:.4f}")
-        print(f"   >>> Parámetros Óptimos: {opt.best_para}")
+        directions = list(
+            getattr(
+                self.config_base,
+                "optimize_directions",
+                ("maximize", "maximize", "minimize"),
+            )
+        )
+        storage = getattr(self.config_base, "optimize_storage", None)
+        study_name = getattr(
+            self.config_base, "optimize_study_name", "reii_search"
+        )
 
-        return opt.best_para
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=storage,
+            load_if_exists=bool(storage),
+            sampler=sampler,
+            pruner=pruner,
+            directions=directions,
+        )
 
+        print(f"\n=== Optuna · {n_trials} trials ===")
+        print(f"   Sampler    : {self.config_base.optimize_sampler}")
+        print(f"   Pruner     : {self.config_base.optimize_pruner}")
+        print(f"   Objectives : {list(zip(['ari', 'coverage', 'n_clusters'], directions))}")
+        print(f"   Coverage gate: {self.config_base.optimize_coverage_gate:.2f}")
+        print(f"   UCEs       : {self.total_uces}")
+
+        study.optimize(
+            self._evaluate_trial,
+            n_trials=n_trials,
+            show_progress_bar=False,
+        )
+
+        # ── Resumen final ────────────────────────────────────────────────
+        n_completed = sum(
+            1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE
+        )
+        n_pruned = sum(
+            1 for t in study.trials if t.state == optuna.trial.TrialState.PRUNED
+        )
+        n_failed = sum(
+            1 for t in study.trials if t.state == optuna.trial.TrialState.FAIL
+        )
+        print(
+            f"\n   >>> Estado: {n_completed} completados, "
+            f"{n_pruned} pruned, {n_failed} failed"
+        )
+
+        if not study.best_trials:
+            print("   [!] Sin soluciones válidas en el frente de Pareto.")
+            return {}
+
+        # Persistir frente completo
+        self.save_pareto_front(study)
+
+        # Selección según preferencia
+        best_idx = self._select_preference(study)
+        best_trial = study.best_trials[best_idx]
+
+        print(f"\n   >>> Pareto front: {len(study.best_trials)} soluciones no-dominadas")
+        print(
+            f"   >>> Seleccionada (preference="
+            f"{self.config_base.optimize_preference}): trial #{best_trial.number}"
+        )
+        print(
+            f"       ARI={best_trial.values[0]:.4f}  "
+            f"coverage={best_trial.values[1]:.4f}  "
+            f"K={-best_trial.values[2]:.0f}"
+        )
+        print(f"       params: {best_trial.params}")
+
+        return dict(best_trial.params)
 
 # ══════════════════════════════════════════════════════════════════════
 # WORKFLOW ORCHESTRATOR
@@ -5780,7 +6474,7 @@ class WorkflowOrchestrator:
         self.uc_config = uc_config
         self.we_analyzer = we_analyzer
         self.subtlex_analyzer = subtlex_analizer
-        self.db = Database(config)
+        self.db = Database(config, dual_write=config.dual_write_json)
         self.segmentador = SegmentadorALCESTE(config)
         self.uc_builder = UCBuilder(we_analyzer, subtlex_analizer, uc_config, config)
         self.double_clf = DoubleClassifier(
@@ -5842,13 +6536,25 @@ class WorkflowOrchestrator:
         texto_map = self.db.data.get("texto_completo_por_doc_id", {})
 
         # Serialize manually so texto_completo_doc survives to_dict()
+        # Serialize manually so texto_completo_doc survives to_dict(),
+        # y para persistir los campos dinámicos de la fase abductiva
+        # (projected_cluster_id, projection_distance, ...). Estos campos
+        # NO son declarados en la dataclass UCE y por tanto asdict() los
+        # ignoraría por defecto.
         serialized = []
         for uce in all_uces:
             d = uce.to_dict()
             d["texto_completo_doc"] = texto_map.get(str(uce.doc_id), "")
+
+            # Campos de proyección liminal (siempre presentes, None si no
+            # hubo proyección o si la UCE no era huérfana)
+            for field_name in _UCE_PROJECTION_FIELDS:
+                d[field_name] = getattr(uce, field_name, None)
+
             serialized.append(d)
 
         self.db.data["uces"] = serialized
+
         print(
             f"   Saved {len(uces_est_list)} stable + "
             f"{len(all_uces) - len(uces_est_list)} unstable UCEs to DB."
@@ -6253,7 +6959,36 @@ class WorkflowOrchestrator:
         cached_uces_por_doc = None
         cached_doc_metadata_map = None
 
+        def _apply_best_params(bp: Dict[str, Any]) -> None:
+            """Aplica los hiperparámetros ganadores al Config activo."""
+            mf1 = bp.get("min_forms_uc_1", self.config.min_forms_uc[0])
+            gap = bp.get("forms_gap", self.config.min_forms_uc[1] - mf1)
+            self.config.min_forms_uc = [mf1, mf1 + gap]
+            self.config.tsj = bp.get("tsj", self.config.tsj)
+            self.config.pseudocount = 0.0  # BLOQUE 1: invariante
+            self.config.min_cluster_size_cdh = bp.get(
+                "min_cluster_size_cdh", self.config.min_cluster_size_cdh
+            )
+            self.config.swap_iterations = bp.get(
+                "swap_iterations", self.config.swap_iterations
+            )
+            self.config.min_r2_threshold = bp.get(
+                "min_r2_threshold", self.config.min_r2_threshold
+            )
+            # Hiperparámetros de UCBuilderConfig se aplican vía self.uc_config
+            if "similarity_threshold" in bp:
+                self.uc_config.similarity_threshold = bp["similarity_threshold"]
+            if "coref_weight" in bp:
+                self.uc_config.coref_weight = bp["coref_weight"]
+            if "uc_window_size" in bp:
+                self.uc_config.window_size = bp["uc_window_size"]
+
+        cached_uces_por_doc = None
+        cached_doc_metadata_map = None
+
         best_params_path = BEST_PARAMS_PATH
+        best_params: Optional[Dict[str, Any]] = None
+
         if os.path.exists(best_params_path):
             print(
                 "   Found existing best_params.json. Loading parameters and skipping optimizer."
@@ -6261,41 +6996,25 @@ class WorkflowOrchestrator:
             try:
                 with open(best_params_path, "r", encoding="utf-8") as f:
                     best_data = json.load(f)
-                best_params = best_data["params"]
-                print(
-                    f"   Loaded params: {best_params} (score={best_data['score']:.4f})"
-                )
-                # Apply loaded parameters to config
-                mf1 = best_params.get("min_forms_uc_1", self.config.min_forms_uc[0])
-                gap = best_params.get("forms_gap", 4)
-                self.config.min_forms_uc = [mf1, mf1 + gap]
-                self.config.tsj = best_params.get("tsj", self.config.tsj)
-                self.config.pseudocount = best_params.get(
-                    "pseudocount", self.config.pseudocount
-                )
-                self.config.min_cluster_size_cdh = best_params.get(
-                    "min_cluster_size_cdh", self.config.min_cluster_size_cdh
-                )
-                self.config.swap_iterations = best_params.get(
-                    "swap_iterations", self.config.swap_iterations
-                )
-                self.config.min_r2_threshold = best_params.get(
-                    "min_r2_threshold", self.config.min_r2_threshold
-                )
-                # (Note: use_poisson_tsj is not used in the pipeline; ignore)
+                # Nuevo formato → 'best_params'; legacy → 'params'
+                best_params = best_data.get("best_params") or best_data.get("params")
+                if best_params:
+                    print(f"   Loaded params: {best_params}")
+                    _apply_best_params(best_params)
             except Exception as e:
                 print(
-                    f"   [WARNING] Could not load best_params.json: {e}. Running optimizer if enabled."
+                    f"   [WARNING] Could not load best_params.json: {e}. "
+                    "Running optimizer if enabled."
                 )
                 best_params = None
         else:
             print(
-                "   [WARNING] Could not load best_params.json. Running optimizer if enabled."
+                "   [WARNING] Could not load best_params.json. "
+                "Running optimizer if enabled."
             )
-            best_params = None
 
         if best_params is None and self.config.optimize:
-            # Run optimizer
+            # Desactivar embeddings durante la optimización (coste)
             self.config.use_embeddings = False
 
             optimizador = Optimizador(
@@ -6305,34 +7024,18 @@ class WorkflowOrchestrator:
                 self.we_analyzer,
                 self.subtlex_analyzer,
             )
-            mejores_params = optimizador.optimizar(n_trials=self.config.optimize_trials)
+            mejores_params = optimizador.optimizar(
+                n_trials=self.config.optimize_trials
+            )
             if mejores_params:
-                # Compute score for the best parameters (reuse objetivo)
-                best_score = optimizador.objetivo(mejores_params)
-                optimizador.save_best_params(mejores_params, best_score)
-                # Apply to config
-                mf1 = mejores_params.get("min_forms_uc_1", self.config.min_forms_uc[0])
-                gap = mejores_params.get("forms_gap", 4)
-                self.config.min_forms_uc = [mf1, mf1 + gap]
-                self.config.tsj = mejores_params.get("tsj", self.config.tsj)
-                self.config.pseudocount = mejores_params.get(
-                    "pseudocount", self.config.pseudocount
-                )
-                self.config.min_cluster_size_cdh = mejores_params.get(
-                    "min_cluster_size_cdh", self.config.min_cluster_size_cdh
-                )
-                self.config.swap_iterations = mejores_params.get(
-                    "swap_iterations", self.config.swap_iterations
-                )
-                self.config.min_r2_threshold = mejores_params.get(
-                    "min_r2_threshold", self.config.min_r2_threshold
-                )
+                # El frente de Pareto ya quedó persistido dentro de optimizar()
+                _apply_best_params(mejores_params)
             else:
                 print("   [!] Optimización no viable. Usando config base.")
             cached_uces_por_doc = optimizador.uces_por_doc
             cached_doc_metadata_map = optimizador.doc_metadata_map
 
-        # Set use_embeddings back to True after possible optimizer run
+        # Restaurar embeddings para la corrida principal
         self.config.use_embeddings = True
         # ── Main run — skip re-lemmatization if we have the cache ──────────
         if cached_uces_por_doc is not None:
@@ -6528,6 +7231,52 @@ class WorkflowOrchestrator:
         for doc_id, meta in doc_metadata_map.items():
             self.db.save_doc_metadata(doc_id, meta)
 
+        # ── FASE ABDUCTIVA (opt-in): proyección liminal de huérfanas ──────
+        # Si use_liminal_projection=True, las UCEs que fallaron la triple
+        # intersección se PROYECTAN sobre los centroides consolidados.
+        # NO se modifica uce.cluster_id, ni df_terms, ni AFC, ni inercia.
+        # Los resultados van a campos separados y se registran bajo
+        # `db.data["liminal_projection"]` para trazabilidad.
+        if (
+            self.config.use_liminal_projection
+            and uces_est_list
+            and voc_uc
+        ):
+            try:
+                projection_summary = self.double_clf._project_liminal_uces(
+                    uces_por_doc=uces_por_doc,
+                    primary_stable=uces_est_list,
+                    voc=voc_uc,
+                )
+                self.db.data["liminal_projection"] = {
+                    **projection_summary,
+                    "enabled": True,
+                    "min_ratio": float(
+                        getattr(
+                            self.config,
+                            "liminal_projection_min_ratio",
+                            1.10,
+                        )
+                    ),
+                    "note": (
+                        "Operación abductiva post-inductiva. Las UCEs "
+                        "proyectadas NO forman parte del corpus analítico: "
+                        "df_terms, AFC, inercia y estabilidad de términos "
+                        "se calcularon exclusivamente sobre uces_est_list."
+                    ),
+                }
+            except Exception as e:
+                print(f"   [WARNING] Proyección liminal falló: {e}")
+                self.db.data["liminal_projection"] = {
+                    "enabled": True,
+                    "error": str(e),
+                }
+        else:
+            self.db.data["liminal_projection"] = {
+                "enabled": False,
+                "note": "use_liminal_projection=False (default)",
+            }
+
         grammar_index = {}  # (doc_id, start_char) -> dict de UCE gramatical
         if grammatical_dashboard_path and os.path.exists(grammatical_dashboard_path):
             with open(grammatical_dashboard_path, "r", encoding="utf-8") as f:
@@ -6584,7 +7333,14 @@ class WorkflowOrchestrator:
         if self.config.use_projection:
             afc_result = self.afc.fit(mat_clases, class_ids, voc)
             if afc_result:
-                afc_result["voc"] = voc
+                # El AFC devuelve su propio vocabulario podado. Alinear mat_uces
+                # a las columnas conservadas para la proyección suplementaria.
+                kept_cols = afc_result.pop("kept_cols_idx", None)
+                afc_result.pop("kept_rows_idx", None)
+                mat_uces_afc = (
+                    mat_uces[:, kept_cols] if kept_cols is not None else mat_uces
+                )
+
                 resultados["proyeccion"] = afc_result
 
                 # ── Task 2: Map AFC coordinates directly onto each UCE ────────────
@@ -6593,9 +7349,9 @@ class WorkflowOrchestrator:
                 col_sums_vec = np.where(col_sums_vec == 0, 1.0, col_sums_vec)
                 col_mass = col_sums_vec / col_sums_vec.sum()  # column marginals
 
-                row_sums = mat_uces.sum(axis=1, keepdims=True).astype(float)
+                row_sums = mat_uces_afc.sum(axis=1, keepdims=True).astype(float)
                 row_sums = np.where(row_sums == 0, 1.0, row_sums)
-                row_profile = mat_uces.astype(float) / row_sums  # (n_uce, n_terms)
+                row_profile = mat_uces_afc.astype(float) / row_sums  # (n_uce, n_terms)
 
                 # Supplementary-row projection: (profile - column_mass) / sqrt(column_mass) @ V / singular_values
                 sv = np.array(afc_result["singular_values"])
@@ -6866,15 +7622,14 @@ if __name__ == "__main__":
         min_forms_uc=[10, 14],
         tsj=3,
         use_cdh=True,
-        pseudocount=0.1,
+        uce_target_size=18,
+        pseudocount=0.0,
         use_cah_per_class=True,
         cah_per_class_top_terms=20,
         use_projection=True,
         analyze_metadata=True,
         use_network_analysis=True,
         use_term_stability=True,
-        optimize=True,
-        optimize_trials=100,
         random_state=42,
         use_rf_shap=True,
         rf_n_estimators=100,
@@ -6884,7 +7639,7 @@ if __name__ == "__main__":
         glm_method="chi2",
         use_multivariate_analysis=True,
         multivariate_metadata=["Edad_Cat", "Sexo", "Ocupacion_Cat", "Procedencia_Cat"],
-        ppmi_k=1.0,  # set to 5.0 for small corpora (< 50k tokens)
+        ppmi_k=1.0,
         analytic_temperature=0.1,
         use_llm_synthesis=False,
         classification_mode="all",
@@ -6893,6 +7648,19 @@ if __name__ == "__main__":
         hdbscan_uce_min_cluster_size=5,
         hdbscan_uce_min_cluster_size_loose=3,
         hdbscan_uce_metric="euclidean",
+        # ── Optimizer (Optuna) ─────────────────────────────────────────
+        optimize=True,
+        optimize_trials=300,           # subir de 100 a 300 — TPE rinde más
+        optimize_sampler="tpe",
+        optimize_pruner="median",
+        optimize_storage="sqlite:///reii_optuna.db",  # persistencia entre sesiones
+        optimize_study_name="reii_search_v1",
+        optimize_n_startup_trials=25,
+        optimize_multivariate=True,
+        optimize_prune_n_startup=15,
+        optimize_directions=("maximize", "maximize", "minimize"),
+        optimize_preference="knee",    # o "max_ari" / "max_coverage"
+        optimize_coverage_gate=0.65,
     )
 
     gram_config = GramConfig(

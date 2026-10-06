@@ -34,20 +34,25 @@ from reii.config import (
     DISCOURSE_CONFIG_PATH,
     DISCOURSE_STATE_PATH,
     GRAMMAR_CONFIG_PATH,
+    IA_DIR,
     TRANSCRIPTS_DIR,
     WORKFLOW_CONFIG_PATH,
     WORKFLOW_DB_PATH,
 )
 from reii.ia_config_editor import (
     AGENT_TEMPLATE,
-    list_discourse_agent_names,
+    get_workflow_agents,
     list_inactive_agent_files,
+    list_workflow_files,
     load_discourse_config,
+    load_discourse_state_progress,
     load_grammar_config,
+    load_workflow_names,
     parse_json_text,
     parse_list_text,
     save_discourse_config,
     save_grammar_config,
+    save_workflow_names,
     to_json_text,
     to_list_text,
 )
@@ -123,10 +128,16 @@ def _workflow_runner(
     with open(WORKFLOW_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(params, f, ensure_ascii=False, indent=2)
 
-    script = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "main_workflow_clasico.py",
-    )
+    mode = state.get("workflow_mode", "classic")
+    if mode == "transformer":
+        script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "main_workflow.py"
+        )
+        # main_workflow.py calls WorkflowOrchestrator.execute()
+    else:
+        script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "main_workflow_clasico.py"
+        )
     log.append(f"🚀 Ejecutando workflow: python {script}")
     try:
         proc = subprocess.Popen(
@@ -158,11 +169,12 @@ def _workflow_runner(
 def _discourse_runner(
     log: List[str],
     state: Dict[str, Any],
-    agent_name: Optional[str],
+    workflow_file: str,
     store: bool,
     workflow: Optional[str],
+    force: bool = False,
 ) -> None:
-    """Ejecuta el agente de análisis de discurso en un hilo en segundo plano.
+    """Ejecuta un workflow de análisis de discurso en un hilo en segundo plano.
 
     ``DebugOrchestrator`` es pesado (carga ``workflow_data.json`` ~56MB y
     construye el resumen gramatical), así que se corre en un hilo para no
@@ -172,11 +184,12 @@ def _discourse_runner(
     import contextlib
 
     from reii.config import (
-        DISCOURSE_CONFIG_PATH,
         DISCOURSE_STATE_PATH,
         GRAMMAR_CONFIG_PATH,
+        IA_DIR,
         WORKFLOW_DB_PATH,
     )
+    from reii.ia_config_editor import list_workflow_files
     from reii.ia_discursiva import DebugOrchestrator
 
     class _LogStream:
@@ -200,18 +213,14 @@ def _discourse_runner(
     stream = _LogStream(log)
     try:
         with contextlib.redirect_stdout(stream):
+            workflow_paths = [str(IA_DIR / f) for f in list_workflow_files()]
             mon = DebugOrchestrator(
                 grammar_config_path=GRAMMAR_CONFIG_PATH,
-                discourse_config_path=DISCOURSE_CONFIG_PATH,
+                workflow_config_paths=workflow_paths,
                 workflow_data_path=WORKFLOW_DB_PATH,
                 state_path=DISCOURSE_STATE_PATH,
             )
-            if agent_name is None:
-                mon.run_all_discourse_agents(store=store, workflow=workflow)
-            else:
-                mon.run_discourse_agent(
-                    agent_name=agent_name, store=store, workflow=workflow
-                )
+            mon.run_workflow(workflow_file, store=store, workflow=workflow, force=force)
         log.append("✅ Análisis de discurso completado.")
         state["exit_code"] = 0
     except Exception as e:
@@ -540,6 +549,18 @@ def render_batch_tab():
     params: Dict[str, Any] = {}
 
     # --- Segmentación / NLP ---
+    with st.expander("⚙️ Modos de workflow", expanded=True):
+        mode = st.radio(
+            "Modo de procesamiento",
+            options=["📊 Classic (rápido, sin GPU)", "🧠 Transformer (requiere GPU)"],
+            index=0,
+            key="workflow_mode",
+        )
+        st.caption(
+            "Classic: spaCy, lexecon, RF/SHAP. "
+            "Transformer: embeddings fine-tuned, BERTopic, jerárquico."
+        )
+    params["workflow_mode"] = mode
     c1, c2, c3 = st.columns(3)
     with c1:
         params["use_bigrams"] = st.radio(
@@ -741,6 +762,7 @@ def render_batch_tab():
             "finished": False,
             "exit_code": None,
         }
+
     if "workflow_log" not in st.session_state:
         st.session_state.workflow_log = []
 
@@ -11559,6 +11581,11 @@ with tab_a:
                 parts = uid.split("_")
                 return "_".join(parts[:2]) if len(parts) >= 3 else uid
 
+            # groupby requires sorted input: same paragraph must be contiguous
+            # (otherwise the same par_key appears in several groups → duplicate
+            #  `card_<par_key>` element keys in Streamlit)
+            corpus_uces = sorted(corpus_uces, key=lambda u: _par_key(u.get("id", "")))
+
             # (groupby should be imported at top: from itertools import groupby)
             for pk, group in groupby(
                 corpus_uces, key=lambda u: _par_key(u.get("id", ""))
@@ -13162,12 +13189,6 @@ with tab_e:
     ds_state = st.session_state.discourse_state
     ds_log = st.session_state.discourse_log
 
-    _agent_names = list_discourse_agent_names()
-    _agent_options = ["Todos los agentes"] + _agent_names
-
-    if st.session_state.get("reii_disc_agent") not in _agent_options:
-        st.session_state["reii_disc_agent"] = _agent_options[0]
-
     if ds_state["finished"]:
         # ── AFTER VIEW ──────────────────────────────────────────────
         if ds_state["exit_code"] == 0:
@@ -13199,17 +13220,20 @@ with tab_e:
 
     if not ds_state["finished"]:
         # ── BEFORE VIEW ─────────────────────────────────────────────
-        with st.container(border=True):
-            c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+        st.subheader("🚀 Workflows de análisis")
+
+        # Opciones globales de ejecución
+        with st.expander("⚙️ Opciones de ejecución", expanded=False):
+            c1, c2, c3 = st.columns(3)
             with c1:
-                agent_label = st.selectbox(
-                    "Agente de discurso",
-                    _agent_options,
-                    index=0,
-                    key="reii_disc_agent",
-                )
-            with c2:
                 store = st.checkbox("Guardar estado", value=True, key="reii_disc_store")
+            with c2:
+                force = st.checkbox(
+                    "Re-procesar todo",
+                    value=False,
+                    key="reii_disc_force",
+                    help="Ignora lo ya procesado y vuelve a analizar todas las UCEs.",
+                )
             with c3:
                 workflow = (
                     st.text_input(
@@ -13219,24 +13243,49 @@ with tab_e:
                     )
                     or None
                 )
-            with c4:
-                run_clicked = st.button(
-                    "▶ Ejecutar",
-                    key="reii_disc_run",
-                    disabled=ds_state["running"],
-                    width="stretch",
-                )
 
-        if run_clicked:
-            if not os.path.exists(GRAMMAR_CONFIG_PATH) or not os.path.exists(
-                DISCOURSE_CONFIG_PATH
-            ):
-                st.error(
-                    "Falta el archivo de configuración del agente de discurso "
-                    f"(`{GRAMMAR_CONFIG_PATH}` o `{DISCOURSE_CONFIG_PATH}`). "
-                    "No se puede ejecutar el análisis."
-                )
-            else:
+        workflow_files = list_workflow_files()
+        workflow_names = load_workflow_names()
+        total_uces, by_agent = load_discourse_state_progress()
+
+        if not workflow_files:
+            st.warning(
+                "No se encontraron workflows en `ia/` (archivos JSON de agentes)."
+            )
+
+        for wf_file in workflow_files:
+            agents = get_workflow_agents(wf_file)
+            display_name = workflow_names.get(wf_file, wf_file)
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([3, 2, 1])
+                with c1:
+                    new_name = st.text_input(
+                        "Nombre del workflow",
+                        value=display_name,
+                        key=f"wf_name_{wf_file}",
+                    )
+                    st.caption(f"{len(agents)} agentes: {', '.join(agents)}")
+                with c2:
+                    if total_uces > 0 and agents:
+                        done = sum(by_agent.get(a, 0) for a in agents)
+                        frac = min(1.0, done / (len(agents) * total_uces))
+                        st.progress(frac)
+                        st.caption(f"{frac * 100:.0f}% procesado")
+                    else:
+                        st.progress(0.0)
+                        st.caption("Sin datos todavía")
+                with c3:
+                    run_clicked = st.button(
+                        "▶ Ejecutar",
+                        key=f"wf_run_{wf_file}",
+                        disabled=ds_state["running"],
+                        width="stretch",
+                    )
+
+            if run_clicked:
+                names = load_workflow_names()
+                names[wf_file] = new_name
+                save_workflow_names(names)
                 st.session_state.discourse_log = []
                 ds_state["running"] = True
                 ds_state["finished"] = False
@@ -13247,9 +13296,10 @@ with tab_e:
                     args=(
                         st.session_state.discourse_log,
                         ds_state,
-                        None if agent_label == "Todos los agentes" else agent_label,
+                        wf_file,
                         store,
                         workflow,
+                        force,
                     ),
                     daemon=True,
                 ).start()
@@ -13356,13 +13406,11 @@ with tab_e:
 
         _inactive = list_inactive_agent_files()
         if _inactive:
-            with st.expander(
-                "ℹ️ Agentes inactivos (no conectados al análisis)", expanded=False
-            ):
+            with st.expander("ℹ️ Workflows no editables aquí", expanded=False):
                 st.caption(
-                    "Estos archivos existen en `ia/` pero NO están conectados al "
-                    "orquestador (`DebugOrchestrator` solo carga `0.json` y `1.json`). "
-                    "No son editables desde aquí."
+                    "Estos archivos existen en `ia/` y SÍ son workflows ejecutables "
+                    "desde arriba, pero este editor solo edita `0.json` (resumidor "
+                    "gramatical) y `1.json` (agentes de discurso)."
                 )
                 st.code(", ".join(_inactive))
 
