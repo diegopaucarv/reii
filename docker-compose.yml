@@ -30,6 +30,7 @@ services:
       - REII_DISCOURSE_CONFIG_PATH=ia/1.json
       - REII_BATCH_DB_PATH=data/entrevistas.json
       - REII_TRANSCRIPTS_DIR=data/entrevistas
+      - REII_DATABASE_URL=postgresql://reii:reii@reii-db:5432/reii
       - TOGETHER_API_KEY=${TOGETHER_API_KEY:-}
       - TOGETHER_API_URL=${TOGETHER_API_URL:-https://api.together.ai/v1/chat/completions}
       - REII_LLM_MODEL=${REII_LLM_MODEL:-deepseek-ai/DeepSeek-V4.1-Flash}
@@ -69,6 +70,7 @@ services:
       - REII_DISCOURSE_CONFIG_PATH=ia/1.json
       - REII_BATCH_DB_PATH=data/entrevistas.json
       - REII_TRANSCRIPTS_DIR=data/entrevistas
+      - REII_DATABASE_URL=postgresql://reii:reii@reii-db:5432/reii
       - TOGETHER_API_KEY=${TOGETHER_API_KEY:-}
       - TOGETHER_API_URL=${TOGETHER_API_URL:-https://api.together.ai/v1/chat/completions}
       - REII_LLM_MODEL=${REII_LLM_MODEL:-deepseek-ai/DeepSeek-V4.1-Flash}
@@ -77,4 +79,18 @@ services:
       - REII_LLM_TIMEOUT=${REII_LLM_TIMEOUT:-300}
       - HF_TOKEN=${HF_TOKEN:-}
     profiles: ["batch"]
-    command: python src/reii/main_workflow_clasico.py
+    command: python src/reii/main_workflow.py
+
+  reii-db:
+    image: postgres:16
+    container_name: reii-db
+    environment:
+      - POSTGRES_USER=reii
+      - POSTGRES_PASSWORD=reii
+      - POSTGRES_DB=reii
+    volumes:
+      - reii_pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  reii_pgdata:

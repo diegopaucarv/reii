@@ -23,21 +23,21 @@ def verify(json_path: str, db_path: str) -> bool:
             (
                 "uces",
                 len(data.get("uces", []) or []),
-                conn.execute("SELECT COUNT(*) FROM uces").fetchone()[0],
+                conn.execute("SELECT COUNT(*) AS count FROM uces").fetchone()["count"],
             ),
             (
                 "ucs",
                 len(data.get("ucs", []) or []),
-                conn.execute("SELECT COUNT(*) FROM ucs").fetchone()[0],
+                conn.execute("SELECT COUNT(*) AS count FROM ucs").fetchone()["count"],
             ),
             (
                 "terms",
                 len(data.get("terminos", []) or []),
-                conn.execute("SELECT COUNT(*) FROM terms").fetchone()[0],
+                conn.execute("SELECT COUNT(*) AS count FROM terms").fetchone()["count"],
             ),
         ]
 
-        print("\n═══ Counts ═══")
+        print("\n=== Counts ===")
         for name, expected, actual in checks:
             flag = "OK " if expected == actual else "!! "
             if expected != actual:
@@ -45,7 +45,7 @@ def verify(json_path: str, db_path: str) -> bool:
             print(f"  {flag}{name:<14} JSON={expected:>6}  SQL={actual:>6}")
 
         # ── UCEs estables por cluster ──────────────────────────────────────
-        print("\n═══ UCEs por cluster ═══")
+        print("\n=== UCEs por cluster ===")
         rows = conn.execute("""
             SELECT cluster_id, COUNT(*) AS n,
                    SUM(is_stable) AS n_stable
@@ -59,27 +59,27 @@ def verify(json_path: str, db_path: str) -> bool:
             )
 
         # ── FKs huérfanas ──────────────────────────────────────────────────
-        print("\n═══ Integridad referencial ═══")
+        print("\n=== Integridad referencial ===")
         orphans_uces = conn.execute("""
-            SELECT COUNT(*) FROM uces u
+            SELECT COUNT(*) AS count FROM uces u
             LEFT JOIN documents d ON d.doc_id = u.doc_id
             WHERE d.doc_id IS NULL
-        """).fetchone()[0]
+        """).fetchone()["count"]
         orphans_ucs = conn.execute("""
-            SELECT COUNT(*) FROM ucs c
+            SELECT COUNT(*) AS count FROM ucs c
             LEFT JOIN documents d ON d.doc_id = c.doc_id
             WHERE d.doc_id IS NULL
-        """).fetchone()[0]
+        """).fetchone()["count"]
         orphans_ann = conn.execute("""
-            SELECT COUNT(*) FROM annotations a
+            SELECT COUNT(*) AS count FROM annotations a
             LEFT JOIN uces u ON u.uce_id = a.uce_id
             WHERE u.uce_id IS NULL
-        """).fetchone()[0]
+        """).fetchone()["count"]
 
         for name, n in [
-            ("uces→documents", orphans_uces),
-            ("ucs→documents", orphans_ucs),
-            ("annotations→uces", orphans_ann),
+            ("uces->documents", orphans_uces),
+            ("ucs->documents", orphans_ucs),
+            ("annotations->uces", orphans_ann),
         ]:
             flag = "OK " if n == 0 else "!! "
             if n != 0:
@@ -87,11 +87,11 @@ def verify(json_path: str, db_path: str) -> bool:
             print(f"  {flag}{name:<24} huérfanas={n}")
 
         # ── Muestra aleatoria de UCEs ──────────────────────────────────────
-        print("\n═══ Muestra de UCEs (SQL) ═══")
+        print("\n=== Muestra de UCEs (SQL) ===")
         sample = conn.execute("""
             SELECT uce_id, doc_id, local_idx, seccion,
                    substr(texto, 1, 60) AS snippet
-            FROM uces ORDER BY RANDOM() LIMIT 3
+            FROM uces ORDER BY random() LIMIT 3
         """).fetchall()
         for r in sample:
             print(
@@ -99,7 +99,7 @@ def verify(json_path: str, db_path: str) -> bool:
                 f"sec={r['seccion'] or '?':<20} :: {r['snippet']}"
             )
 
-    print("\n✅ Verificación OK" if ok else "\n❌ Verificación FALLÓ")
+    print("\n[OK] Verificación OK" if ok else "\n[FAIL] Verificación FALLÓ")
     return ok
 
 

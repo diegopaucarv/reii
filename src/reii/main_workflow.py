@@ -39,6 +39,7 @@ from transformers import utils
 from reii.config import (
     BEST_PARAMS_PATH,
     CORPUS_NAME,
+    DATABASE_URL,
     EMBEDDING_MODEL_NAME,
     LLM_MODEL,
     OUTPUT_DASHBOARD,
@@ -47,7 +48,6 @@ from reii.config import (
     TOGETHER_API_KEY,
     TOGETHER_BASE_URL,
     WORKFLOW_DB_PATH,
-    WORKFLOW_SQLITE_PATH
 )
 from reii.config import (
     DATA_DIR as REII_DATA_DIR,
@@ -360,9 +360,9 @@ class Config:
     # ── Optimizer (Optuna) ──────────────────────────────────────────────
     optimize: bool = False
     optimize_trials: int = 200
-    optimize_sampler: str = "tpe"            # "tpe" | "random" | "cmaes"
-    optimize_pruner: str = "median"          # "median" | "hyperband" | "none"
-    optimize_storage: Optional[str] = None   # ej. "sqlite:///reii_optuna.db"
+    optimize_sampler: str = "tpe"  # "tpe" | "random" | "cmaes"
+    optimize_pruner: str = "median"  # "median" | "hyperband" | "none"
+    optimize_storage: Optional[str] = None  # ej. "sqlite:///reii_optuna.db"
     optimize_study_name: str = "reii_search"
     optimize_n_startup_trials: int = 25
     optimize_multivariate: bool = True
@@ -370,13 +370,12 @@ class Config:
     # Multi-objective: (ARI↑, coverage↑, −K↑  ≡ K↓)
     optimize_directions: Tuple[str, ...] = ("maximize", "maximize", "minimize")
     # Preferencia sobre el frente de Pareto al seleccionar la solución final
-    optimize_preference: str = "max_ari"     # "max_ari" | "max_coverage" | "knee"
+    optimize_preference: str = "max_ari"  # "max_ari" | "max_coverage" | "knee"
     # Gate duro de cobertura (Recomendación A) — prune si cae por debajo
     optimize_coverage_gate: float = 0.65
 
     prune_small_clusters: bool = False
     min_class_size: int = 19
-
 
     db_local_path: str = WORKFLOW_DB_PATH
     subtlex_df_path: Optional[str] = None
@@ -410,11 +409,12 @@ class Config:
     hdbscan_uce_min_samples: Optional[int] = 1
     hdbscan_uce_metric: str = "euclidean"  # "euclidean" | "cosine"
 
-
-    # Ruta de la DB SQLite. Si None, se deriva de db_local_path.
-    db_sqlite_path: Optional[str] = WORKFLOW_SQLITE_PATH
+    # DSN de la base de datos (PostgreSQL). Si None, se deriva de db_local_path.
+    db_dsn: Optional[str] = DATABASE_URL
     # Escribir también el JSON de compatibilidad durante la transición.
     dual_write_json: bool = True
+
+
 # ══════════════════════════════════════════════════════════════════════
 # (Skipping boilerplate UCE, UC, CDHNode, Database, Segmentador for brevity - assume unchanged from base code except POS filtering)
 # ══════════════════════════════════════════════════════════════════════
@@ -1097,13 +1097,13 @@ class Database:
     El contrato público (save_uces, save_ucs, etc.) NO cambia — todo el
     pipeline sigue funcionando sin tocar el orquestador.
     """
+
     def __init__(self, config: Config, dual_write: bool = True):
         self.config = config
-        self.path = config.db_local_path              # JSON (compat)
-        self.sqlite_path = config.db_sqlite_path      # SQLite (primaria)
+        self.path = config.db_local_path  # JSON (compat)
+        self.dsn = config.db_dsn  # PostgreSQL (primaria)
         self.dual_write = dual_write
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        os.makedirs(os.path.dirname(self.sqlite_path), exist_ok=True)
 
         # Buffer en memoria: replicamos la interfaz dict anterior
         self.data = self._load_json_dict()
@@ -1115,10 +1115,19 @@ class Database:
             with open(self.path, "r", encoding="utf-8") as f:
                 return json.load(f)
         return {
-            "uces": [], "ucs": [], "sintesis_por_clase": [], "terminos": [],
-            "vocabulario": [], "multivariate": {}, "network": {},
-            "term_stability": [], "forma_index": {}, "cah_terminos": {},
-            "afc_result": {}, "cdh_tree_umbral1": {}, "cdh_tree_umbral2": {},
+            "uces": [],
+            "ucs": [],
+            "sintesis_por_clase": [],
+            "terminos": [],
+            "vocabulario": [],
+            "multivariate": {},
+            "network": {},
+            "term_stability": [],
+            "forma_index": {},
+            "cah_terminos": {},
+            "afc_result": {},
+            "cdh_tree_umbral1": {},
+            "cdh_tree_umbral2": {},
             "shap_analysis": {},
         }
 
@@ -1128,18 +1137,23 @@ class Database:
             self.data["doc_metadata"] = self.doc_metadata
             tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, indent=2, ensure_ascii=False,
-                          cls=_NumpyEncoder)
+                json.dump(self.data, f, indent=2, ensure_ascii=False, cls=_NumpyEncoder)
             os.replace(tmp, self.path)
         # SQL: reconstrucción total a partir de self.data (idempotente)
         try:
             from reii.backend.migrate import (
-                migrate_documents, migrate_uces, migrate_ucs,
-                migrate_clusters, migrate_terms, migrate_annotations,
-                migrate_network, migrate_kv,
+                migrate_annotations,
+                migrate_clusters,
+                migrate_documents,
+                migrate_kv,
+                migrate_network,
+                migrate_terms,
+                migrate_uces,
+                migrate_ucs,
             )
-            from reii.backend.db import connect
-            conn = connect(self.sqlite_path)
+            from reii.backend.sql.db import connect
+
+            conn = connect(self.dsn)
             try:
                 migrate_documents(conn, self.data)
                 migrate_uces(conn, self.data)
@@ -1164,8 +1178,7 @@ class Database:
                 self.data.setdefault(collection_name, []).append(d)
             else:
                 self.data[collection_name] = [
-                    x if x[key] != d[key] else d
-                    for x in self.data[collection_name]
+                    x if x[key] != d[key] else d for x in self.data[collection_name]
                 ]
 
     def save_uces(self, uces):
@@ -1209,9 +1222,11 @@ class Database:
                 d["id"] = f"{doc_id}_{section_id}_{local_idx}"
             else:
                 import uuid
+
                 d["id"] = str(uuid.uuid4())
             uces.append(UCE.from_dict(d))
         return uces
+
 
 # ══════════════════════════════════════════════════════════════════════
 # BERTOPIC COMPLEMENTARIO (Placeholder)
@@ -4036,7 +4051,6 @@ class DoubleClassifier:
                 yield "_".join(b)
         if self.config.use_trigrams:
             for t in uce.trigram_stems if use_stems else uce.trigrams:
-            for t in (uce.trigram_stems if use_stems else uce.trigrams):
                 yield "_".join(t)
 
     def _triple_stability_verdicts(
@@ -6034,8 +6048,8 @@ class Optimizador:
         self.we_analyzer = we_analyzer
         self.subtlex_analyzer = subtlex_analyzer
         self.segmentador = SegmentadorALCESTE(config_base)
-        self.uces_por_doc, self.doc_metadata_map = (
-            self.segmentador.segmentar_en_uces(corpus_raw)
+        self.uces_por_doc, self.doc_metadata_map = self.segmentador.segmentar_en_uces(
+            corpus_raw
         )
         start_time = time.time()
         for doc_uces in self.uces_por_doc:
@@ -6094,14 +6108,10 @@ class Optimizador:
             ],
             "n_trials_total": len(study.trials),
             "n_trials_completed": sum(
-                1
-                for t in study.trials
-                if t.state == optuna.trial.TrialState.COMPLETE
+                1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE
             ),
             "n_trials_pruned": sum(
-                1
-                for t in study.trials
-                if t.state == optuna.trial.TrialState.PRUNED
+                1 for t in study.trials if t.state == optuna.trial.TrialState.PRUNED
             ),
             "timestamp": datetime.now().isoformat(),
             "total_uces": self.total_uces,
@@ -6123,9 +6133,7 @@ class Optimizador:
             data = json.load(f)
         params = data.get("best_params") or data.get("params")
         if params:
-            print(
-                f"   [Optimizador] Loaded params from {path}: {params}"
-            )
+            print(f"   [Optimizador] Loaded params from {path}: {params}")
         return params
 
     def _select_preference(self, study: "optuna.Study") -> int:
@@ -6297,9 +6305,7 @@ class Optimizador:
             raise optuna.TrialPruned()
 
         coverage = len(uces_list) / max(1, self.total_uces)
-        coverage_gate = float(
-            getattr(self.config_base, "optimize_coverage_gate", 0.65)
-        )
+        coverage_gate = float(getattr(self.config_base, "optimize_coverage_gate", 0.65))
 
         # ── Gate duro: coverage insuficiente (Recomendación A) ──────────
         if coverage < coverage_gate:
@@ -6320,9 +6326,7 @@ class Optimizador:
         n = min(len(labels1_uce), len(labels2_uce))
         if n < 2:
             raise optuna.TrialPruned()
-        ari = float(
-            adjusted_rand_score(labels1_uce[:n], labels2_uce[:n])
-        )
+        ari = float(adjusted_rand_score(labels1_uce[:n], labels2_uce[:n]))
 
         return ari, float(coverage), -float(n_clusters)
 
@@ -6332,12 +6336,8 @@ class Optimizador:
     def _make_sampler(self):
         name = getattr(self.config_base, "optimize_sampler", "tpe")
         seed = self.config_base.random_state
-        n_startup = int(
-            getattr(self.config_base, "optimize_n_startup_trials", 25)
-        )
-        multivariate = bool(
-            getattr(self.config_base, "optimize_multivariate", True)
-        )
+        n_startup = int(getattr(self.config_base, "optimize_n_startup_trials", 25))
+        multivariate = bool(getattr(self.config_base, "optimize_multivariate", True))
 
         if name == "tpe":
             return TPESampler(
@@ -6362,9 +6362,7 @@ class Optimizador:
 
     def optimizar(self, n_trials: int = 200) -> Dict[str, Any]:
         if not _OPTUNA_AVAILABLE:
-            print(
-                "   [!] optuna no instalado. Ejecuta: pip install optuna"
-            )
+            print("   [!] optuna no instalado. Ejecuta: pip install optuna")
             return {}
 
         # Cache del espacio de búsqueda — se consulta en cada trial
@@ -6381,9 +6379,7 @@ class Optimizador:
             )
         )
         storage = getattr(self.config_base, "optimize_storage", None)
-        study_name = getattr(
-            self.config_base, "optimize_study_name", "reii_search"
-        )
+        study_name = getattr(self.config_base, "optimize_study_name", "reii_search")
 
         study = optuna.create_study(
             study_name=study_name,
@@ -6397,7 +6393,9 @@ class Optimizador:
         print(f"\n=== Optuna · {n_trials} trials ===")
         print(f"   Sampler    : {self.config_base.optimize_sampler}")
         print(f"   Pruner     : {self.config_base.optimize_pruner}")
-        print(f"   Objectives : {list(zip(['ari', 'coverage', 'n_clusters'], directions))}")
+        print(
+            f"   Objectives : {list(zip(['ari', 'coverage', 'n_clusters'], directions))}"
+        )
         print(f"   Coverage gate: {self.config_base.optimize_coverage_gate:.2f}")
         print(f"   UCEs       : {self.total_uces}")
 
@@ -6433,7 +6431,9 @@ class Optimizador:
         best_idx = self._select_preference(study)
         best_trial = study.best_trials[best_idx]
 
-        print(f"\n   >>> Pareto front: {len(study.best_trials)} soluciones no-dominadas")
+        print(
+            f"\n   >>> Pareto front: {len(study.best_trials)} soluciones no-dominadas"
+        )
         print(
             f"   >>> Seleccionada (preference="
             f"{self.config_base.optimize_preference}): trial #{best_trial.number}"
@@ -6446,6 +6446,7 @@ class Optimizador:
         print(f"       params: {best_trial.params}")
 
         return dict(best_trial.params)
+
 
 # ══════════════════════════════════════════════════════════════════════
 # WORKFLOW ORCHESTRATOR
@@ -6475,6 +6476,13 @@ class WorkflowOrchestrator:
         self.we_analyzer = we_analyzer
         self.subtlex_analyzer = subtlex_analizer
         self.db = Database(config, dual_write=config.dual_write_json)
+        # Publicar defaults de config en PostgreSQL (ON CONFLICT DO NOTHING: no pisa ediciones del dashboard)
+        try:
+            from reii.backend.config_store import ConfigStore
+
+            ConfigStore(config.db_dsn).seed_from_config(config)
+        except Exception as e:
+            print(f"   [WARNING] ConfigStore.seed_from_config falló: {e}")
         self.segmentador = SegmentadorALCESTE(config)
         self.uc_builder = UCBuilder(we_analyzer, subtlex_analizer, uc_config, config)
         self.double_clf = DoubleClassifier(
@@ -7024,9 +7032,7 @@ class WorkflowOrchestrator:
                 self.we_analyzer,
                 self.subtlex_analyzer,
             )
-            mejores_params = optimizador.optimizar(
-                n_trials=self.config.optimize_trials
-            )
+            mejores_params = optimizador.optimizar(n_trials=self.config.optimize_trials)
             if mejores_params:
                 # El frente de Pareto ya quedó persistido dentro de optimizar()
                 _apply_best_params(mejores_params)
@@ -7237,11 +7243,7 @@ class WorkflowOrchestrator:
         # NO se modifica uce.cluster_id, ni df_terms, ni AFC, ni inercia.
         # Los resultados van a campos separados y se registran bajo
         # `db.data["liminal_projection"]` para trazabilidad.
-        if (
-            self.config.use_liminal_projection
-            and uces_est_list
-            and voc_uc
-        ):
+        if self.config.use_liminal_projection and uces_est_list and voc_uc:
             try:
                 projection_summary = self.double_clf._project_liminal_uces(
                     uces_por_doc=uces_por_doc,
@@ -7650,7 +7652,7 @@ if __name__ == "__main__":
         hdbscan_uce_metric="euclidean",
         # ── Optimizer (Optuna) ─────────────────────────────────────────
         optimize=True,
-        optimize_trials=300,           # subir de 100 a 300 — TPE rinde más
+        optimize_trials=300,  # subir de 100 a 300 — TPE rinde más
         optimize_sampler="tpe",
         optimize_pruner="median",
         optimize_storage="sqlite:///reii_optuna.db",  # persistencia entre sesiones
@@ -7659,9 +7661,26 @@ if __name__ == "__main__":
         optimize_multivariate=True,
         optimize_prune_n_startup=15,
         optimize_directions=("maximize", "maximize", "minimize"),
-        optimize_preference="knee",    # o "max_ari" / "max_coverage"
+        optimize_preference="knee",  # o "max_ari" / "max_coverage"
         optimize_coverage_gate=0.65,
     )
+
+    # ── Overrides del dashboard (PostgreSQL vía ConfigStore) ─────────────
+    try:
+        from reii.backend.config_store import ConfigStore
+
+        _store = ConfigStore(alceste_config.db_dsn)
+        _store.seed_from_config(
+            alceste_config
+        )  # publica defaults (no-op si ya sembrado)
+        _stored = _store.get_all()
+        _valid = {
+            k: v for k, v in _stored.items() if k in alceste_config.__dataclass_fields__
+        }
+        if _valid:
+            alceste_config = dataclasses.replace(alceste_config, **_valid)
+    except Exception as e:
+        print(f"   [WARNING] ConfigStore apply falló: {e}")
 
     gram_config = GramConfig(
         min_tokens_por_uce=30,

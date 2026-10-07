@@ -1,0 +1,366 @@
+[
+  {
+    "original": "240213_2302 enf lourdes.srt",
+    "clean": "240213_2302 enf lourdes.txt",
+    "interviewer": "UNKNOWN",
+    "speakers": {
+      "UNKNOWN": 29,
+      "00": 14
+    },
+    "token_est": 97
+  },
+  {
+    "original": "240214_0532 ing ROUSELL defensa civil.srt",
+    "clean": "240214_0532 ing ROUSELL defensa civil.txt",
+    "interviewer": "01",
+    "speakers": {
+      "01": 71,
+      "00": 195
+    },
+    "token_est": 5937
+  },
+  {
+    "original": "250611_2343 enfermero Nelson quimbiri.srt",
+    "clean": "250611_2343 enfermero Nelson quimbiri.txt",
+    "interviewer": "03",
+    "speakers": {
+      "03": 359,
+      "01": 22,
+      "02": 253,
+      "UNKNOWN": 3,
+      "00": 7
+    },
+    "token_est": 8472
+  },
+  {
+    "original": "250612_0047 trabjador de quimbiri.srt",
+    "clean": "250612_0047 trabjador de quimbiri.txt",
+    "interviewer": "01",
+    "speakers": {
+      "01": 72,
+      "02": 8,
+      "00": 135,
+      "UNKNOWN": 10
+    },
+    "token_est": 3149
+  },
+  {
+    "original": "250612_0118 trabajador de CS quimbiri.srt",
+    "clean": "250612_0118 trabajador de CS quimbiri.txt",
+    "interviewer": "00",
+    "speakers": {
+      "00": 201,
+      "01": 193
+    },
+    "token_est": 5174
+  },
+  {
+    "original": "250612_0521 enfermera.srt",
+    "clean": "250612_0521 enfermera.txt",
+    "interviewer": "01",
+    "speakers": {
+      "01": 167,
+      "02": 144,
+      "UNKNOWN": 1,
+      "00": 10
+    },
+    "token_est": 3698
+  },
+  {
+    "original": "250612_0632 ..... enfermera.srt",
+    "clean": "250612_0632 ..... enfermera.txt",
+    "interviewer": "01",
+    "speakers": {
+      "01": 257,
+      "00": 293
+    },
+    "token_est": 6429
+  },
+  {
+    "original": "250613_0530 DIRESA.srt",
+    "clean": "250613_0530 DIRESA.txt",
+    "interviewer": "00",
+    "speakers": {
+      "00": 106,
+      "UNKNOWN": 2,
+      "01": 43
+    },
+    "token_est": 3180
+  },
+  {
+    "original": "250613_0754 bombera comandante.srt",
+    "clean": "250613_0754 bombera comandante.txt",
+    "interviewer": "00",
+    "speakers": {
+      "00": 367,
+      "UNKNOWN": 86
+    },
+    "token_est": 2525
+  },
+  {
+    "original": "250613_0840 bombera.srt",
+    "clean": "250613_0840 bombera.txt",
+    "interviewer": "UNKNOWN",
+    "speakers": {
+      "UNKNOWN": 4,
+      "00": 1
+    },
+    "token_est": 13
+  },
+  {
+    "original": "Brigadista Erick - Hospital SF 23 sept, 10-51 a.m..srt",
+    "clean": "Brigadista Erick - Hospital SF 23 sept_ 10-51_a.m..txt",
+    "interviewer": "01",
+    "speakers": {
+      "01": 169,
+      "02": 305,
+      "00": 5
+    },
+    "token_est": 6933
+  },
+  {
+    "original": "Director CSMC Uyarina Wasi 23 sept, 3-28 p.m.srt",
+    "clean": "Director CSMC Uyarina Wasi 23 sept_ 3-28_p.m.txt",
+    "interviewer": "00",
+    "speakers": {
+      "01": 535,
+      "00": 249,
+      "UNKNOWN": 3
+    },
+    "token_est": 12631
+  },
+  {
+    "original": "ENTREVISTA ALCALDE SR RONDINEL.srt",
+    "clean": "ENTREVISTA ALCALDE SR RONDINEL.txt",
+    "interviewer": "01",
+    "speakers": {
+      "UNKNOWN": 6,
+      "00": 161,
+      "01": 241
+    },
+    "token_est": 5648
+  },
+  {
+    "original": "ENTREVISTA DIRECTORA HOSPTAL LIC, IRENE.srt",
+    "clean": "ENTREVISTA DIRECTORA HOSPTAL LIC_ IRENE.txt",
+    "interviewer": "00",
+    "speakers": {
+      "01": 99,
+      "00": 674,
+      "02": 11,
+      "UNKNOWN": 1
+    },
+    "token_est": 13542
+  },
+  {
+    "original": "ENTREVISTA ENFERMERA ANA MARÌA.srt",
+    "clean": "ENTREVISTA ENFERMERA ANA MARÌA.txt",
+    "interviewer": "00",
+    "speakers": {
+      "00": 134,
+      "02": 342,
+      "01": 116
+    },
+    "token_est": 10638
+  },
+  {
+    "original": "ENTREVISTA ENFERMERA DENISSE.srt",
+    "clean": "ENTREVISTA ENFERMERA DENISSE.txt",
+    "interviewer": "01",
+    "speakers": {
+      "03": 230,
+      "01": 123,
+      "00": 1,
+      "02": 11
+    },
+    "token_est": 7746
+  },
+  {
+    "original": "ENTREVISTA SR CARLOS.srt",
+    "clean": "ENTREVISTA SR CARLOS.txt",
+    "interviewer": "00",
+    "speakers": {
+      "01": 179,
+      "00": 168
+    },
+    "token_est": 5938
+  },
+  {
+    "original": "ENTREVISTA SR RIVELINO.srt",
+    "clean": "ENTREVISTA SR RIVELINO.txt",
+    "interviewer": "00",
+    "speakers": {
+      "00": 116,
+      "01": 186,
+      "UNKNOWN": 2
+    },
+    "token_est": 6593
+  },
+  {
+    "original": "ENTREVISTA TÈCNICO ENFERMERÌA SR VICTOR.srt",
+    "clean": "ENTREVISTA TÈCNICO ENFERMERÌA SR VICTOR.txt",
+    "interviewer": "01",
+    "speakers": {
+      "01": 284,
+      "02": 227,
+      "00": 53
+    },
+    "token_est": 8294
+  },
+  {
+    "original": "Enfermera Cynthia 24 sept, 5-23 p.m.srt",
+    "clean": "Enfermera Cynthia 24 sept_ 5-23_p.m.txt",
+    "interviewer": "00",
+    "speakers": {
+      "UNKNOWN": 226,
+      "00": 376,
+      "01": 149
+    },
+    "token_est": 2787
+  },
+  {
+    "original": "Entrevista Comisario 2026-09-26_12 34 28 to 13 10 02.srt",
+    "clean": "Entrevista Comisario 2026-09-26_12 34 28 to 13 10 02.txt",
+    "interviewer": "UNKNOWN",
+    "speakers": {
+      "UNKNOWN": 67,
+      "00": 50
+    },
+    "token_est": 327
+  },
+  {
+    "original": "Focus Group 2 MJA , MLL Y DIEGO.srt",
+    "clean": "Focus Group 2 MJA _ MLL Y DIEGO.txt",
+    "interviewer": "UNKNOWN",
+    "speakers": {
+      "UNKNOWN": 64,
+      "00": 55
+    },
+    "token_est": 456
+  },
+  {
+    "original": "Grabación estándar 1 PERSONAL C.S MACHENTE.srt",
+    "clean": "Grabación estándar 1 PERSONAL C.S MACHENTE.txt",
+    "interviewer": "01",
+    "speakers": {
+      "01": 179,
+      "00": 159
+    },
+    "token_est": 5588
+  },
+  {
+    "original": "Grabación estándar 10 FUNCIONARIO RESPONSABLE EMED.srt",
+    "clean": "Grabación estándar 10 FUNCIONARIO RESPONSABLE EMED.txt",
+    "interviewer": "00",
+    "speakers": {
+      "01": 56,
+      "00": 27
+    },
+    "token_est": 1525
+  },
+  {
+    "original": "Grabación estándar 2 PERSONAL C. S MACHENTE.srt",
+    "clean": "Grabación estándar 2 PERSONAL C. S MACHENTE.txt",
+    "interviewer": "00",
+    "speakers": {
+      "00": 168,
+      "01": 138
+    },
+    "token_est": 4814
+  },
+  {
+    "original": "Grabación estándar 3 PERSONAL C.S MACHENTE.srt",
+    "clean": "Grabación estándar 3 PERSONAL C.S MACHENTE.txt",
+    "interviewer": "01",
+    "speakers": {
+      "01": 155,
+      "02": 109,
+      "00": 7
+    },
+    "token_est": 4755
+  },
+  {
+    "original": "Grabación estándar 4 PERSONAL C.S MACHENTE.srt",
+    "clean": "Grabación estándar 4 PERSONAL C.S MACHENTE.txt",
+    "interviewer": "UNKNOWN",
+    "speakers": {
+      "UNKNOWN": 37,
+      "00": 45,
+      "01": 231
+    },
+    "token_est": 2217
+  },
+  {
+    "original": "Grabación estándar 5 PERSONAL HOSPITAL SAN FRANCISCO.srt",
+    "clean": "Grabación estándar 5 PERSONAL HOSPITAL SAN FRANCISCO.txt",
+    "interviewer": "01",
+    "speakers": {
+      "01": 139,
+      "00": 193
+    },
+    "token_est": 8368
+  },
+  {
+    "original": "Grabación estándar 6 PERSONAL HOSPITAL SAN FRANCISCO.srt",
+    "clean": "Grabación estándar 6 PERSONAL HOSPITAL SAN FRANCISCO.txt",
+    "interviewer": "00",
+    "speakers": {
+      "00": 122,
+      "01": 168
+    },
+    "token_est": 7000
+  },
+  {
+    "original": "Grabación estándar 7 PERSONAL HOSPITAL SAN FRANCISCO.srt",
+    "clean": "Grabación estándar 7 PERSONAL HOSPITAL SAN FRANCISCO.txt",
+    "interviewer": "00",
+    "speakers": {
+      "00": 107,
+      "01": 120
+    },
+    "token_est": 3691
+  },
+  {
+    "original": "Grabación estándar 8 PERSONAL HOSPITAL SAN FRANCISCO.srt",
+    "clean": "Grabación estándar 8 PERSONAL HOSPITAL SAN FRANCISCO.txt",
+    "interviewer": "00",
+    "speakers": {
+      "00": 178,
+      "01": 144,
+      "UNKNOWN": 1
+    },
+    "token_est": 4512
+  },
+  {
+    "original": "Grabación estándar 9 FUNCIONARIO JEFE CPCED.srt",
+    "clean": "Grabación estándar 9 FUNCIONARIO JEFE CPCED.txt",
+    "interviewer": "00",
+    "speakers": {
+      "00": 85,
+      "01": 97
+    },
+    "token_est": 3906
+  },
+  {
+    "original": "TESTIMONIO SRA JULIA DAMINIFICADA.srt",
+    "clean": "TESTIMONIO SRA JULIA DAMINIFICADA.txt",
+    "interviewer": "00",
+    "speakers": {
+      "01": 251,
+      "00": 75,
+      "UNKNOWN": 6
+    },
+    "token_est": 3610
+  },
+  {
+    "original": "Trabajadora Social CSMC Uyarina Wasi 24 sept, 2-49 p.m.srt",
+    "clean": "Trabajadora Social CSMC Uyarina Wasi 24 sept_ 2-49_p.m.txt",
+    "interviewer": "00",
+    "speakers": {
+      "00": 259,
+      "01": 754,
+      "UNKNOWN": 1
+    },
+    "token_est": 21443
+  }
+]

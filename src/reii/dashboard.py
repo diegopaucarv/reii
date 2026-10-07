@@ -9,11 +9,15 @@ import subprocess
 import sys
 import threading
 import time
+from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from datetime import datetime
 from itertools import combinations, groupby
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+
+if TYPE_CHECKING:
+    from reii.batch_processor import BatchProcessor
 
 import networkx as nx
 import numpy as np
@@ -27,7 +31,6 @@ from scipy.signal import savgol_filter
 from scipy.stats import fisher_exact, pearsonr
 from sklearn.preprocessing import LabelEncoder
 
-from reii.batch_processor import BatchProcessor
 from reii.config import (
     BATCH_DB_PATH,
     CORPUS_NAME,
@@ -129,6 +132,7 @@ def _workflow_runner(
         json.dump(params, f, ensure_ascii=False, indent=2)
 
     mode = params.get("workflow_mode", "classic")
+    raw = str(params.get("workflow_mode", "classic")).lower()
     if mode == "transformer":
         script = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "main_workflow.py"
@@ -345,6 +349,8 @@ def render_batch_tab():
             st.session_state.show_batch_view = False
             st.rerun()
 
+    from reii.batch_processor import BatchProcessor
+
     bp = BatchProcessor(db_path=BATCH_DB_PATH)
 
     # ── Estado de la cola (persistente entre reruns) ─────────────────
@@ -552,9 +558,13 @@ def render_batch_tab():
     with st.expander("⚙️ Modos de workflow", expanded=True):
         mode = st.radio(
             "Modo de procesamiento",
-            options=["📊 Classic (rápido, sin GPU)", "🧠 Transformer (requiere GPU)"],
+            options=["classic", "transformer"],
+            format_func=lambda v: {
+                "classic": "📊 Classic (rápido, sin GPU)",
+                "transformer": "🧠 Transformer (requiere GPU)",
+            }[v],
             index=0,
-            key="workflow_mode",
+            key="workflow_mode_v2",  # ← key nueva fuerza init limpia
         )
         st.caption(
             "Classic: spaCy, lexecon, RF/SHAP. "
@@ -824,10 +834,10 @@ def render_batch_tab():
                 expanded=False,
             ):
                 st.code("\n".join(wf_log[-300:]))
-            # El workflow ya escribió data/workflow_data.json: al re-renderizar
-            # la página principal, load_merged_data() encontrará las UCEs y
-            # mostrará el dashboard habitual. Solo re-renderiza si el archivo
-            # existe; si no, deja el log visible para diagnosticar.
+            # El workflow ya escribió la base SQLite: al re-renderizar la página
+            # principal, _load_snapshot() encontrará las UCEs y mostrará el
+            # dashboard habitual. Solo re-renderiza si la base existe; si no,
+            # deja el log visible para diagnosticar.
             if os.path.exists(WORKFLOW_DB_PATH):
                 st.rerun()
         else:
@@ -979,26 +989,32 @@ _CONFIDENCE_RANK = {"alta": 3, "media": 2, "baja": 1}
 
 
 # ─────────────────────────────────────────────────────────────
-# DATA LOADING
+# DATA LOADING (SQLite-backed, version-keyed)
 # ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=30)
-def load_workflow_data():
-    path = WORKFLOW_DB_PATH
+def _wf_version() -> str:
+    """Fresh every rerun (uncached). Cheap SQL hash of the DB state."""
+    from reii.backend.dashboard_adapter import DashboardAdapter
+
+    return DashboardAdapter().version_hash()
+
+
+@st.cache_resource(show_spinner=False)
+def _load_snapshot(_version: str) -> Dict[str, Any]:
+    from reii.backend.dashboard_adapter import DashboardAdapter
+
+    return DashboardAdapter().snapshot()
+
+
+def _discourse_version() -> str:
+    path = DISCOURSE_STATE_PATH
     if not os.path.exists(path):
-        return {}
-    # Reintenta brevemente: el workflow puede estar reescribiendo el archivo
-    # (aunque ya escribe de forma atómica, un rerun puede caer justo en medio).
-    for _ in range(5):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            time.sleep(0.2)
-    return {}
+        return "none"
+    st = os.stat(path)
+    return f"{st.st_mtime_ns}_{st.st_size}"
 
 
-@st.cache_data(ttl=30)
-def load_discourse_state():
+@st.cache_data(show_spinner=False)
+def _load_discourse(_version: str) -> Dict[str, Any]:
     path = DISCOURSE_STATE_PATH
     if not os.path.exists(path):
         return {}
@@ -1006,41 +1022,36 @@ def load_discourse_state():
         return json.load(f)
 
 
-@st.cache_data(ttl=30)
-def load_merged_data():
-    wf = load_workflow_data()
-    if not wf:
-        return {}
+_version = _wf_version()
+data = _load_snapshot(_version)
+# cache_resource returns the SAME shared object across sessions; copy the
+# parts we mutate below so we never write into the cached snapshot.
+data = {**data, "uces": [dict(u) for u in data["uces"]]}
+disc = _load_discourse(_discourse_version())
+annotations_by_uce = disc.get("annotations_by_uce", {})
 
-    disc = load_discourse_state()
-    annotations_by_uce = disc.get("annotations_by_uce", {})
+# Merge discourse annotations into UCEs (legacy normalization, same as before)
+if annotations_by_uce:
+    for uce in data.get("uces", []):
+        raw_anns = annotations_by_uce.get(uce.get("id"), [])
+        normalized = []
+        for ann in raw_anns:
+            if "spans" not in ann and ann.get("uce_id") and ann.get("quote"):
+                ann = {
+                    **ann,
+                    "spans": [
+                        {
+                            "uce_id": ann["uce_id"],
+                            "quote": ann["quote"],
+                            "start_char": ann.get("start_char", -1),
+                            "end_char": ann.get("end_char", -1),
+                        }
+                    ],
+                }
+            normalized.append(ann)
+        uce["discourse_annotations"] = normalized
+    data["annotations_by_uce"] = annotations_by_uce
 
-    if annotations_by_uce:
-        # Normalize legacy format: some annotations use flat fields instead of spans[]
-        for uce in wf.get("uces", []):
-            raw_anns = annotations_by_uce.get(uce.get("id"), [])
-            normalized = []
-            for ann in raw_anns:
-                # Legacy: single uce_id + quote → wrap in spans[]
-                if "spans" not in ann and ann.get("uce_id") and ann.get("quote"):
-                    ann = {
-                        **ann,
-                        "spans": [
-                            {
-                                "uce_id": ann["uce_id"],
-                                "quote": ann["quote"],
-                                "start_char": ann.get("start_char", -1),
-                                "end_char": ann.get("end_char", -1),
-                            }
-                        ],
-                    }
-                normalized.append(ann)
-            uce["discourse_annotations"] = normalized
-
-    return wf
-
-
-data = load_merged_data()
 uces = data.get("uces", [])
 
 if not uces or st.session_state.get("show_batch_view"):
@@ -1228,7 +1239,9 @@ if not clusters_unicos:
         }
     )
 
-if not sintesis_estructurada and clusters_unicos:
+
+def _sintesis_mockup(clusters_unicos) -> dict:
+    """Síntesis de respaldo (mockup) cuando no hay datos reales guardados."""
     _mt = {
         0: (
             "Esta clase articula un discurso centrado en la **experiencia cotidiana** "
@@ -1245,7 +1258,7 @@ if not sintesis_estructurada and clusters_unicos:
         1: "• Discurso institucional\n• Habla normativa",
         2: "• Discurso prospectivo\n• Agencia y proyecto",
     }
-    sintesis_estructurada = {
+    return {
         "per_class": {
             str(c): _mt.get(i, f"Clase {c}") for i, c in enumerate(clusters_unicos)
         },
@@ -1256,6 +1269,10 @@ if not sintesis_estructurada and clusters_unicos:
         "global_synthesis": "Estructura de representación social heterogénea.",
         "_is_mockup": True,
     }
+
+
+if not sintesis_estructurada and clusters_unicos:
+    sintesis_estructurada = _sintesis_mockup(clusters_unicos)
 
 CLASS_COLORS_DARK = {0: "#E8A838", 1: "#5BA8DC", 2: "#5DC88A"}
 CLASS_COLORS_LIGHT = {0: "#C8800A", 1: "#1B6FAD", 2: "#1D8A50"}
@@ -1348,12 +1365,102 @@ def _uce_meta(uce: dict) -> dict:
 
 
 # ── FIX 13: Índice secuencial de documentos (origen_index) ──
-origen_index = data.get("origen_index", {})
+origen_index = dict(data.get("origen_index") or {})
 if not origen_index:
     for _u in uces:
         _m = _uce_meta(_u)
         _key = str(_m.get("origen", _u.get("doc_id", "Desconocido")))
         origen_index.setdefault(_key, []).append(_u["id"])
+
+
+def render_config_editor():
+    from reii.backend.config_store import (
+        ALL_CONFIG_KEYS,
+        CONFIG_CATEGORIES,
+        ConfigStore,
+    )
+    from reii.backend.dashboard_adapter import DashboardAdapter
+
+    store = ConfigStore()
+    # Valores efectivos: defaults del último run (kv_store) + overrides
+    # (workflow_config). La tabla workflow_config puede estar vacía hasta que
+    # el workflow corre con el hook de bootstrap; el snapshot siempre trae los
+    # defaults del último run.
+    base = data.get("config") or {}
+    overrides = store.get_all()
+    st.subheader("⚙️ Configuración del análisis")
+    st.caption(
+        "Valores efectivos del último run del workflow. Guardar escribe un "
+        "override que el próximo run respeta; 'Restaurar defaults' borra los "
+        "overrides y vuelve a los valores del código."
+    )
+    updates: Dict[str, Any] = {}
+    for category, keys in CONFIG_CATEGORIES.items():
+        with st.expander(category, expanded=False):
+            for key in keys:
+                if key not in base:
+                    continue
+                current = base[key]
+                is_override = key in overrides
+                label = f"{key} {'✎' if is_override else ''}"
+                if isinstance(current, bool):
+                    new_val = st.radio(
+                        label,
+                        [True, False],
+                        index=0 if current else 1,
+                        key=f"cfg_{key}",
+                    )
+                elif isinstance(current, int):
+                    new_val = st.number_input(
+                        label, value=current, step=1, key=f"cfg_{key}"
+                    )
+                elif isinstance(current, float):
+                    new_val = st.number_input(
+                        label, value=current, step=0.01, key=f"cfg_{key}"
+                    )
+                elif isinstance(current, (list, tuple)):
+                    new_val = st.text_area(
+                        label,
+                        value=json.dumps(current, ensure_ascii=False),
+                        key=f"cfg_{key}",
+                    )
+                    try:
+                        new_val = json.loads(new_val)
+                    except Exception:
+                        new_val = current
+                else:
+                    new_val = st.text_input(label, value=str(current), key=f"cfg_{key}")
+                if new_val != current:
+                    updates[key] = new_val
+    if updates and st.button("💾 Guardar configuración"):
+        DashboardAdapter().set_config_many(updates, by="dashboard")
+        st.cache_data.clear()
+        st.rerun()
+    if st.button("↩️ Restaurar defaults"):
+        for key in ALL_CONFIG_KEYS:
+            store.reset(key)
+        st.cache_data.clear()
+        st.rerun()
+
+
+# Botones de navegación de la sidebar (pestaña C, vista de búsqueda).
+# Función plana (NO fragment): se llama desde el nivel módulo dentro de
+# `with st.sidebar:`. Los JMP necesitan rerun completo para navegar
+# (cambian la vista principal), por eso usan scope="app".
+def _render_sidebar_jump_buttons(matching_ucs, uc_search, expanded_search_terms):
+    if st.button("🔄 Recargar datos discursivos"):
+        st.cache_resource.clear()
+        st.rerun(scope="app")
+    for uc_idx, (_, doc_id, _, _, uc_uces) in enumerate(matching_ucs):
+        for u in uc_uces:
+            if st.button(f"JMP_{u['id']}", key=f"btn_{uc_idx}_{u['id']}"):
+                st.session_state.tab_b_view = "document"
+                st.session_state.selected_doc_id = doc_id
+                st.session_state.target_uce_id = u["id"]
+                st.session_state.doc_search_query = uc_search
+                st.session_state.doc_filter_lemmas = list(expanded_search_terms)
+                st.rerun(scope="app")
+
 
 # ── INICIALIZACIÓN DE ESTADOS PARA LA PESTAÑA B ──
 if "tab_b_view" not in st.session_state:
@@ -1409,6 +1516,9 @@ n_ucs = len(ucs)
 # MOTOR DE BÚSQUEDA
 # ─────────────────────────────────────────────────────────────
 PROXIMITY_THRESHOLD = 2
+
+# Tokenizador de palabras (misma clase de caracteres que `match_term`).
+_WB = re.compile(r"[a-záéíóúüñA-ZÁÉÍÓÚÜÑ0-9]+")
 
 
 def _word_count(s: str) -> int:
@@ -1473,13 +1583,63 @@ def match_term(term: str, text: str) -> list:
 
 
 @st.cache_data(show_spinner=False)
-def _cached_corpus_search(terms_key: tuple, target_cls, logic: str) -> list:
+def _build_word_index(_version: str):
+    """Índice invertido de palabras -> índices de UCE, cacheado por versión.
+
+    Re-deriva `uces` desde el snapshot para no serializar la lista completa
+    en la clave de caché.
+    """
+    _uces = _load_snapshot(_version).get("uces", [])
+    word_to_ids: dict = {}
+    for idx, uce in enumerate(_uces):
+        text = uce.get("texto", "")
+        for w in _WB.findall(text):
+            wl = w.lower()
+            word_to_ids.setdefault(wl, []).append(idx)
+    sorted_words = sorted(word_to_ids.keys())
+    return word_to_ids, sorted_words
+
+
+@st.cache_data(show_spinner=False)
+def _cached_corpus_search(
+    _version: str, terms_key: tuple, target_cls, logic: str
+) -> list:
     terms = list(terms_key)
     n_terms = len(terms)
+    _uces = _load_snapshot(_version).get("uces", [])
+    _uce_phi_dict = {
+        item["uce_id"]: item.get("phi_score", 0.0)
+        for item in _load_snapshot(_version).get("uce_phi", [])
+        if item.get("uce_id")
+    }
+
+    # Determinar candidatos vía índice invertido (solo si hay términos).
+    # Unión de rangos bisect sobre TODOS los términos: correcto para AND y OR.
+    candidate_ids = None
+    if terms:
+        first_parts = []
+        ok = True
+        for t in terms:
+            fp = t.split("_")[0].lower()
+            if not fp or not _WB.fullmatch(fp):
+                ok = False
+                break
+            first_parts.append(fp)
+        if ok:
+            word_to_ids, sorted_words = _build_word_index(_version)
+            candidate_ids = set()
+            for fp in first_parts:
+                lo = bisect_left(sorted_words, fp)
+                hi = bisect_right(sorted_words, fp + "\uffff")
+                for w in sorted_words[lo:hi]:
+                    candidate_ids.update(word_to_ids[w])
+
     results = []
-    for uce in uces:
+    for idx, uce in enumerate(_uces):
         cid = uce.get("cluster_id")
         if target_cls is not None and cid != target_cls:
+            continue
+        if candidate_ids is not None and idx not in candidate_ids:
             continue
         if not terms:
             results.append(
@@ -1488,7 +1648,7 @@ def _cached_corpus_search(terms_key: tuple, target_cls, logic: str) -> list:
                     "matched_terms": [],
                     "match_count": 0,
                     "positions": {},
-                    "phi": uce_phi_dict.get(uce.get("id", ""), 0.0),
+                    "phi": _uce_phi_dict.get(uce.get("id", ""), 0.0),
                 }
             )
             continue
@@ -1511,7 +1671,7 @@ def _cached_corpus_search(terms_key: tuple, target_cls, logic: str) -> list:
                 "matched_terms": matched,
                 "match_count": mc,
                 "positions": positions,
-                "phi": uce_phi_dict.get(uce.get("id", ""), 0.0),
+                "phi": _uce_phi_dict.get(uce.get("id", ""), 0.0),
             }
         )
     if not terms:
@@ -1522,34 +1682,54 @@ def _cached_corpus_search(terms_key: tuple, target_cls, logic: str) -> list:
 
 
 def corpus_search(terms, target_cls, logic):
-    return _cached_corpus_search(tuple(terms), target_cls, logic)
+    return _cached_corpus_search(_version, tuple(terms), target_cls, logic)
 
 
-def _build_term_color_map_cached(terms_key: tuple, classes_key: tuple) -> dict:
+@st.cache_data(show_spinner=False)
+def _build_termino_index(_version: str):
+    """Índice por cluster de términos ordenados + phi, cacheado por versión."""
+    _terminos_df = pd.DataFrame(_load_snapshot(_version).get("terminos", []))
+    index: dict = {}
+    if not _terminos_df.empty:
+        for c, grp in _terminos_df.groupby("cluster"):
+            phi_by_termino: dict = {}
+            for termino, sub in grp.groupby("termino"):
+                phi_by_termino[termino] = sub["phi"].max()
+            index[c] = (sorted(phi_by_termino.keys()), phi_by_termino)
+    return index
+
+
+def _build_term_color_map_cached(
+    _version: str, terms_key: tuple, classes_key: tuple
+) -> dict:
     terms = list(terms_key)
     selected_classes = list(classes_key)
+    index = _build_termino_index(_version)
     cmap = {}
     for term in terms:
         root = term.split("_")[0]
         best_phi = -999
         best_col = T["text_mid"]
-        if not terminos_df.empty:
-            for c in selected_classes:
-                rows = terminos_df[
-                    (terminos_df["cluster"] == c)
-                    & (terminos_df["termino"].str.startswith(root))
-                ]
-                if not rows.empty:
-                    pv = rows["phi"].max()
-                    if pv > best_phi:
-                        best_phi = pv
-                        best_col = class_colors.get(c, T["text_mid"])
+        for c in selected_classes:
+            entry = index.get(c)
+            if entry is None:
+                continue
+            sorted_terminos, phi_by_termino = entry
+            lo = bisect_left(sorted_terminos, root)
+            hi = bisect_right(sorted_terminos, root + "\uffff")
+            for termino in sorted_terminos[lo:hi]:
+                pv = phi_by_termino[termino]
+                if pv > best_phi:
+                    best_phi = pv
+                    best_col = class_colors.get(c, T["text_mid"])
         cmap[term] = best_col
     return cmap
 
 
 def build_term_color_map(terms, selected_classes):
-    return _build_term_color_map_cached(tuple(terms), tuple(sorted(selected_classes)))
+    return _build_term_color_map_cached(
+        _version, tuple(terms), tuple(sorted(selected_classes))
+    )
 
 
 def render_highlighted_text(text: str, positions: dict, term_color_map: dict) -> str:
@@ -2430,6 +2610,14 @@ def _build_stats_from_uces(uces: List[Dict]) -> Dict:
     }
 
 
+@st.cache_data(show_spinner=False)
+def _build_stats_cached(_version: str, uce_ids_key: tuple) -> Dict:
+    _uces = _load_snapshot(_version).get("uces", [])
+    lookup = {u["id"]: u for u in _uces}
+    filtered = [lookup[uid] for uid in uce_ids_key if uid in lookup]
+    return _build_stats_from_uces(filtered)
+
+
 # ─────────────────────────────────────────────────────────────
 # ESTADO GLOBAL
 # ─────────────────────────────────────────────────────────────
@@ -2701,6 +2889,7 @@ def _title_style(text: str) -> dict:
     )
 
 
+@st.cache_data(show_spinner=False)
 def make_cdh_dendrogram(_dm_key: bool, root_at_top: bool = True):
     """Draw the CDH decision tree. If root_at_top=True, root is placed at top."""
     if not cdh_tree:
@@ -2887,6 +3076,7 @@ def make_cdh_dendrogram(_dm_key: bool, root_at_top: bool = True):
     return fig
 
 
+@st.cache_data(show_spinner=False)
 def make_shap_per_class_importance(_dm_key: bool):
     """Grouped bar: mean |SHAP| per feature, one bar per class."""
     shap_pcm = shap_data.get("shap_per_class_mean_abs", [])
@@ -2937,6 +3127,7 @@ def make_shap_per_class_importance(_dm_key: bool):
     return fig
 
 
+@st.cache_data(show_spinner=False)
 def make_global_cah_dendrogram(_dm_key: bool):
     from scipy.cluster.hierarchy import dendrogram as _dendrogram
 
@@ -3154,6 +3345,7 @@ def metadata_quality_html(
 #     return fig
 
 
+@st.cache_data(show_spinner=False)
 def make_donut(_selected_classes_key: tuple, _dm_key: bool):
     selected_classes = list(_selected_classes_key)
     if not selected_classes or not class_sizes:
@@ -3183,6 +3375,7 @@ def make_donut(_selected_classes_key: tuple, _dm_key: bool):
     return fig
 
 
+@st.cache_data(show_spinner=False)
 def make_word_bars(_selected_classes_key: tuple, _dm_key: bool):
     selected_classes = list(_selected_classes_key)
     if not selected_classes or not words_per_cluster:
@@ -3220,6 +3413,7 @@ def make_word_bars(_selected_classes_key: tuple, _dm_key: bool):
     return fig
 
 
+@st.cache_data(show_spinner=False)
 def make_mca_scatter(_selected_classes_key: tuple, _dm_key: bool):
     selected_classes = list(_selected_classes_key)
     if not multivariate:
@@ -3335,6 +3529,7 @@ def make_mca_scatter(_selected_classes_key: tuple, _dm_key: bool):
     return fig
 
 
+@st.cache_data(show_spinner=False)
 def make_scree_plot(_dm_key: bool):
     if not singular_values or len(singular_values) < 2:
         return None
@@ -3491,6 +3686,7 @@ def _document_afc_projection() -> List[Dict]:
     return projections
 
 
+@st.cache_data(show_spinner=False)
 def make_afc_biplot(
     _selected_classes_key: tuple,
     view_mode: str,
@@ -3791,6 +3987,7 @@ def make_afc_biplot(
     return fig
 
 
+@st.cache_data(show_spinner=False)
 def make_stability_map(_selected_classes_key: tuple, _dm_key: bool):
     selected_classes = list(_selected_classes_key)
     if not term_stability_dict or terminos_df.empty or not selected_classes:
@@ -4095,6 +4292,7 @@ def make_single_doc_trajectory(
 
 
 # FIX 8: make_butterfly_chart — NaN guard + empty num_cols guard
+@st.cache_data(show_spinner=False)
 def make_butterfly_chart(
     _selected_classes_key: tuple,
     top_n=28,
@@ -4219,9 +4417,12 @@ def make_butterfly_chart(
     return fig
 
 
+@st.cache_data(show_spinner=False)
 def make_cross_class_radar_lemmas(
-    chosen_lemmas: list, selected_classes: list, _dm_key: bool
+    chosen_lemmas_key: tuple, selected_classes_key: tuple, _dm_key: bool
 ):
+    chosen_lemmas = list(chosen_lemmas_key)
+    selected_classes = list(selected_classes_key)
     if terminos_df.empty or not chosen_lemmas or not selected_classes:
         return None
     classes = sorted([c for c in selected_classes if c in class_sizes])
@@ -4274,9 +4475,12 @@ def make_cross_class_radar_lemmas(
     return fig
 
 
+@st.cache_data(show_spinner=False)
 def make_term_freq_bar_lemmas(
-    chosen_lemmas: list, selected_classes: list, _dm_key: bool
+    chosen_lemmas_key: tuple, selected_classes_key: tuple, _dm_key: bool
 ):
+    chosen_lemmas = list(chosen_lemmas_key)
+    selected_classes = list(selected_classes_key)
     if terminos_df.empty or not selected_classes or not chosen_lemmas:
         return None
     classes = sorted([c for c in selected_classes if c in class_sizes])
@@ -4323,7 +4527,13 @@ def make_term_freq_bar_lemmas(
     return fig
 
 
-def make_lemma_sunburst(chosen_lemmas: list, forma_index: dict, selected_classes: list):
+@st.cache_data(show_spinner=False)
+def make_lemma_sunburst(
+    chosen_lemmas_key: tuple, forma_index_json: str, selected_classes_key: tuple
+):
+    chosen_lemmas = list(chosen_lemmas_key)
+    selected_classes = list(selected_classes_key)
+    forma_index = json.loads(forma_index_json)
     if not chosen_lemmas or not forma_index:
         return None
     ids = ["ROOT"]
@@ -4475,16 +4685,15 @@ def gramcat_html(_selected_classes_key: tuple, _dm_key: bool) -> str:
     )
 
 
-def build_lemma_network(
+def _build_lemma_graph(
     chosen_lemmas: list,
     _uces: list,
     _lemma_map: dict,
     min_cooc: int = 2,
     top_n: int = 50,
-    min_degree: int = 1,
 ):
     if not chosen_lemmas or not _lemma_map:
-        return None, None
+        return None
     seed_set = set(chosen_lemmas)
     expanded_seeds = set()
     for lem in seed_set:
@@ -4507,7 +4716,7 @@ def build_lemma_network(
         if matched:
             relevant_uces.append(lms)
     if not relevant_uces:
-        return None, None
+        return None
     cooc_counter = Counter()
     term_freq = Counter()
     for lemmas in relevant_uces:
@@ -4534,6 +4743,13 @@ def build_lemma_network(
     for (a, b), cnt in cooc_counter.items():
         if a in candidate_terms and b in candidate_terms and cnt >= min_cooc:
             G.add_edge(a, b, weight=cnt)
+    G.graph["seed_set"] = seed_set
+    return G
+
+
+def _build_lemma_figure(G, min_degree: int, _lemma_map: dict):
+    G = G.copy()
+    seed_set = G.graph.get("seed_set", set())
     nodes_to_remove = [
         n for n in G.nodes() if G.degree(n) < min_degree and n not in seed_set
     ]
@@ -4967,6 +5183,7 @@ def make_doc_composition(_dm_key: bool):
     return fig
 
 
+@st.cache_data(show_spinner=False)
 def make_graphe_specificites(_selected_classes_key: tuple, top_n: int, _dm_key: bool):
     from scipy.cluster.hierarchy import leaves_list, linkage
     from scipy.spatial.distance import pdist
@@ -5038,6 +5255,7 @@ def make_graphe_specificites(_selected_classes_key: tuple, top_n: int, _dm_key: 
     return fig
 
 
+@st.cache_data(show_spinner=False)
 def make_tensions_lexicales(_selected_classes_key: tuple, _dm_key: bool):
     selected_classes = list(_selected_classes_key)
     if terminos_df.empty or not selected_classes:
@@ -7400,35 +7618,6 @@ def build_isotopy_data(
     return out
 
 
-@st.cache_data(show_spinner=False)
-def _build_isotopy_cached(
-    terminos_json: str,
-    uces_json: str,
-    phi_json: str,
-    clusters_key: tuple,
-    colors_key: tuple,
-    sintesis_json: str,
-    top_terms=8,
-    top_uces=5,
-):
-    _terminos_df = pd.DataFrame(json.loads(terminos_json))
-    _uces = json.loads(uces_json)
-    _uce_phi_dict = json.loads(phi_json)
-    _clusters_unicos = list(clusters_key)
-    _class_colors = dict(zip(clusters_key, colors_key))
-    _sintesis_estructurada = json.loads(sintesis_json)
-    return build_isotopy_data(
-        _terminos_df,
-        _uces,
-        _uce_phi_dict,
-        _clusters_unicos,
-        _class_colors,
-        _sintesis_estructurada,
-        top_terms,
-        top_uces,
-    )
-
-
 def build_global_data(_se, _cu, _cc):
     opp1 = _se.get("oposicion_principal", {})
     opp2 = _se.get("oposicion_secundaria", {})
@@ -7450,15 +7639,44 @@ def build_global_data(_se, _cu, _cc):
     }
 
 
-iso_classes = _build_isotopy_cached(
-    terminos_df.to_json(),
-    json.dumps(uces),
-    json.dumps(uce_phi_dict),
-    tuple(clusters_unicos),
-    tuple(class_colors[c] for c in clusters_unicos),
-    json.dumps(sintesis_estructurada),
-)
-global_data = build_global_data(sintesis_estructurada, clusters_unicos, class_colors)
+@st.cache_data(show_spinner=False)
+def _build_iso_and_global(_version: str, _dm: bool):
+    """Isotopías + datos globales, cacheados por versión de la DB.
+
+    Recibe solo `_version` (hash del estado de la DB) y `_dm` (modo oscuro,
+    afecta los colores). Re-deriva las entradas desde el snapshot ya cacheado
+    para no serializar `json.dumps(uces)` (35MB) en cada rerun.
+    """
+    snap = _load_snapshot(_version)
+    _uces = snap.get("uces", [])
+    _terminos_df = pd.DataFrame(snap.get("terminos", []))
+    _uce_phi_dict = {
+        item["uce_id"]: item["phi_score"] for item in snap.get("uce_phi", [])
+    }
+    _clusters_unicos = sorted(
+        {
+            u.get("cluster_id")
+            for u in _uces
+            if u.get("cluster_id") is not None and u.get("cluster_id") >= 0
+        }
+    )
+    _class_colors = {c: _class_color(c) for c in _clusters_unicos}
+    _sintesis_estructurada = snap.get("sintesis_estructurada", {})
+    if not _sintesis_estructurada and _clusters_unicos:
+        _sintesis_estructurada = _sintesis_mockup(_clusters_unicos)
+    iso = build_isotopy_data(
+        _terminos_df,
+        _uces,
+        _uce_phi_dict,
+        _clusters_unicos,
+        _class_colors,
+        _sintesis_estructurada,
+    )
+    gd = build_global_data(_sintesis_estructurada, _clusters_unicos, _class_colors)
+    return iso, gd
+
+
+iso_classes, global_data = _build_iso_and_global(_version, _dm)
 
 
 def _build_imap(cd):
@@ -7515,12 +7733,18 @@ def _uce_cards_html(ul, imap, col):
 
 
 @st.cache_data(show_spinner=False)
+def _build_lemma_graph_cached(chosen_lemmas_key: tuple, min_cooc: int, top_n: int):
+    return _build_lemma_graph(list(chosen_lemmas_key), uces, lemma_map, min_cooc, top_n)
+
+
+@st.cache_data(show_spinner=False)
 def build_lemma_network_cached(
     chosen_lemmas_key: tuple, min_cooc: int, top_n: int, min_degree: int
 ):
-    return build_lemma_network(
-        list(chosen_lemmas_key), uces, lemma_map, min_cooc, top_n, min_degree
-    )
+    G = _build_lemma_graph_cached(chosen_lemmas_key, min_cooc, top_n)
+    if G is None:
+        return None, None
+    return _build_lemma_figure(G, min_degree, lemma_map)
 
 
 def unified_kwic_search(uces_list, filter_terms, cluster_id, color):
@@ -9938,39 +10162,10 @@ def render_paragraph_card(
         </style>
         """
 
-        js_script = """
-        <script>
-        function sendToPython(tabName, filtersJsonStr) {
-            try {
-                const payloadObj = {
-                    "tab": tabName,
-                    "filters": JSON.parse(filtersJsonStr.replace(/&quot;/g, '"')),
-                    "ts": Date.now()
-                };
-                const payload = JSON.stringify(payloadObj);
-                const input = window.parent.document.querySelector('input[aria-label="js_bridge"]');
-                if (!input) { console.error("JS bridge input not found."); return; }
-                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, "value"
-                ).set;
-                nativeInputValueSetter.call(input, payload);
-                input.dispatchEvent(new Event('input',  { bubbles: true }));
-                input.dispatchEvent(new Event('change', { bubbles: true }));
-                input.dispatchEvent(new window.parent.KeyboardEvent('keydown',
-                    { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-                input.dispatchEvent(new window.parent.KeyboardEvent('keyup',
-                    { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-                input.blur();
-            } catch (e) { console.error("sendToPython error:", e); }
-        }
-        </script>
-        """
-
         final_html = (
             f"{iframe_styles}"
             f'<div style="line-height:2.1;font-size:0.88rem;padding:8px 12px;">'
             f"{''.join(html_parts)}</div>"
-            f"{js_script}"
         )
         click = _ANNOTATED_CARD(
             html=final_html,
@@ -9983,11 +10178,6 @@ def render_paragraph_card(
                 click.get("ts")
             )
             _set_multiple_filters(click["tab"], click["filters"])
-
-        st.iframe(
-            final_html,
-            height=max(300, len(par_uces) * 110),
-        )
 
 
 TRAIT_COLORS: Dict[str, str] = {
@@ -11030,6 +11220,14 @@ def _confidence_metrics_html(anns: List[dict]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
+# CONFIGURACIÓN (sidebar) — solo se renderiza si el usuario la abre
+# ─────────────────────────────────────────────────────────────
+with st.sidebar:
+    if st.checkbox("⚙️ Configuración del análisis", key="show_cfg_editor"):
+        render_config_editor()
+
+
+# ─────────────────────────────────────────────────────────────
 # PESTAÑAS PRINCIPALES
 # ─────────────────────────────────────────────────────────────
 tab_a, tab_b, tab_c, tab_d, tab_e = st.tabs(
@@ -11039,7 +11237,8 @@ tab_a, tab_b, tab_c, tab_d, tab_e = st.tabs(
         "C · Análisis por clase",
         "D· Correlaciones y calidad",
         "E · Discurso por clase",
-    ]
+    ],
+    on_change="rerun",
 )
 
 
@@ -11047,9 +11246,10 @@ tab_a, tab_b, tab_c, tab_d, tab_e = st.tabs(
 # PESTAÑA A
 # ══════════════════════════════════════════════════════════════
 
-with tab_a:
-    all_doc_ids_a = sorted(origen_index.keys())
 
+@st.fragment
+def _render_tab_a():
+    all_doc_ids_a = sorted(origen_index.keys())
     # ── Barra superior ─────────────────────────────────────────
     top_cols = st.columns([3, 5, 2])
     with top_cols[0]:
@@ -11059,10 +11259,10 @@ with tab_a:
             default=None,
             label_visibility="collapsed",
             placeholder="Filter by document…",
+            key="tab_a_docs",
         )
         if not selected_docs:
             selected_docs = all_doc_ids_a
-
     with top_cols[1]:
         search_query = st.text_input(
             "Search",
@@ -11070,7 +11270,6 @@ with tab_a:
             label_visibility="collapsed",
             placeholder="Search corpus…",
         ).strip()
-
     with top_cols[2]:
         LAYERS = {
             "neg": "Negación",
@@ -11093,9 +11292,9 @@ with tab_a:
                 default=["neg", "verb", "pron"],
                 label_visibility="collapsed",
                 placeholder="Annotation layers…",
+                key="tab_a_layers",
             )
         )
-
     # Build UCE list filtered by selected documents
     uce_lookup_a = {u["id"]: u for u in uces}
     all_uces_filtered: List[Dict] = []
@@ -11104,7 +11303,6 @@ with tab_a:
             u = uce_lookup_a.get(uid)
             if u:
                 all_uces_filtered.append(u)
-
     # ── PRECOMPUTE SHARED DATA STRUCTURES ──────────────────────────
     # Chain index for coreference (used by both columns)
     chain_index: Dict[str, Dict] = {}
@@ -11120,7 +11318,6 @@ with tab_a:
                 txt = m.get("text", "").strip()
                 if txt:
                     chain_index[rep]["mentions"].add(txt)
-
     # All predicate frames (used by both columns)
     all_frames: List[Dict] = []
     for u in all_uces_filtered:
@@ -11128,9 +11325,10 @@ with tab_a:
             frame = dict(pf) if not isinstance(pf, dict) else dict(pf)
             frame["_uce_id"] = u.get("id", "")
             all_frames.append(frame)
-
     # Now proceed with stats and column layout...
-    stats_a = _build_stats_from_uces(all_uces_filtered)
+    stats_a = dict(
+        _build_stats_cached(_version, tuple(u["id"] for u in all_uces_filtered))
+    )
     stats_a["predicate_frames"] = data.get("predicate_frames", {})
 
     def _pred_matches(f: dict) -> bool:
@@ -11142,7 +11340,6 @@ with tab_a:
         voice_filter = st.session_state.get("pred_filter_voice", "Todas")
         role_filter = st.session_state.get("pred_filter_role", "Todos")
         negated_filter = st.session_state.get("pred_filter_negated", "Ambos")
-
         if voice_filter != "Todas" and f.get("voice") != voice_filter:
             return False
         if role_filter != "Todos" and f.get("thematic_role") != role_filter:
@@ -11158,7 +11355,6 @@ with tab_a:
     # COLUMNAS PRINCIPALES  izq=stats/filtros  der=corpus
     # ══════════════════════════════════════════════════════════
     col_a, col_b = st.columns([35, 65])
-
     # ── Columna izquierda: pestañas de análisis ────────────────
     with col_a:
         opciones_tabs = [
@@ -11171,10 +11367,8 @@ with tab_a:
             "Coref",
             "Predicados",
         ]
-
         if "radio_tabs_a" not in st.session_state:
             st.session_state.radio_tabs_a = "Global"
-
         active_tab = st.radio(
             "Pestañas A",
             options=opciones_tabs,
@@ -11182,7 +11376,6 @@ with tab_a:
             label_visibility="collapsed",
             key="radio_tabs_a",
         )
-
         # ── Pestañas existentes (sin cambios) ─────────────────
         if active_tab == "Global":
             tab_global(stats_a, all_uces_filtered)
@@ -11196,7 +11389,6 @@ with tab_a:
             tab_adverbios(stats_a, all_uces_filtered)
         elif active_tab == "Discurso":
             tab_discurso(stats_a, all_uces_filtered)
-
         # ══════════════════════════════════════════════════════
         # PESTAÑA COREF — rediseñada
         # ══════════════════════════════════════════════════════
@@ -11217,14 +11409,12 @@ with tab_a:
                         txt = m.get("text", "").strip()
                         if txt:
                             chain_index[rep]["mentions"].add(txt)
-
             # Convertir a lista ordenada por nº de menciones desc
             sorted_chains = sorted(
                 chain_index.items(),
                 key=lambda kv: len(kv[1]["uce_ids"]),
                 reverse=True,
             )
-
             if not sorted_chains:
                 st.info(
                     "No hay entidades correferentes en los documentos seleccionados."
@@ -11239,17 +11429,14 @@ with tab_a:
                     f"{len(sorted_chains)} entidades correferentes — ordenadas por frecuencia</p>",
                     unsafe_allow_html=True,
                 )
-
                 # Columnas rep/count para cada cadena
                 max_uces = len(sorted_chains[0][1]["uce_ids"]) if sorted_chains else 1
-
                 for rep, info in sorted_chains:
                     n_uces_chain = len(info["uce_ids"])
                     n_mentions = len(info["mentions"])
                     bar_pct = int(n_uces_chain / max_uces * 100)
                     is_selected = st.session_state.get("coref_selected_entity") == rep
                     entity_color = _entity_color(rep)
-
                     # Card clicable por entidad
                     label_html = (
                         f'<div style="display:flex;align-items:center;gap:8px;'
@@ -11272,7 +11459,6 @@ with tab_a:
                         f"</div>"
                     )
                     st.markdown(label_html, unsafe_allow_html=True)
-
                     # Botón invisible de selección superpuesto
                     btn_key = f"coref_btn_{rep}"
                     if st.button(
@@ -11285,7 +11471,6 @@ with tab_a:
                         else:
                             st.session_state.coref_selected_entity = rep
                         st.rerun()
-
                 # Detalle de menciones de la entidad seleccionada
                 sel_entity = st.session_state.get("coref_selected_entity")
                 if sel_entity and sel_entity in chain_index:
@@ -11314,7 +11499,6 @@ with tab_a:
                         f"{', '.join(info['uce_ids'][:6])}"
                         + (" …" if len(info["uce_ids"]) > 6 else "")
                     )
-
         # ══════════════════════════════════════════════════════
         # PESTAÑA PREDICADOS — rediseñada
         # ══════════════════════════════════════════════════════
@@ -11327,16 +11511,13 @@ with tab_a:
                     frame = dict(pf) if not isinstance(pf, dict) else pf
                     frame["_uce_id"] = u.get("id", "")
                     all_frames.append(frame)
-
             if not all_frames:
                 st.info("No hay marcos predicativos en los documentos seleccionados.")
             else:
                 # 2. Índice por lema verbal
                 # ─────────────────────────
-
                 lemma_counts = Counter(f.get("verb_lemma", "?") for f in all_frames)
                 sorted_lemmas = [lm for lm, _ in lemma_counts.most_common()]
-
                 # Estado de filtros
                 if "pred_selected_lemma" not in st.session_state:
                     st.session_state.pred_selected_lemma = (
@@ -11348,7 +11529,6 @@ with tab_a:
                     st.session_state.pred_filter_role = "Todos"
                 if "pred_filter_negated" not in st.session_state:
                     st.session_state.pred_filter_negated = "Ambos"
-
                 # 3. Selector de lema (chips clicables)
                 # ─────────────────────────────────────
                 st.markdown(
@@ -11357,7 +11537,6 @@ with tab_a:
                     'color:var(--text-low);margin-bottom:6px">Verbo lema</p>',
                     unsafe_allow_html=True,
                 )
-
                 # Mostramos hasta 12 lemas; el resto se colapsa
                 max_show = 12
                 chips_html_parts = []
@@ -11379,7 +11558,6 @@ with tab_a:
                     + "</div>",
                     unsafe_allow_html=True,
                 )
-
                 sel_lemma = st.selectbox(
                     "Seleccionar lema:",
                     options=sorted_lemmas,
@@ -11390,12 +11568,10 @@ with tab_a:
                     label_visibility="collapsed",
                 )
                 st.session_state.pred_selected_lemma = sel_lemma
-
                 # Frames del lema seleccionado
                 lemma_frames = [
                     f for f in all_frames if f.get("verb_lemma") == sel_lemma
                 ]
-
                 # 4. Filtros secundarios
                 # ─────────────────────
                 voices = ["Todas"] + sorted(
@@ -11408,7 +11584,6 @@ with tab_a:
                         if f.get("thematic_role")
                     }
                 )
-
                 fc1, fc2, fc3 = st.columns(3)
                 with fc1:
                     st.session_state.pred_filter_voice = st.selectbox(
@@ -11437,12 +11612,9 @@ with tab_a:
                             st.session_state.pred_filter_negated
                         ),
                     )
-
                 # 5. Aplicar filtros
                 # ─────────────────
-
                 filtered_frames = [f for f in lemma_frames if _pred_matches(f)]
-
                 # 6. Estadísticas del lema bajo filtro
                 # ─────────────────────────────────────
                 if filtered_frames:
@@ -11457,12 +11629,10 @@ with tab_a:
                     )
                     tense_counts = Counter(f.get("tense", "?") for f in filtered_frames)
                     neg_count = sum(1 for f in filtered_frames if f.get("negated"))
-
                     top_agent = (
                         agent_counts.most_common(1)[0][0] if agent_counts else "—"
                     )
                     top_obj = obj_counts.most_common(1)[0][0] if obj_counts else "—"
-
                     stat_rows = [
                         ("Agente más frecuente", sh(top_agent)),
                         ("OD más frecuente", sh(top_obj)),
@@ -11493,14 +11663,12 @@ with tab_a:
                         f'background:var(--bg-panel)">{rows_html}</div>',
                         unsafe_allow_html=True,
                     )
-
                     # Sync filtro de subcat para que el corpus resalte
                     current_pred_filter = _get_subcat_filter().get("predicate_lemma")
                     if current_pred_filter != sel_lemma:
                         _set_subcat_filter("predicate_lemma", sel_lemma)
                         st.rerun()
                 st.caption(f"{len(filtered_frames)} frames bajo filtro activo")
-
     # ══════════════════════════════════════════════════════════
     # COLUMNA DERECHA: corpus anotado
     # ══════════════════════════════════════════════════════════
@@ -11524,7 +11692,6 @@ with tab_a:
                 format_func=lambda x: CAT_MAP[x],
                 label_visibility="collapsed",
             )
-
             # Filtros activos + botón de limpieza
             active_filters = _get_subcat_filter()
             if active_filters:
@@ -11536,10 +11703,8 @@ with tab_a:
                     if st.button("Limpiar filtros", key="clear_all_filters"):
                         _clear_subcat_filters()
                         st.stop()  # Prevent further execution after rerun request
-
             # ── DEFAULT CORPUS: all filtered UCEs ────────────────────────
             corpus_uces = all_uces_filtered
-
             # ── Coref: highlight selected entity and restrict UCEs ───────
             sel_coref_entity = st.session_state.get("coref_selected_entity")
             if active_tab == "Coref":
@@ -11558,7 +11723,6 @@ with tab_a:
                 else:
                     # No entity selected → show all but clear highlight
                     st.session_state.pop("highlight_entity", None)
-
             # ── Predicados: restrict to UCEs containing selected lemma ───
             elif active_tab == "Predicados":
                 sel_lm = st.session_state.get("pred_selected_lemma")
@@ -11570,16 +11734,13 @@ with tab_a:
                     }
                     # mini_html = _render_pred_mini_table(lm_uce_ids)
                     # st.markdown(mini_html, unsafe_allow_html=True)
-
                     corpus_uces = [
                         u for u in all_uces_filtered if u["id"] in lm_uce_ids
                     ]
                 # else: keep default (all UCEs)
-
             # ── For any other tab, ensure highlight is cleared ───────────
             else:
                 st.session_state.pop("highlight_entity", None)
-
             # ── Search filter: restrict to UCEs matching the query ────────
             if search_query:
                 _sq = search_query.lower()
@@ -11596,7 +11757,6 @@ with tab_a:
             # (otherwise the same par_key appears in several groups → duplicate
             #  `card_<par_key>` element keys in Streamlit)
             corpus_uces = sorted(corpus_uces, key=lambda u: _par_key(u.get("id", "")))
-
             # (groupby should be imported at top: from itertools import groupby)
             for pk, group in groupby(
                 corpus_uces, key=lambda u: _par_key(u.get("id", ""))
@@ -11612,435 +11772,8 @@ with tab_a:
                 )
 
 
-with tab_b:
-    st.markdown(
-        '<div style="padding:16px 28px 4px;font-family:var(--font-mono);font-size:9px;'
-        'letter-spacing:.12em;color:var(--text-low);text-transform:uppercase">Clases activas:</div>',
-        unsafe_allow_html=True,
-    )
-    cls_cols = st.columns(len(class_list))
-    for i, c in enumerate(class_list):
-        with cls_cols[i]:
-            sel = c in st.session_state.selected_classes
-            if st.button(
-                f"Clase {c}",
-                key=f"ta_cls_{c}",
-                width="stretch",
-                type="primary" if sel else "secondary",
-            ):
-                new_list = list(st.session_state.selected_classes)
-                if sel:
-                    new_list.remove(c)
-                else:
-                    new_list.append(c)
-                if not new_list:
-                    new_list = class_list.copy()
-                st.session_state.selected_classes = new_list
-                st.rerun()
-
-    _sec_rule("Estructura · Persistencia y distribución")
-    col_l, col_r = st.columns(2)
-    with col_l:
-        cl1, cl2 = st.columns(2)
-        with cl1:
-            st.markdown('<div style="padding:0 0 4px">', unsafe_allow_html=True)
-            st.markdown(
-                '<p class="panel-hdr">Distribución por clase</p>',
-                unsafe_allow_html=True,
-            )
-            dn = make_donut(tuple(selected_classes), _dm)
-            if dn:
-                st.plotly_chart(dn, width="stretch", config={"displayModeBar": False})
-            st.markdown("</div>", unsafe_allow_html=True)
-        with cl2:
-            st.markdown(
-                '<p class="panel-hdr">Palabras analizadas</p>', unsafe_allow_html=True
-            )
-            wb = make_word_bars(tuple(selected_classes), _dm)
-            if wb:
-                st.plotly_chart(wb, width="stretch", config={"displayModeBar": False})
-        for c in sorted(selected_classes):
-            pct = class_sizes[c] / classified_uces * 100 if classified_uces else 0
-            col = class_colors.get(c, "#AAA")
-            st.markdown(
-                f"""
-            <div style="display:grid;grid-template-columns:60px 1fr 36px 60px;align-items:center;
-                        gap:8px;padding:5px 0;border-bottom:1px solid var(--border)">
-              <span style="font-family:var(--font-mono);font-size:11px;color:{col};font-weight:500">Clase {c}</span>
-              <div style="height:4px;background:var(--bg-hover);border-radius:2px;overflow:hidden">
-                <div style="height:100%;width:{pct:.0f}%;background:{col};border-radius:2px"></div>
-              </div>
-              <span style="font-family:var(--font-mono);font-size:10px;color:{col}">{pct:.0f}%</span>
-              <span style="font-family:var(--font-mono);font-size:10px;color:var(--text-low)">{class_sizes[c]} UCE</span>
-            </div>""",
-                unsafe_allow_html=True,
-            )
-
-    with col_r:
-        _sec_rule("AFC · Analyse Factorielle des Correspondances")
-        _afc_c1, _afc_c2 = st.columns([2, 2])
-        with _afc_c1:
-            afc_view = st.radio(
-                "Vista AFC:",
-                options=["coordonnees", "correlations", "contributions"],
-                format_func=lambda x: {
-                    "coordonnees": "📐 En coordonnées",
-                    "correlations": "⭕ En corrélations",
-                    "contributions": "📊 En contributions",
-                }[x],
-                key="afc_view_mode",
-                horizontal=True,
-            )
-        with _afc_c2:
-            show_uc_proj = st.checkbox(
-                "Proyectar UCs individuales", False, key="afc_show_ucs"
-            )
-            show_doc_proj = st.checkbox(
-                "Proyectar documentos", False, key="afc_show_documents"
-            )
-        afc_fig = make_afc_biplot(
-            tuple(selected_classes),
-            view_mode=afc_view,
-            _dm_key=_dm,
-            show_ucs=show_uc_proj,
-            show_documents=show_doc_proj,
-        )
-        if afc_fig:
-            st.plotly_chart(afc_fig, width="stretch", config={"displayModeBar": True})
-        else:
-            st.info("Sin datos AFC. Asegúrate de use_projection=True en el pipeline.")
-        _AFC_HELP = {
-            "coordonnees": "Distancias χ² reales. Puntos alejados del origen = mayor especificidad.",
-            "correlations": "Proyección sobre el círculo unitario. Puntos en el borde = bien representados.",
-            "contributions": "Peso de cada término en la formación de los ejes factoriales.",
-        }
-        st.markdown(
-            f'<div style="font-family:var(--font-serif);font-size:12px;font-style:italic;'
-            f'color:var(--text-low);padding:4px 0 16px;line-height:1.6">'
-            f"{_AFC_HELP.get(afc_view, '')}</div>",
-            unsafe_allow_html=True,
-        )
-
-    bn = st.slider("Términos", 10, 60, 28, 2, key="ta_bn")
-    st.markdown(
-        '<div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dim);padding:8px 0 0">'
-        "Ordenados por spread máx−mín entre clases. Arriba = mayor polarización.</div>",
-        unsafe_allow_html=True,
-    )
-    bs = st.checkbox("Solo significativos", True, key="ta_bs")
-
-    bc1, bc3 = st.columns([1, 1])
-    with bc1:
-        _sec_rule("Butterfly Chart · φ por término y clase")
-        bff = make_butterfly_chart(tuple(selected_classes), bn, bs, _dm_key=_dm)
-        if bff:
-            st.plotly_chart(bff, width="stretch", config={"displayModeBar": False})
-        else:
-            st.info("Sin datos para el butterfly chart.")
-
-    with bc3:
-        _sec_rule("Graphe des spécificités · φ × CAH")
-        gs_fig = make_graphe_specificites(tuple(selected_classes), bn, _dm)
-        if gs_fig:
-            st.plotly_chart(gs_fig, width="stretch", config={"displayModeBar": False})
-        else:
-            st.info("Sin datos para el graphe des spécificités.")
-
-    cc1, cc2 = st.columns([1, 1])
-    with cc1:
-        _sec_rule("Estabilidad léxica · robustez de los hallazgos")
-        stab_fig = make_stability_map(tuple(sorted(class_sizes.keys())), _dm)
-        if stab_fig:
-            st.plotly_chart(stab_fig, width="stretch", config={"displayModeBar": False})
-            st.markdown(
-                '<div style="font-family:var(--font-serif);font-size:12px;font-style:italic;'
-                'color:var(--text-low);padding:4px 0 16px;line-height:1.6">'
-                "Arriba-derecha = hallazgos robustos (alto φ, alta estabilidad bootstrap). "
-                "Abajo-derecha = hallazgos frágiles: interpretar con cautela. "
-                "Tamaño = frecuencia global.</div>",
-                unsafe_allow_html=True,
-            )
-        else:
-            st.info(
-                "Sin datos de estabilidad. Activa use_term_stability=True en el pipeline."
-            )
-
-    with cc2:
-        _sec_rule("Tensiones lexicales · campo de batalla semántico")
-        tl_fig = make_tensions_lexicales(tuple(selected_classes), _dm)
-        if tl_fig:
-            st.plotly_chart(tl_fig, width="stretch", config={"displayModeBar": False})
-
-    _sec_rule("Comparación inter‑clases · Buscador de corpus")
-
-    _lemma_options = sorted(
-        lemma_map.keys(), key=lambda x: lemma_map[x]["total_freq"], reverse=True
-    )
-    _def_lemmas = _lemma_options[:6] if len(_lemma_options) >= 6 else _lemma_options
-
-    st.markdown(
-        '<div style="padding:4px 0 2px;font-family:var(--font-mono);font-size:9px;'
-        'letter-spacing:.1em;color:var(--text-low);text-transform:uppercase">'
-        "Lemas a explorar · el sistema resuelve raíces y formas exactas automáticamente</div>",
-        unsafe_allow_html=True,
-    )
-
-    chosen_lemmas = st.multiselect(
-        "Lemas:",
-        options=_lemma_options,
-        default=_def_lemmas,
-        key="cross_lemmas",
-        label_visibility="collapsed",
-    )
-    resolved_terms, _stem_label_map = resolve_stems_to_terms(chosen_lemmas)
-
-    if chosen_lemmas:
-        expanded_terms = set()
-        for lem in chosen_lemmas:
-            expanded_terms.add(lem)
-            expanded_terms.update(lemma_map.get(lem, {}).get("stems", []))
-            expanded_terms.update(lemma_map.get(lem, {}).get("formas", []))
-        chips_html = "".join(
-            f'<span style="padding:1px 8px;border-radius:10px;background:var(--bg-card);'
-            f"color:var(--text-mid);font-family:var(--font-mono);font-size:9px;"
-            f'margin:2px 3px;border:.5px solid var(--border2)">{sh(t)}</span>'
-            for t in chosen_lemmas
-        )
-        st.markdown(
-            f'<div style="padding:3px 0 8px;font-family:var(--font-mono);font-size:9px;'
-            f'color:var(--text-low)">Lemas seleccionados ({len(chosen_lemmas)}): {chips_html}<br>'
-            f"Expandido a {len(expanded_terms)} raíces y formas para el motor de búsqueda.</div>",
-            unsafe_allow_html=True,
-        )
-
-    if len(selected_classes) >= 2:
-        cr, cb = st.columns(2)
-        with cr:
-            st.markdown(
-                '<p class="panel-hdr">Radar Σφ por clase</p>', unsafe_allow_html=True
-            )
-            if len(chosen_lemmas) >= 3:
-                rf = make_cross_class_radar_lemmas(
-                    chosen_lemmas, tuple(selected_classes), _dm
-                )
-                if rf:
-                    st.plotly_chart(
-                        rf, width="stretch", config={"displayModeBar": False}
-                    )
-            else:
-                st.markdown(
-                    '<div style="padding:16px;font-family:var(--font-mono);font-size:10px;'
-                    'color:var(--text-low)">Necesitas al menos 3 lemas resueltos para el radar.</div>',
-                    unsafe_allow_html=True,
-                )
-        with cb:
-            sf = make_term_freq_bar_lemmas(chosen_lemmas, tuple(selected_classes), _dm)
-            if sf:
-                st.markdown(
-                    f'<p class="panel-hdr">Σφ acumulado por clase</p>',
-                    unsafe_allow_html=True,
-                )
-                st.plotly_chart(sf, width="stretch", config={"displayModeBar": False})
-
-    cr1, cb1 = st.columns(2)
-    with cr1:
-        st.markdown(
-            '<p class="panel-hdr">Formas exactas por lema · sunburst</p>',
-            unsafe_allow_html=True,
-        )
-        if chosen_lemmas:
-            sun = make_lemma_sunburst(
-                chosen_lemmas, data.get("forma_index", {}), selected_classes
-            )
-            if sun:
-                st.plotly_chart(sun, width="stretch", config={"displayModeBar": False})
-            else:
-                st.markdown(
-                    '<div style="padding:12px;font-family:var(--font-mono);font-size:10px;'
-                    'color:var(--text-low)">Sin variantes para los lemas seleccionados.</div>',
-                    unsafe_allow_html=True,
-                )
-
-    with cb1:
-        st.markdown(
-            '<p class="panel-hdr">Red de co‑ocurrencia · lemas resueltos</p>',
-            unsafe_allow_html=True,
-        )
-        min_deg = st.slider(
-            "Grado mínimo:", min_value=1, max_value=20, value=1, key="net_min_degree"
-        )
-        if chosen_lemmas:
-            net_fig, net_G = build_lemma_network_cached(
-                tuple(chosen_lemmas), 2, 50, min_deg
-            )
-            if net_fig:
-                if net_G:
-                    actual_max = max((d for _, d in net_G.degree()), default=0)
-                    st.markdown(
-                        f'<div style="font-family:var(--font-mono);font-size:9px;color:var(--text-low);'
-                        f'margin:-8px 0 6px">{net_G.number_of_nodes()} nodos · '
-                        f"{net_G.number_of_edges()} aristas · grado máx. {actual_max}</div>",
-                        unsafe_allow_html=True,
-                    )
-                st.plotly_chart(
-                    net_fig, width="stretch", config={"displayModeBar": False}
-                )
-            else:
-                st.info(
-                    "Sin red para los lemas resueltos con el grado mínimo seleccionado."
-                )
-        else:
-            st.info("Selecciona lemas para construir la red.")
-
-    _sec_rule("Perfil gramatical · Clase seleccionada")
-    render_gram_summary_section(filter_class=None)
-
-    _sec_rule("Buscador de corpus")
-    sc1, sc2, sc3 = st.columns([2, 1, 1])
-    with sc1:
-        cls_opts = ["Todas las clases"] + [
-            f"Clase {c}" for c in sorted(selected_classes)
-        ]
-        fcls = st.selectbox(
-            "Clase:", cls_opts, key="ta_fcls", label_visibility="collapsed"
-        )
-    with sc2:
-        logic = st.radio(
-            "Lógica:",
-            ["OR", "AND"],
-            horizontal=True,
-            key="ta_logic",
-            help="OR: al menos un término · AND: todos los términos",
-        )
-    with sc3:
-        show_all = st.checkbox("Mostrar todas", False, key="ta_showall")
-
-    tcls = None if fcls == "Todas las clases" else int(fcls.split()[-1])
-    sr = corpus_search(chosen_lemmas, tcls, logic)
-    tcm = build_term_color_map(chosen_lemmas, selected_classes) if chosen_lemmas else {}
-    ndsp = len(sr) if show_all else min(20, len(sr))
-    mc_counts = Counter(r["match_count"] for r in sr) if chosen_lemmas and sr else {}
-    breakdown_html = (
-        "".join(
-            f'<span style="padding:1px 8px;border-radius:10px;background:var(--bg-card);'
-            f'color:var(--text-mid);font-family:var(--font-mono);font-size:9px;margin-left:6px">'
-            f"{mc_counts[mc]} UCEs · {mc}/{len(chosen_lemmas)} términos</span>"
-            for mc in sorted(mc_counts, reverse=True)
-        )
-        if mc_counts
-        else ""
-    )
-    lc = "#5BA8DC" if logic == "OR" else "#E8A838"
-    st.markdown(
-        f'<div style="display:flex;align-items:center;gap:8px;padding:6px 0 8px;'
-        f'font-family:var(--font-mono);font-size:9px">'
-        f'<span style="color:var(--text-low)">{len(sr)} UCEs encontradas</span>'
-        f'<span style="padding:1px 8px;border-radius:10px;background:{lc}22;'
-        f'color:{lc};border:.5px solid {lc}55">{logic}</span>'
-        f"{breakdown_html}"
-        f'<span style="color:var(--text-dim);margin-left:auto">mostrando {ndsp}</span></div>',
-        unsafe_allow_html=True,
-    )
-
-    scroll_html = '<div class="corpus-scroll">'
-    if not sr:
-        scroll_html += (
-            '<div style="padding:20px 0;font-family:var(--font-mono);'
-            'font-size:10px;color:var(--text-dim)">Sin UCEs que coincidan.</div>'
-        )
-    else:
-        for res in sr[:ndsp]:
-            uce = res["uce"]
-            c = uce.get("cluster_id")
-            cc = (
-                class_colors.get(c, T["text_low"])
-                if c is not None and c >= 0
-                else T["text_low"]
-            )
-            phi_coefs = uce.get("phi_coefficients", {}) or {}
-            phi_html = ""
-            if phi_coefs:
-                top_phi = sorted(phi_coefs.items(), key=lambda x: x[1], reverse=True)[
-                    :5
-                ]
-                phi_html = (
-                    '<div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:6px">'
-                    + "".join(
-                        f'<span style="padding:1px 7px;border-radius:10px;font-family:var(--font-mono);'
-                        f'font-size:9px;background:{cc}18;color:{cc};border:.5px solid {cc}44">'
-                        f"{sh(t)} {v:+.2f}</span>"
-                        for t, v in top_phi
-                    )
-                    + "</div>"
-                )
-            phi = res["phi"]
-            mc = res["match_count"]
-            matched = res["matched_terms"]
-            texto_html = (
-                render_highlighted_text(uce.get("texto", ""), res["positions"], tcm)
-                if res["positions"]
-                else sh(uce.get("texto", ""))
-            )
-            ctag = f"Clase {c}" if c is not None and c >= 0 else "no clasificada"
-            if mc == 0:
-                bbg, bfg, btxt = "var(--bg-card)", T["text_low"], "sin coincidencias"
-            elif chosen_lemmas and mc == len(chosen_lemmas):
-                bbg, bfg, btxt = "#0F2A18", "#5DC88A", f"✓ {mc}/{len(chosen_lemmas)}"
-            else:
-                bbg, bfg, btxt = (
-                    "var(--bg-card)",
-                    "#E8A838",
-                    f"{mc}/{len(chosen_lemmas)}" if chosen_lemmas else "",
-                )
-            badge = (
-                f'<span class="match-badge" style="background:{bbg};color:{bfg};border:.5px solid {bfg}55">{btxt}</span>'
-                if btxt
-                else ""
-            )
-            chips = "".join(
-                f'<span style="padding:0 6px;border-radius:8px;font-size:9px;'
-                f"background:{tcm.get(mt, T['text_mid'])}22;color:{tcm.get(mt, T['text_mid'])};"
-                f'border:.5px solid {tcm.get(mt, T["text_mid"])}44;font-family:var(--font-mono)">{sh(mt)}</span> '
-                for mt in matched
-            )
-            doc_id = uce.get("doc_id", "—")
-            # AUG #1: use doc_meta_map for metadata display
-            meta_dict = _uce_meta(uce)
-            if meta_dict:
-                meta_items = [
-                    f"<span style='color:var(--text-dim)'>{k}:</span> <span style='color:var(--text-mid)'>{v}</span>"
-                    for k, v in meta_dict.items()
-                ]
-                meta_str = (
-                    "<span style='color:var(--border2); margin:0 8px;'> </span>".join(
-                        meta_items
-                    )
-                )
-            else:
-                meta_str = "<span style='color:var(--text-dim)'>Sin metadatos</span>"
-            scroll_html += f"""
-            <div class="uce-card" style="border-left:3px solid {cc}; padding:14px; display:flex; flex-direction:column; gap:12px;">
-              <div>
-                <div class="uce-meta" style="margin-bottom:10px;">
-                  <span style="font-family:var(--font-mono); font-size:11px; font-weight:600; color:var(--text-hi);">{sh(uce.get("id", "?")[:12])}</span>
-                  <span style="color:{cc}">{ctag} · φ={phi:.2f}</span>
-                  {badge}<span style="margin-left:4px">{chips}</span>
-                </div>
-                <div class="uce-text">{texto_html}</div>{phi_html}              </div>
-              <div style="background:var(--bg-panel); border:1px solid var(--border2); border-radius:var(--r-sm); padding:6px 12px; font-family:var(--font-mono); font-size:10px; display:flex; align-items:center; flex-wrap:wrap;">
-                <span style="color:var(--text-hi); font-weight:600; margin-right:8px;">Doc: {sh(doc_id)}</span>
-                <span style="color:var(--border2); margin-right:8px;"> </span>
-                <span>{meta_str}</span>
-              </div>
-            </div>"""
-    scroll_html += "</div>"
-    st.html(scroll_html)
-
-
-# ══════════════════════════════════════════════════════════════
-# PESTAÑA C
-# ══════════════════════════════════════════════════════════════
-with tab_c:
+@st.fragment
+def _render_tab_c():
     st.markdown(
         '<div style="padding:16px 28px 4px;font-family:var(--font-mono);font-size:9px;'
         'letter-spacing:.12em;color:var(--text-low);text-transform:uppercase">Clase en análisis:</div>',
@@ -12058,14 +11791,12 @@ with tab_c:
             ):
                 st.session_state.selected_class_single = c
                 st.rerun()
-
     cur_c = st.session_state.selected_class_single
     if st.session_state.get("_last_iso_class") != cur_c:
         st.session_state.iso_view = "hyp"
         st.session_state.iso_idx = 0
         st.session_state["_last_iso_class"] = cur_c
     cur_col = class_colors.get(cur_c, T["accent"]) if cur_c is not None else T["accent"]
-
     if cur_c is None:
         st.info("Selecciona una clase para comenzar el análisis.")
     else:
@@ -12084,10 +11815,8 @@ with tab_c:
         """,
             unsafe_allow_html=True,
         )
-
         _sec_rule("Análisis léxico · Barras φ y explorador de términos")
         lc1, lc2 = st.columns(2)
-
         with lc1:
             _sec_rule("Dendrograma léxico intra-clase · CAH de términos")
             cah_key = str(cur_c)
@@ -12107,7 +11836,6 @@ with tab_c:
                     )
             else:
                 st.info(f"Sin CAH disponible para Clase {cur_c}.")
-
             st.markdown(
                 '<p class="panel-hdr" style="margin-bottom:8px">Explorador de términos · φ vs frecuencia '
                 '<span style="color:var(--text-low);float:right;font-size:9px">burbuja = frec. en clase</span></p>',
@@ -12118,16 +11846,13 @@ with tab_c:
                 st.plotly_chart(ef, width="stretch", config={"displayModeBar": False})
             else:
                 st.info("Sin datos.")
-
         with lc2:
             st.markdown(
                 '<p class="panel-hdr">Presencias y ausencias significativas</p>',
                 unsafe_allow_html=True,
             )
             st.html(phi_bars_html(cur_c, _dm))
-
         _sec_rule("Buscador de Contexto y KWIC")
-
         iframe_css = f"""
         <style>
         :root {{
@@ -12154,10 +11879,8 @@ with tab_c:
         }}
         </script>
         """
-
         if st.session_state.tab_b_view == "search":
             _sec_rule("Buscador de Contextos y Lectura de Tarjetas")
-
             if not terminos_df.empty:
                 class_stems = terminos_df[
                     (terminos_df["cluster"] == cur_c) & (terminos_df["phi"] > 0)
@@ -12171,35 +11894,29 @@ with tab_c:
                 )
             else:
                 class_lemmas = []
-
             class_expanded_terms = set()
             for lem in class_lemmas:
                 class_expanded_terms.add(lem)
                 class_expanded_terms.update(lemma_map.get(lem, {}).get("stems", []))
                 class_expanded_terms.update(lemma_map.get(lem, {}).get("formas", []))
             class_expanded_terms = list(class_expanded_terms)
-
             uc_lemmas_selected = st.multiselect(
                 "Filtrar por Lemas (expande a raíces y formas exactas):",
                 options=class_lemmas,
                 key=f"uc_lemmas_{cur_c}",
             )
-
             expanded_search_terms = set()
             for lem in uc_lemmas_selected:
                 expanded_search_terms.add(lem)
                 expanded_search_terms.update(lemma_map.get(lem, {}).get("stems", []))
                 expanded_search_terms.update(lemma_map.get(lem, {}).get("formas", []))
-
             uc_search = st.text_input(
                 "Buscar texto libre en contextos:", key=f"uc_search_{cur_c}"
             )
-
             if expanded_search_terms or uc_search:
                 st.html(
                     f'<div style="margin-top:10px;">{unified_kwic_search(uces, list(expanded_search_terms), cur_c, cur_col)}</div>'
                 )
-
             matching_ucs = []
 
             # Group UCEs by their document and section
@@ -12210,22 +11927,18 @@ with tab_c:
             grouped_uces = defaultdict(list)
             for u in uces:
                 grouped_uces[_get_section_key(u.get("id", ""))].append(u)
-
             for sec_key, uc_uces in grouped_uces.items():
                 if not uc_uces or not any(
                     u.get("cluster_id") == cur_c for u in uc_uces
                 ):
                     continue
-
                 uc_full_text = " ".join(u.get("texto", "") for u in uc_uces)
-
                 if uc_search and uc_search.lower() not in uc_full_text.lower():
                     continue
                 if expanded_search_terms and not any(
                     match_term(l, uc_full_text) for l in expanded_search_terms
                 ):
                     continue
-
                 max_phi = max(
                     [
                         uce_phi_dict.get(u["id"], 0.0)
@@ -12234,19 +11947,15 @@ with tab_c:
                     ],
                     default=0.0,
                 )
-
                 _m = _uce_meta(uc_uces[0])
                 doc_id = str(_m.get("origen", uc_uces[0].get("doc_id", "—")))
                 try:
                     sort_val = int("".join(filter(str.isdigit, doc_id)))
                 except ValueError:
                     sort_val = 999999
-
                 # We pass None for the old 'uc' dict since it no longer exists
                 matching_ucs.append((sort_val, doc_id, max_phi, None, uc_uces))
-
             matching_ucs.sort(key=lambda x: x[0])
-
             if not matching_ucs:
                 st.info(f"No hay contextos que coincidan para la Clase {cur_c}.")
             else:
@@ -12289,36 +11998,19 @@ with tab_c:
                     cards_html += "</div></div>"
                 cards_html += "</div>"
                 st.iframe(cards_html, height=400)
-
-                with st.sidebar:
-                    if st.button("🔄 Recargar datos discursivos"):
-                        st.cache_resource.clear()
-                        st.rerun()
-                    for uc_idx, (_, doc_id, _, _, uc_uces) in enumerate(matching_ucs):
-                        for u in uc_uces:
-                            if st.button(
-                                f"JMP_{u['id']}", key=f"btn_{uc_idx}{u['id']}"
-                            ):
-                                st.session_state.tab_b_view = "document"
-                                st.session_state.selected_doc_id = doc_id
-                                st.session_state.target_uce_id = u["id"]
-                                st.session_state.doc_search_query = uc_search
-                                st.session_state.doc_filter_lemmas = list(
-                                    expanded_search_terms
-                                )
-                                st.rerun()
-
+                st.session_state.tab_c_sidebar = {
+                    "matching_ucs": matching_ucs,
+                    "uc_search": uc_search,
+                    "expanded_search_terms": expanded_search_terms,
+                }
         elif st.session_state.tab_b_view == "document":
             # .---------------------------
-
             target_doc = st.session_state.selected_doc_id
             st.session_state.selected_doc_id = doc_id
             _sec_rule(f"Visor de Documento Completo: {target_doc}")
-
             if st.button("← Volver a los resultados de búsqueda", type="primary"):
                 st.session_state.tab_b_view = "search"
                 st.rerun()
-
             uce_to_uc_id = {}
             uc_cluster_map = {}
             for uc in ucs:
@@ -12335,16 +12027,13 @@ with tab_c:
             uc_to_uces = {}
             uc_order = []
             doc_uce_ids = origen_index.get(target_doc, [])
-
             for uid in doc_uce_ids:
                 base_uid = re.sub(r"__mf\d+$", "", uid)
                 group_key = _get_section_key(base_uid)
                 if group_key not in uc_order:
                     uc_order.append(group_key)
                 uc_to_uces.setdefault(group_key, []).append(base_uid)
-
             uce_lookup = {u["id"]: u for u in uces}
-
             # Determine highlight terms
             sq = st.session_state.get("doc_search_query", "")
             fl = st.session_state.get("doc_filter_lemmas", [])
@@ -12371,27 +12060,22 @@ with tab_c:
                 hl_terms_doc = list(hl_terms_doc)
             else:
                 hl_terms_doc = fl
-
             # ------------------------------------------------------------------
             # 2. Left column: Bar chart (Sequence)
             # ------------------------------------------------------------------
             doc_c1, doc_c2 = st.columns([1, 3])
-
             with doc_c1:
                 st.markdown(
                     '<p class="panel-hdr">Secuencia Discursiva</p>',
                     unsafe_allow_html=True,
                 )
-
                 # Build flat list in document order
                 flat_colors = []
                 flat_hover = []
-
                 for idx, uid in enumerate(doc_uce_ids):
                     u = uce_lookup.get(uid, {})
                     cid = u.get("cluster_id")
                     phi = uce_phi_dict.get(uid, 0.0)
-
                     if cid is not None and cid >= 0:
                         flat_colors.append(class_colors.get(cid, T["accent"]))
                         flat_hover.append(
@@ -12403,7 +12087,6 @@ with tab_c:
                         flat_hover.append(
                             f"<b>No clasificado</b><br>UCE {idx + 1}/{len(doc_uce_ids)}"
                         )
-
                 # Plot bar chart: each UCE gets a horizontal bar of height 1
                 fig_traj = go.Figure(
                     go.Bar(
@@ -12416,7 +12099,6 @@ with tab_c:
                         hovertemplate="%{text}<extra></extra>",
                     )
                 )
-
                 fig_traj.update_layout(
                     height=600,
                     bargap=0,
@@ -12441,7 +12123,6 @@ with tab_c:
                     ),
                     **_plot_defaults(),
                 )
-
                 st.plotly_chart(
                     fig_traj, width="content", config={"displayModeBar": False}
                 )
@@ -12453,19 +12134,15 @@ with tab_c:
                     '<p class="panel-hdr">Lectura Continua de UCEs</p>',
                     unsafe_allow_html=True,
                 )
-
                 doc_html = '<div style="height: 600px; overflow-y: auto; padding-right: 10px; padding-bottom: 200px;">'
-
                 # Iterate over UCE IDs in document order (preserved by origen_index)
                 for uid in doc_uce_ids:
                     u = uce_lookup.get(uid, {})
                     if not u:
                         continue
-
                     cid = u.get("cluster_id")
                     phi = uce_phi_dict.get(uid, 0.0)
                     txt = u.get("texto", "")
-
                     # Choose border and text color based on cluster (or neutral for unclassified)
                     if cid is not None and cid >= 0:
                         border_color = class_colors.get(cid, T["border2"])
@@ -12473,7 +12150,6 @@ with tab_c:
                     else:
                         border_color = T["border2"]
                         text_color = T["text_mid"]
-
                     # Apply highlighting if search terms are active
                     if hl_terms_doc or sq:
                         display_text = _render_tab_b_highlight(
@@ -12481,7 +12157,6 @@ with tab_c:
                         )
                     else:
                         display_text = sh(txt)
-
                     doc_html += f"""
                         <div style="margin-bottom: 12px; border-left: 4px solid {border_color}; background: {T["bg_card"]}; border-radius: 4px; padding: 8px 12px;">
                             <div>
@@ -12490,9 +12165,7 @@ with tab_c:
                             </div>
                         </div>
                         """
-
                 doc_html += "</div>"
-
                 # Scroll to target UCE if needed
                 if st.session_state.target_uce_id:
                     doc_html += f'''
@@ -12514,7 +12187,6 @@ with tab_c:
                         </script>
                         '''
                 st.iframe(doc_html, height=620)
-
         _sec_rule("Síntesis discursiva")
         if str(cur_c) in sintesis_por_clase:
             sy = sintesis_por_clase[str(cur_c)]
@@ -12546,10 +12218,8 @@ with tab_c:
             )
         else:
             st.info("Sin síntesis disponible para esta clase.")
-
         _sec_rule("Perfil gramatical · Clase seleccionada")
         render_gram_summary_section(filter_class=cur_c)
-
         _sec_rule("Perfil de modalización · agencia enunciativa")
         mod_fig = make_modalization_radar(cur_c, _dm)
         if mod_fig:
@@ -12561,16 +12231,13 @@ with tab_c:
                 "Alta deóntica = discurso normativo. Alta polifonía = discurso referido.</div>",
                 unsafe_allow_html=True,
             )
-
         _sec_rule("Análisis isotópico")
         if "iso_view" not in st.session_state:
             st.session_state.iso_view = "hyp"
         if "iso_idx" not in st.session_state:
             st.session_state.iso_idx = 0
-
         cur_iso_cd = next((d for d in iso_classes if d["id"] == cur_c), None)
         n_isos = len(cur_iso_cd.get("iso", [])) if cur_iso_cd else 0
-
         sub_nav = (
             [("hyp", "Hipótesis")]
             + [(f"iso_{i}", f"Isotopía {i + 1}") for i in range(n_isos)]
@@ -12583,7 +12250,6 @@ with tab_c:
                 ("global", "Oposiciones AFC"),
             ]
         )
-
         if sub_nav:
             sn_cols = st.columns(len(sub_nav), gap="small")
             for i, (vk, vl) in enumerate(sub_nav):
@@ -12600,9 +12266,7 @@ with tab_c:
                         if vk.startswith("iso_"):
                             st.session_state.iso_idx = int(vk.split("_")[1])
                         st.rerun()
-
         iso_view = st.session_state.iso_view
-
         if iso_view == "global":
             gd = global_data
             oc1, oc2 = st.columns(2, gap="medium")
@@ -12626,13 +12290,11 @@ with tab_c:
             if gd.get("hyp"):
                 _sec_label("Hipótesis global", top=True)
                 _hyp_block(gd["hyp"], "#7C6BF8")
-
         elif cur_iso_cd is None:
             st.info("Datos isotópicos no disponibles para esta clase.")
         else:
             _imap = _build_imap(cur_iso_cd)
             _c_id = cur_iso_cd["id"]
-
             if iso_view == "hyp":
                 hyp = cur_iso_cd.get("hyp", "")
                 if hyp:
@@ -12657,7 +12319,6 @@ with tab_c:
                         f'<div style="padding:2px 0 10px">{_chips(cur_iso_cd["abs_terms"], cur_col, neg=True)}</div>',
                         unsafe_allow_html=True,
                     )
-
             elif iso_view.startswith("iso_"):
                 idx = st.session_state.iso_idx
                 isos = cur_iso_cd.get("iso", [])
@@ -12680,7 +12341,6 @@ with tab_c:
                         unified_kwic_search(uces, iso.get("terms", []), cur_c, cur_col),
                         unsafe_allow_html=True,
                     )
-
             elif iso_view == "abs":
                 at = cur_iso_cd.get("abs_terms", [])
                 ad = cur_iso_cd.get("abs_desc", "")
@@ -12695,7 +12355,6 @@ with tab_c:
                     )
                 else:
                     st.info("Sin términos negativos.")
-
             elif iso_view == "met":
                 mets = cur_iso_cd.get("met", [])
                 if not mets:
@@ -12721,7 +12380,6 @@ with tab_c:
                                 ),
                                 unsafe_allow_html=True,
                             )
-
             elif iso_view == "anc":
                 obj = cur_iso_cd.get("obj", {})
                 anc = cur_iso_cd.get("anc", {})
@@ -12733,7 +12391,10 @@ with tab_c:
                         obj,
                         [
                             ("Núcleo figurativo", "nucleo_figurativo"),
-                            ("Términos de naturalización", "terminos_naturalizacion"),
+                            (
+                                "Términos de naturalización",
+                                "terminos_naturalizacion",
+                            ),
                         ],
                     ),
                     (
@@ -12769,7 +12430,6 @@ with tab_c:
                                         unsafe_allow_html=True,
                                     )
                         st.markdown("</div></div>", unsafe_allow_html=True)
-
             elif iso_view == "lbl":
                 lbls = cur_iso_cd.get("lbls", [])
                 lkey = f"tb_lbl_{_c_id}"
@@ -12818,7 +12478,6 @@ with tab_c:
                     st.success(
                         f"✓ Etiqueta registrada: **{st.session_state[f'tb_lcustom_{_c_id}']}**"
                     )
-
             elif iso_view == "val":
                 tens = cur_iso_cd.get("tensions", [])
                 lims = cur_iso_cd.get("limits", [])
@@ -12878,10 +12537,8 @@ with tab_c:
                             st.rerun()
 
 
-# ══════════════════════════════════════════════════════════════
-# PESTAÑA D
-# ══════════════════════════════════════════════════════════════
-with tab_d:
+@st.fragment
+def _render_tab_d():
     # Primera fila: árbol de persistencia y scree plot
     ec1, ec2 = st.columns(2)
     with ec1:
@@ -13156,7 +12813,9 @@ with tab_d:
             unsafe_allow_html=True,
         )
         filt = st.text_input(
-            "Filtrar por texto:", placeholder="ej: educación, familia…", key="tc_rfilt"
+            "Filtrar por texto:",
+            placeholder="ej: educación, familia…",
+            key="tc_rfilt",
         )
         filt_res = (
             [u for u in residual_uces if filt.lower() in u.get("texto", "").lower()]
@@ -13180,10 +12839,453 @@ with tab_d:
         else:
             st.info("Sin UCEs residuales que coincidan.")
 
-# ─────────────────────────────────────────────────────────────
-# PESTAÑA E
-# ─────────────────────────────────────────────────────────────
-with tab_e:
+
+@st.fragment
+def _render_tab_b():
+    st.markdown(
+        '<div style="padding:16px 28px 4px;font-family:var(--font-mono);font-size:9px;'
+        'letter-spacing:.12em;color:var(--text-low);text-transform:uppercase">Clases activas:</div>',
+        unsafe_allow_html=True,
+    )
+    cls_cols = st.columns(len(class_list))
+    for i, c in enumerate(class_list):
+        with cls_cols[i]:
+            sel = c in st.session_state.selected_classes
+            if st.button(
+                f"Clase {c}",
+                key=f"ta_cls_{c}",
+                width="stretch",
+                type="primary" if sel else "secondary",
+            ):
+                new_list = list(st.session_state.selected_classes)
+                if sel:
+                    new_list.remove(c)
+                else:
+                    new_list.append(c)
+                if not new_list:
+                    new_list = class_list.copy()
+                st.session_state.selected_classes = new_list
+                st.rerun()
+
+    _sec_rule("Estructura · Persistencia y distribución")
+    col_l, col_r = st.columns(2)
+    with col_l:
+        cl1, cl2 = st.columns(2)
+        with cl1:
+            st.markdown('<div style="padding:0 0 4px">', unsafe_allow_html=True)
+            st.markdown(
+                '<p class="panel-hdr">Distribución por clase</p>',
+                unsafe_allow_html=True,
+            )
+            dn = make_donut(tuple(selected_classes), _dm)
+            if dn:
+                st.plotly_chart(dn, width="stretch", config={"displayModeBar": False})
+            st.markdown("</div>", unsafe_allow_html=True)
+        with cl2:
+            st.markdown(
+                '<p class="panel-hdr">Palabras analizadas</p>',
+                unsafe_allow_html=True,
+            )
+            wb = make_word_bars(tuple(selected_classes), _dm)
+            if wb:
+                st.plotly_chart(wb, width="stretch", config={"displayModeBar": False})
+        for c in sorted(selected_classes):
+            pct = class_sizes[c] / classified_uces * 100 if classified_uces else 0
+            col = class_colors.get(c, "#AAA")
+            st.markdown(
+                f"""
+            <div style="display:grid;grid-template-columns:60px 1fr 36px 60px;align-items:center;
+                        gap:8px;padding:5px 0;border-bottom:1px solid var(--border)">
+              <span style="font-family:var(--font-mono);font-size:11px;color:{col};font-weight:500">Clase {c}</span>
+              <div style="height:4px;background:var(--bg-hover);border-radius:2px;overflow:hidden">
+                <div style="height:100%;width:{pct:.0f}%;background:{col};border-radius:2px"></div>
+              </div>
+              <span style="font-family:var(--font-mono);font-size:10px;color:{col}">{pct:.0f}%</span>
+              <span style="font-family:var(--font-mono);font-size:10px;color:var(--text-low)">{class_sizes[c]} UCE</span>
+            </div>""",
+                unsafe_allow_html=True,
+            )
+
+    with col_r:
+        _sec_rule("AFC · Analyse Factorielle des Correspondances")
+        _afc_c1, _afc_c2 = st.columns([2, 2])
+        with _afc_c1:
+            afc_view = st.radio(
+                "Vista AFC:",
+                options=["coordonnees", "correlations", "contributions"],
+                format_func=lambda x: {
+                    "coordonnees": "📐 En coordonnées",
+                    "correlations": "⭕ En corrélations",
+                    "contributions": "📊 En contributions",
+                }[x],
+                key="afc_view_mode",
+                horizontal=True,
+            )
+        with _afc_c2:
+            show_uc_proj = st.checkbox(
+                "Proyectar UCs individuales", False, key="afc_show_ucs"
+            )
+            show_doc_proj = st.checkbox(
+                "Proyectar documentos", False, key="afc_show_documents"
+            )
+        afc_fig = make_afc_biplot(
+            tuple(selected_classes),
+            view_mode=afc_view,
+            _dm_key=_dm,
+            show_ucs=show_uc_proj,
+            show_documents=show_doc_proj,
+        )
+        if afc_fig:
+            st.plotly_chart(afc_fig, width="stretch", config={"displayModeBar": True})
+        else:
+            st.info("Sin datos AFC. Asegúrate de use_projection=True en el pipeline.")
+        _AFC_HELP = {
+            "coordonnees": "Distancias χ² reales. Puntos alejados del origen = mayor especificidad.",
+            "correlations": "Proyección sobre el círculo unitario. Puntos en el borde = bien representados.",
+            "contributions": "Peso de cada término en la formación de los ejes factoriales.",
+        }
+        st.markdown(
+            f'<div style="font-family:var(--font-serif);font-size:12px;font-style:italic;'
+            f'color:var(--text-low);padding:4px 0 16px;line-height:1.6">'
+            f"{_AFC_HELP.get(afc_view, '')}</div>",
+            unsafe_allow_html=True,
+        )
+
+    bn = st.slider("Términos", 10, 60, 28, 2, key="ta_bn")
+    st.markdown(
+        '<div style="font-family:var(--font-mono);font-size:9px;color:var(--text-dim);padding:8px 0 0">'
+        "Ordenados por spread máx−mín entre clases. Arriba = mayor polarización.</div>",
+        unsafe_allow_html=True,
+    )
+    bs = st.checkbox("Solo significativos", True, key="ta_bs")
+
+    bc1, bc3 = st.columns([1, 1])
+    with bc1:
+        _sec_rule("Butterfly Chart · φ por término y clase")
+        bff = make_butterfly_chart(tuple(selected_classes), bn, bs, _dm_key=_dm)
+        if bff:
+            st.plotly_chart(bff, width="stretch", config={"displayModeBar": False})
+        else:
+            st.info("Sin datos para el butterfly chart.")
+
+    with bc3:
+        _sec_rule("Graphe des spécificités · φ × CAH")
+        gs_fig = make_graphe_specificites(tuple(selected_classes), bn, _dm)
+        if gs_fig:
+            st.plotly_chart(gs_fig, width="stretch", config={"displayModeBar": False})
+        else:
+            st.info("Sin datos para el graphe des spécificités.")
+
+    cc1, cc2 = st.columns([1, 1])
+    with cc1:
+        _sec_rule("Estabilidad léxica · robustez de los hallazgos")
+        stab_fig = make_stability_map(tuple(sorted(class_sizes.keys())), _dm)
+        if stab_fig:
+            st.plotly_chart(stab_fig, width="stretch", config={"displayModeBar": False})
+            st.markdown(
+                '<div style="font-family:var(--font-serif);font-size:12px;font-style:italic;'
+                'color:var(--text-low);padding:4px 0 16px;line-height:1.6">'
+                "Arriba-derecha = hallazgos robustos (alto φ, alta estabilidad bootstrap). "
+                "Abajo-derecha = hallazgos frágiles: interpretar con cautela. "
+                "Tamaño = frecuencia global.</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.info(
+                "Sin datos de estabilidad. Activa use_term_stability=True en el pipeline."
+            )
+
+    with cc2:
+        _sec_rule("Tensiones lexicales · campo de batalla semántico")
+        tl_fig = make_tensions_lexicales(tuple(selected_classes), _dm)
+        if tl_fig:
+            st.plotly_chart(tl_fig, width="stretch", config={"displayModeBar": False})
+
+    _sec_rule("Comparación inter‑clases · Buscador de corpus")
+
+    _lemma_options = sorted(
+        lemma_map.keys(), key=lambda x: lemma_map[x]["total_freq"], reverse=True
+    )
+    _def_lemmas = _lemma_options[:6] if len(_lemma_options) >= 6 else _lemma_options
+
+    st.markdown(
+        '<div style="padding:4px 0 2px;font-family:var(--font-mono);font-size:9px;'
+        'letter-spacing:.1em;color:var(--text-low);text-transform:uppercase">'
+        "Lemas a explorar · el sistema resuelve raíces y formas exactas automáticamente</div>",
+        unsafe_allow_html=True,
+    )
+
+    chosen_lemmas = st.multiselect(
+        "Lemas:",
+        options=_lemma_options,
+        default=_def_lemmas,
+        key="cross_lemmas",
+        label_visibility="collapsed",
+    )
+    resolved_terms, _stem_label_map = resolve_stems_to_terms(chosen_lemmas)
+
+    if chosen_lemmas:
+        expanded_terms = set()
+        for lem in chosen_lemmas:
+            expanded_terms.add(lem)
+            expanded_terms.update(lemma_map.get(lem, {}).get("stems", []))
+            expanded_terms.update(lemma_map.get(lem, {}).get("formas", []))
+        chips_html = "".join(
+            f'<span style="padding:1px 8px;border-radius:10px;background:var(--bg-card);'
+            f"color:var(--text-mid);font-family:var(--font-mono);font-size:9px;"
+            f'margin:2px 3px;border:.5px solid var(--border2)">{sh(t)}</span>'
+            for t in chosen_lemmas
+        )
+        st.markdown(
+            f'<div style="padding:3px 0 8px;font-family:var(--font-mono);font-size:9px;'
+            f'color:var(--text-low)">Lemas seleccionados ({len(chosen_lemmas)}): {chips_html}<br>'
+            f"Expandido a {len(expanded_terms)} raíces y formas para el motor de búsqueda.</div>",
+            unsafe_allow_html=True,
+        )
+
+    if len(selected_classes) >= 2:
+        cr, cb = st.columns(2)
+        with cr:
+            st.markdown(
+                '<p class="panel-hdr">Radar Σφ por clase</p>',
+                unsafe_allow_html=True,
+            )
+            if len(chosen_lemmas) >= 3:
+                rf = make_cross_class_radar_lemmas(
+                    tuple(chosen_lemmas), tuple(selected_classes), _dm
+                )
+                if rf:
+                    st.plotly_chart(
+                        rf, width="stretch", config={"displayModeBar": False}
+                    )
+            else:
+                st.markdown(
+                    '<div style="padding:16px;font-family:var(--font-mono);font-size:10px;'
+                    'color:var(--text-low)">Necesitas al menos 3 lemas resueltos para el radar.</div>',
+                    unsafe_allow_html=True,
+                )
+        with cb:
+            sf = make_term_freq_bar_lemmas(
+                tuple(chosen_lemmas), tuple(selected_classes), _dm
+            )
+            if sf:
+                st.markdown(
+                    f'<p class="panel-hdr">Σφ acumulado por clase</p>',
+                    unsafe_allow_html=True,
+                )
+                st.plotly_chart(sf, width="stretch", config={"displayModeBar": False})
+
+    cr1, cb1 = st.columns(2)
+    with cr1:
+        st.markdown(
+            '<p class="panel-hdr">Formas exactas por lema · sunburst</p>',
+            unsafe_allow_html=True,
+        )
+        if chosen_lemmas:
+            sun = make_lemma_sunburst(
+                tuple(chosen_lemmas),
+                json.dumps(data.get("forma_index", {})),
+                tuple(selected_classes),
+            )
+            if sun:
+                st.plotly_chart(sun, width="stretch", config={"displayModeBar": False})
+            else:
+                st.markdown(
+                    '<div style="padding:12px;font-family:var(--font-mono);font-size:10px;'
+                    'color:var(--text-low)">Sin variantes para los lemas seleccionados.</div>',
+                    unsafe_allow_html=True,
+                )
+
+    with cb1:
+        st.markdown(
+            '<p class="panel-hdr">Red de co‑ocurrencia · lemas resueltos</p>',
+            unsafe_allow_html=True,
+        )
+        min_deg = st.slider(
+            "Grado mínimo:",
+            min_value=1,
+            max_value=20,
+            value=1,
+            key="net_min_degree",
+        )
+        if chosen_lemmas:
+            net_fig, net_G = build_lemma_network_cached(
+                tuple(chosen_lemmas), 2, 50, min_deg
+            )
+            if net_fig:
+                if net_G:
+                    actual_max = max((d for _, d in net_G.degree()), default=0)
+                    st.markdown(
+                        f'<div style="font-family:var(--font-mono);font-size:9px;color:var(--text-low);'
+                        f'margin:-8px 0 6px">{net_G.number_of_nodes()} nodos · '
+                        f"{net_G.number_of_edges()} aristas · grado máx. {actual_max}</div>",
+                        unsafe_allow_html=True,
+                    )
+                st.plotly_chart(
+                    net_fig, width="stretch", config={"displayModeBar": False}
+                )
+            else:
+                st.info(
+                    "Sin red para los lemas resueltos con el grado mínimo seleccionado."
+                )
+        else:
+            st.info("Selecciona lemas para construir la red.")
+
+    _sec_rule("Perfil gramatical · Clase seleccionada")
+    render_gram_summary_section(filter_class=None)
+
+    _sec_rule("Buscador de corpus")
+    sc1, sc2, sc3 = st.columns([2, 1, 1])
+    with sc1:
+        cls_opts = ["Todas las clases"] + [
+            f"Clase {c}" for c in sorted(selected_classes)
+        ]
+        fcls = st.selectbox(
+            "Clase:", cls_opts, key="ta_fcls", label_visibility="collapsed"
+        )
+    with sc2:
+        logic = st.radio(
+            "Lógica:",
+            ["OR", "AND"],
+            horizontal=True,
+            key="ta_logic",
+            help="OR: al menos un término · AND: todos los términos",
+        )
+    with sc3:
+        show_all = st.checkbox("Mostrar todas", False, key="ta_showall")
+
+    tcls = None if fcls == "Todas las clases" else int(fcls.split()[-1])
+    sr = corpus_search(chosen_lemmas, tcls, logic)
+    tcm = build_term_color_map(chosen_lemmas, selected_classes) if chosen_lemmas else {}
+    ndsp = len(sr) if show_all else min(20, len(sr))
+    mc_counts = Counter(r["match_count"] for r in sr) if chosen_lemmas and sr else {}
+    breakdown_html = (
+        "".join(
+            f'<span style="padding:1px 8px;border-radius:10px;background:var(--bg-card);'
+            f'color:var(--text-mid);font-family:var(--font-mono);font-size:9px;margin-left:6px">'
+            f"{mc_counts[mc]} UCEs · {mc}/{len(chosen_lemmas)} términos</span>"
+            for mc in sorted(mc_counts, reverse=True)
+        )
+        if mc_counts
+        else ""
+    )
+    lc = "#5BA8DC" if logic == "OR" else "#E8A838"
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:8px;padding:6px 0 8px;'
+        f'font-family:var(--font-mono);font-size:9px">'
+        f'<span style="color:var(--text-low)">{len(sr)} UCEs encontradas</span>'
+        f'<span style="padding:1px 8px;border-radius:10px;background:{lc}22;'
+        f'color:{lc};border:.5px solid {lc}55">{logic}</span>'
+        f"{breakdown_html}"
+        f'<span style="color:var(--text-dim);margin-left:auto">mostrando {ndsp}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    scroll_html = '<div class="corpus-scroll">'
+    if not sr:
+        scroll_html += (
+            '<div style="padding:20px 0;font-family:var(--font-mono);'
+            'font-size:10px;color:var(--text-dim)">Sin UCEs que coincidan.</div>'
+        )
+    else:
+        for res in sr[:ndsp]:
+            uce = res["uce"]
+            c = uce.get("cluster_id")
+            cc = (
+                class_colors.get(c, T["text_low"])
+                if c is not None and c >= 0
+                else T["text_low"]
+            )
+            phi_coefs = uce.get("phi_coefficients", {}) or {}
+            phi_html = ""
+            if phi_coefs:
+                top_phi = sorted(phi_coefs.items(), key=lambda x: x[1], reverse=True)[
+                    :5
+                ]
+                phi_html = (
+                    '<div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:6px">'
+                    + "".join(
+                        f'<span style="padding:1px 7px;border-radius:10px;font-family:var(--font-mono);'
+                        f'font-size:9px;background:{cc}18;color:{cc};border:.5px solid {cc}44">'
+                        f"{sh(t)} {v:+.2f}</span>"
+                        for t, v in top_phi
+                    )
+                    + "</div>"
+                )
+            phi = res["phi"]
+            mc = res["match_count"]
+            matched = res["matched_terms"]
+            texto_html = (
+                render_highlighted_text(uce.get("texto", ""), res["positions"], tcm)
+                if res["positions"]
+                else sh(uce.get("texto", ""))
+            )
+            ctag = f"Clase {c}" if c is not None and c >= 0 else "no clasificada"
+            if mc == 0:
+                bbg, bfg, btxt = (
+                    "var(--bg-card)",
+                    T["text_low"],
+                    "sin coincidencias",
+                )
+            elif chosen_lemmas and mc == len(chosen_lemmas):
+                bbg, bfg, btxt = (
+                    "#0F2A18",
+                    "#5DC88A",
+                    f"✓ {mc}/{len(chosen_lemmas)}",
+                )
+            else:
+                bbg, bfg, btxt = (
+                    "var(--bg-card)",
+                    "#E8A838",
+                    f"{mc}/{len(chosen_lemmas)}" if chosen_lemmas else "",
+                )
+            badge = (
+                f'<span class="match-badge" style="background:{bbg};color:{bfg};border:.5px solid {bfg}55">{btxt}</span>'
+                if btxt
+                else ""
+            )
+            chips = "".join(
+                f'<span style="padding:0 6px;border-radius:8px;font-size:9px;'
+                f"background:{tcm.get(mt, T['text_mid'])}22;color:{tcm.get(mt, T['text_mid'])};"
+                f'border:.5px solid {tcm.get(mt, T["text_mid"])}44;font-family:var(--font-mono)">{sh(mt)}</span> '
+                for mt in matched
+            )
+            doc_id = uce.get("doc_id", "—")
+            # AUG #1: use doc_meta_map for metadata display
+            meta_dict = _uce_meta(uce)
+            if meta_dict:
+                meta_items = [
+                    f"<span style='color:var(--text-dim)'>{k}:</span> <span style='color:var(--text-mid)'>{v}</span>"
+                    for k, v in meta_dict.items()
+                ]
+                meta_str = (
+                    "<span style='color:var(--border2); margin:0 8px;'> </span>".join(
+                        meta_items
+                    )
+                )
+            else:
+                meta_str = "<span style='color:var(--text-dim)'>Sin metadatos</span>"
+            scroll_html += f"""
+            <div class="uce-card" style="border-left:3px solid {cc}; padding:14px; display:flex; flex-direction:column; gap:12px;">
+              <div>
+                <div class="uce-meta" style="margin-bottom:10px;">
+                  <span style="font-family:var(--font-mono); font-size:11px; font-weight:600; color:var(--text-hi);">{sh(uce.get("id", "?")[:12])}</span>
+                  <span style="color:{cc}">{ctag} · φ={phi:.2f}</span>
+                  {badge}<span style="margin-left:4px">{chips}</span>
+                </div>
+                <div class="uce-text">{texto_html}</div>{phi_html}              </div>
+              <div style="background:var(--bg-panel); border:1px solid var(--border2); border-radius:var(--r-sm); padding:6px 12px; font-family:var(--font-mono); font-size:10px; display:flex; align-items:center; flex-wrap:wrap;">
+                <span style="color:var(--text-hi); font-weight:600; margin-right:8px;">Doc: {sh(doc_id)}</span>
+                <span style="color:var(--border2); margin-right:8px;"> </span>
+                <span>{meta_str}</span>
+              </div>
+            </div>"""
+    scroll_html += "</div>"
+    st.html(scroll_html)
+
+
+@st.fragment(run_every=2)
+def _render_tab_e():
     # ════════════════════════════════════════════════════════════════════════
     # CONTROL: ejecutar / volver a ejecutar el análisis de discurso
     # ════════════════════════════════════════════════════════════════════════
@@ -13210,7 +13312,7 @@ with tab_e:
                 st.code("\n".join(ds_log[-300:]))
             if not ds_state.get("refreshed", False):
                 ds_state["refreshed"] = True
-                load_discourse_state.clear()
+                _load_discourse.clear()
                 st.rerun()
         else:
             st.error(
@@ -13229,7 +13331,7 @@ with tab_e:
             ds_state["running"] = False
             st.rerun()
 
-    if not ds_state["finished"]:
+    else:
         # ── BEFORE VIEW ─────────────────────────────────────────────
         st.subheader("🚀 Workflows de análisis")
 
@@ -13328,105 +13430,7 @@ with tab_e:
                 else:
                     st.caption("Iniciando…")
 
-        # ── Polling: mientras el análisis corre, re-renderiza cada 2s
-        if ds_state["running"]:
-            time.sleep(2)
-            st.rerun()
-
-        # ── CRUD: editor de configuración de agentes IA ──
-        st.divider()
-        st.subheader("⚙️ Configuración de agentes IA")
-
-        gram = load_grammar_config()
-        with st.expander("📝 Resumidor gramatical (ia/0.json)", expanded=False):
-            st.text_input("Nombre", value=gram.get("name", ""), key="ia_gram_name")
-            st.text_input("Rol", value=gram.get("role", ""), key="ia_gram_role")
-            st.text_area(
-                "Instrucciones",
-                value=gram.get("instructions", ""),
-                key="ia_gram_instructions",
-                height=120,
-            )
-            st.text_area(
-                "json_schema (JSON)",
-                value=to_json_text(gram.get("json_schema", {})),
-                key="ia_gram_json_schema",
-                height=120,
-            )
-            st.text_area(
-                "few_shot_examples (JSON)",
-                value=to_json_text(gram.get("few_shot_examples", [])),
-                key="ia_gram_few_shot",
-                height=120,
-            )
-            if st.button("💾 Guardar resumidor", key="ia_gram_save", width="stretch"):
-                _save_grammar_from_widgets()
-
-        st.subheader("🤖 Agentes de discurso (ia/1.json)")
-        disc = load_discourse_config()
-        for _name in list(disc.keys()):
-            _agent = disc[_name]
-            _k = _sanitize_key(_name)
-            with st.expander(f"🤖 {_name}", expanded=False):
-                st.text_input(
-                    "Nombre", value=_agent.get("name", _name), key=f"ia_ag_{_k}_name"
-                )
-                st.text_input(
-                    "Rol", value=_agent.get("role", ""), key=f"ia_ag_{_k}_role"
-                )
-                st.text_area(
-                    "Instrucciones",
-                    value=_agent.get("instructions", ""),
-                    key=f"ia_ag_{_k}_instructions",
-                    height=120,
-                )
-                st.text_area(
-                    "json_schema (JSON)",
-                    value=to_json_text(_agent.get("json_schema", {})),
-                    key=f"ia_ag_{_k}_json_schema",
-                    height=120,
-                )
-                st.text_area(
-                    "few_shot_examples (JSON)",
-                    value=to_json_text(_agent.get("few_shot_examples", [])),
-                    key=f"ia_ag_{_k}_few_shot",
-                    height=120,
-                )
-                st.text_input(
-                    "Categorías gramaticales (separadas por coma)",
-                    value=to_list_text(_agent.get("gram_cats", [])),
-                    key=f"ia_ag_{_k}_gram_cats",
-                )
-                st.text_input(
-                    "Categorías discursivas (separadas por coma)",
-                    value=to_list_text(_agent.get("disc_cats", [])),
-                    key=f"ia_ag_{_k}_disc_cats",
-                )
-                _c1, _c2 = st.columns(2)
-                with _c1:
-                    if st.button("💾 Guardar", key=f"ia_ag_{_k}_save", width="stretch"):
-                        _save_agent_from_widgets(_name)
-                with _c2:
-                    if st.button("🗑️ Eliminar", key=f"ia_ag_{_k}_del", width="stretch"):
-                        _delete_agent(_name)
-
-        st.subheader("➕ Nuevo agente")
-        st.text_input("Nombre del nuevo agente", key="ia_new_agent_name")
-        if st.button("Crear agente", key="ia_new_agent_create", width="stretch"):
-            _create_agent()
-
-        _inactive = list_inactive_agent_files()
-        if _inactive:
-            with st.expander("ℹ️ Workflows no editables aquí", expanded=False):
-                st.caption(
-                    "Estos archivos existen en `ia/` y SÍ son workflows ejecutables "
-                    "desde arriba, pero este editor solo edita `0.json` (resumidor "
-                    "gramatical) y `1.json` (agentes de discurso)."
-                )
-                st.code(", ".join(_inactive))
-
-        # ── Stop BEFORE view; results block below only renders in AFTER view
-        st.stop()
+        return
 
     import hashlib as _hlib
     from collections import defaultdict as _ddict
@@ -13528,9 +13532,9 @@ with tab_e:
     # ════════════════════════════════════════════════════════════════════════
 
     @st.cache_data(show_spinner=False)
-    def _e_prepare(ann_json: str, uces_json: str):
-        ann_raw = json.loads(ann_json)
-        uces_raw = json.loads(uces_json)
+    def _e_prepare(_version: str, _disc_version: str):
+        ann_raw = _load_discourse(_disc_version).get("annotations_by_uce", {})
+        uces_raw = _load_snapshot(_version).get("uces", [])
 
         ulookup = {}
         for u in uces_raw:
@@ -13601,25 +13605,9 @@ with tab_e:
         }
         return df, cat_fields, txt_fields, vidx
 
-    # ── serialise once ───────────────────────────────────────────────────────
-    _e_disc = load_discourse_state()
-    _e_ann_raw = _e_disc.get("annotations_by_uce", {})
-    _e_ann_json = json.dumps(_e_ann_raw, ensure_ascii=False, default=str)
-    _e_uces_json = json.dumps(
-        [
-            {
-                k: v
-                for k, v in u.items()
-                if k
-                not in ("span", "_coref_chains_full", "_predicate_frames_serialized")
-            }
-            for u in uces
-        ],
-        ensure_ascii=False,
-        default=str,
+    _df_all, _cat_fields, _txt_fields, _verb_idx = _e_prepare(
+        _version, _discourse_version()
     )
-
-    _df_all, _cat_fields, _txt_fields, _verb_idx = _e_prepare(_e_ann_json, _e_uces_json)
 
     if _df_all.empty:
         st.info("No hay anotaciones discursivas en este corpus.")
@@ -13954,7 +13942,9 @@ with tab_e:
                             tickfont=dict(size=9),
                         ),
                         yaxis=dict(
-                            gridcolor=_E_BORD, linecolor=_E_BORD, tickfont=dict(size=9)
+                            gridcolor=_E_BORD,
+                            linecolor=_E_BORD,
+                            tickfont=dict(size=9),
                         ),
                         margin=dict(t=10, b=16, l=4, r=4),
                     )
@@ -14359,6 +14349,141 @@ with tab_e:
                     pass
 
             st.caption(f"Presencia de rasgo. {_N_BINS} divisiones. Clic → ir al texto.")
+
+
+@st.fragment
+def _render_tab_e_crud():
+    # ── CRUD: editor de configuración de agentes IA ──
+    st.divider()
+    st.subheader("⚙️ Configuración de agentes IA")
+
+    gram = load_grammar_config()
+    with st.expander("📝 Resumidor gramatical (ia/0.json)", expanded=False):
+        st.text_input("Nombre", value=gram.get("name", ""), key="ia_gram_name")
+        st.text_input("Rol", value=gram.get("role", ""), key="ia_gram_role")
+        st.text_area(
+            "Instrucciones",
+            value=gram.get("instructions", ""),
+            key="ia_gram_instructions",
+            height=120,
+        )
+        st.text_area(
+            "json_schema (JSON)",
+            value=to_json_text(gram.get("json_schema", {})),
+            key="ia_gram_json_schema",
+            height=120,
+        )
+        st.text_area(
+            "few_shot_examples (JSON)",
+            value=to_json_text(gram.get("few_shot_examples", [])),
+            key="ia_gram_few_shot",
+            height=120,
+        )
+        if st.button("💾 Guardar resumidor", key="ia_gram_save", width="stretch"):
+            _save_grammar_from_widgets()
+
+    st.subheader("🤖 Agentes de discurso (ia/1.json)")
+    disc = load_discourse_config()
+    for _name in list(disc.keys()):
+        _agent = disc[_name]
+        _k = _sanitize_key(_name)
+        with st.expander(f"🤖 {_name}", expanded=False):
+            st.text_input(
+                "Nombre",
+                value=_agent.get("name", _name),
+                key=f"ia_ag_{_k}_name",
+            )
+            st.text_input("Rol", value=_agent.get("role", ""), key=f"ia_ag_{_k}_role")
+            st.text_area(
+                "Instrucciones",
+                value=_agent.get("instructions", ""),
+                key=f"ia_ag_{_k}_instructions",
+                height=120,
+            )
+            st.text_area(
+                "json_schema (JSON)",
+                value=to_json_text(_agent.get("json_schema", {})),
+                key=f"ia_ag_{_k}_json_schema",
+                height=120,
+            )
+            st.text_area(
+                "few_shot_examples (JSON)",
+                value=to_json_text(_agent.get("few_shot_examples", [])),
+                key=f"ia_ag_{_k}_few_shot",
+                height=120,
+            )
+            st.text_input(
+                "Categorías gramaticales (separadas por coma)",
+                value=to_list_text(_agent.get("gram_cats", [])),
+                key=f"ia_ag_{_k}_gram_cats",
+            )
+            st.text_input(
+                "Categorías discursivas (separadas por coma)",
+                value=to_list_text(_agent.get("disc_cats", [])),
+                key=f"ia_ag_{_k}_disc_cats",
+            )
+            _c1, _c2 = st.columns(2)
+            with _c1:
+                if st.button("💾 Guardar", key=f"ia_ag_{_k}_save", width="stretch"):
+                    _save_agent_from_widgets(_name)
+            with _c2:
+                if st.button("🗑️ Eliminar", key=f"ia_ag_{_k}_del", width="stretch"):
+                    _delete_agent(_name)
+
+    st.subheader("➕ Nuevo agente")
+    st.text_input("Nombre del nuevo agente", key="ia_new_agent_name")
+    if st.button("Crear agente", key="ia_new_agent_create", width="stretch"):
+        _create_agent()
+
+    _inactive = list_inactive_agent_files()
+    if _inactive:
+        with st.expander("ℹ️ Workflows no editables aquí", expanded=False):
+            st.caption(
+                "Estos archivos existen en `ia/` y SÍ son workflows ejecutables "
+                "desde arriba, pero este editor solo edita `0.json` (resumidor "
+                "gramatical) y `1.json` (agentes de discurso)."
+            )
+            st.code(", ".join(_inactive))
+
+
+if tab_a.open:
+    with tab_a:
+        _render_tab_a()
+elif tab_b.open:
+    with tab_b:
+        _render_tab_b()
+
+    # ══════════════════════════════════════════════════════════════
+    # PESTAÑA C
+    # ══════════════════════════════════════════════════════════════
+elif tab_c.open:
+    with tab_c:
+        _render_tab_c()
+    # ══════════════════════════════════════════════════════════════
+    # PESTAÑA D
+    # ══════════════════════════════════════════════════════════════
+elif tab_d.open:
+    with tab_d:
+        _render_tab_d()
+    # ─────────────────────────────────────────────────────────────
+    # PESTAÑA E
+    # ─────────────────────────────────────────────────────────────
+
+
+elif tab_e.open:
+    with tab_e:
+        _render_tab_e()
+        _ds = st.session_state.get("discourse_state", {})
+        if not _ds.get("finished") and not _ds.get("running"):
+            _render_tab_e_crud()
+
+# ── Sidebar: botones de salto (JMP) desde la búsqueda de contextos (tab C) ──
+with st.sidebar:
+    _sb = st.session_state.get("tab_c_sidebar")
+    if _sb and tab_c.open and st.session_state.get("tab_b_view") == "search":
+        _render_sidebar_jump_buttons(
+            _sb["matching_ucs"], _sb["uc_search"], _sb["expanded_search_terms"]
+        )
 
 st.markdown(
     f"""

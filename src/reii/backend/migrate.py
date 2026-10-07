@@ -17,10 +17,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+
+import psycopg
 
 from reii.backend.sql.db import connect, transaction
 
@@ -74,7 +75,7 @@ def _flatten_texto_completo(uce: Dict) -> Optional[str]:
 # Migradores por tabla
 # ════════════════════════════════════════════════════════════════════════════
 def migrate_documents(
-    conn: sqlite3.Connection, data: Dict, dry_run: bool = False
+    conn: psycopg.Connection, data: Dict, dry_run: bool = False
 ) -> int:
     """
     Extrae documentos únicos de:
@@ -116,10 +117,14 @@ def migrate_documents(
         for did, payload in all_ids.items():
             conn.execute(
                 """
-                INSERT OR REPLACE INTO documents
+                INSERT INTO documents
                   (doc_id, doc_idx, orden, origen, metadata_json,
                    texto_completo, n_uces)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (doc_id) DO UPDATE SET
+                  doc_idx = EXCLUDED.doc_idx, orden = EXCLUDED.orden,
+                  origen = EXCLUDED.origen, metadata_json = EXCLUDED.metadata_json,
+                  texto_completo = EXCLUDED.texto_completo, n_uces = EXCLUDED.n_uces
                 """,
                 (
                     did,
@@ -135,7 +140,7 @@ def migrate_documents(
     return len(all_ids)
 
 
-def migrate_uces(conn: sqlite3.Connection, data: Dict, dry_run: bool = False) -> int:
+def migrate_uces(conn: psycopg.Connection, data: Dict, dry_run: bool = False) -> int:
     uces = data.get("uces", []) or []
     if dry_run:
         logger.info("[dry-run] uces: %d filas", len(uces))
@@ -172,6 +177,26 @@ def migrate_uces(conn: sqlite3.Connection, data: Dict, dry_run: bool = False) ->
         "pos_tags",
         "coref_chains",
         "subjects",
+        "lemmas",
+        "stems",
+        "content_lemmas",
+        "entidades",
+        "is_ambiguous",
+        "is_top",
+        "stability",
+        "phi_coefficients",
+        "coordinates",
+        "token_surprisals",
+        "frame_annotations",
+        "predicate_analysis",
+        "predicate_summary",
+        "verbal_frames",
+        "embedding",
+        "start_char",
+        "end_char",
+        "uc_id",
+        "texto_completo_doc",
+        "discourse_annotations",
     )
     # Columnas que van a metrics_json
     METRIC_KEYS = (
@@ -200,14 +225,28 @@ def migrate_uces(conn: sqlite3.Connection, data: Dict, dry_run: bool = False) ->
 
             conn.execute(
                 """
-                INSERT OR REPLACE INTO uces (
+                INSERT INTO uces (
                     uce_id, doc_id, local_idx, section_id, seccion, texto,
                     n_tokens, cluster_id, is_stable, stability_method,
                     is_terminal_consolidated,
                     projected_cluster_id, projection_distance,
                     projection_margin, projection_ratio,
                     phi_score, linguistic_json, metrics_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (uce_id) DO UPDATE SET
+                  doc_id = EXCLUDED.doc_id, local_idx = EXCLUDED.local_idx,
+                  section_id = EXCLUDED.section_id, seccion = EXCLUDED.seccion,
+                  texto = EXCLUDED.texto, n_tokens = EXCLUDED.n_tokens,
+                  cluster_id = EXCLUDED.cluster_id, is_stable = EXCLUDED.is_stable,
+                  stability_method = EXCLUDED.stability_method,
+                  is_terminal_consolidated = EXCLUDED.is_terminal_consolidated,
+                  projected_cluster_id = EXCLUDED.projected_cluster_id,
+                  projection_distance = EXCLUDED.projection_distance,
+                  projection_margin = EXCLUDED.projection_margin,
+                  projection_ratio = EXCLUDED.projection_ratio,
+                  phi_score = EXCLUDED.phi_score,
+                  linguistic_json = EXCLUDED.linguistic_json,
+                  metrics_json = EXCLUDED.metrics_json
                 """,
                 (
                     uce_id,
@@ -235,7 +274,7 @@ def migrate_uces(conn: sqlite3.Connection, data: Dict, dry_run: bool = False) ->
     return len(uces)
 
 
-def migrate_ucs(conn: sqlite3.Connection, data: Dict, dry_run: bool = False) -> int:
+def migrate_ucs(conn: psycopg.Connection, data: Dict, dry_run: bool = False) -> int:
     ucs = data.get("ucs", []) or []
     if dry_run:
         logger.info("[dry-run] ucs: %d filas", len(ucs))
@@ -249,10 +288,14 @@ def migrate_ucs(conn: sqlite3.Connection, data: Dict, dry_run: bool = False) -> 
             lemmas = uc.get("lemmas") or []
             conn.execute(
                 """
-                INSERT OR REPLACE INTO ucs
+                INSERT INTO ucs
                   (uc_id, doc_id, texto, cluster_id,
                    uce_ids_json, lemmas_json, n_lemmas)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (uc_id) DO UPDATE SET
+                  doc_id = EXCLUDED.doc_id, texto = EXCLUDED.texto,
+                  cluster_id = EXCLUDED.cluster_id, uce_ids_json = EXCLUDED.uce_ids_json,
+                  lemmas_json = EXCLUDED.lemmas_json, n_lemmas = EXCLUDED.n_lemmas
                 """,
                 (
                     uc_id,
@@ -273,7 +316,7 @@ def migrate_ucs(conn: sqlite3.Connection, data: Dict, dry_run: bool = False) -> 
 
 
 def migrate_clusters(
-    conn: sqlite3.Connection, data: Dict, dry_run: bool = False
+    conn: psycopg.Connection, data: Dict, dry_run: bool = False
 ) -> int:
     """
     Deriva clusters desde:
@@ -319,10 +362,13 @@ def migrate_clusters(
         for cid in sorted(all_cids):
             conn.execute(
                 """
-                INSERT OR REPLACE INTO clusters
+                INSERT INTO clusters
                   (cluster_id, cluster_name, member_count,
                    top_terms_json, centroid_json)
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (cluster_id) DO UPDATE SET
+                  cluster_name = EXCLUDED.cluster_name, member_count = EXCLUDED.member_count,
+                  top_terms_json = EXCLUDED.top_terms_json, centroid_json = EXCLUDED.centroid_json
                 """,
                 (
                     cid,
@@ -336,7 +382,7 @@ def migrate_clusters(
     return len(all_cids)
 
 
-def migrate_terms(conn: sqlite3.Connection, data: Dict, dry_run: bool = False) -> int:
+def migrate_terms(conn: psycopg.Connection, data: Dict, dry_run: bool = False) -> int:
     terms = data.get("terminos", []) or []
     if dry_run:
         logger.info("[dry-run] terms: %d filas", len(terms))
@@ -350,11 +396,18 @@ def migrate_terms(conn: sqlite3.Connection, data: Dict, dry_run: bool = False) -
                 continue
             conn.execute(
                 """
-                INSERT OR REPLACE INTO terms (
+                INSERT INTO terms (
                     term, cluster_id, frecuencia_global, frecuencia_cluster,
                     chi2_yates, p_valor, p_adj, phi, cramer_v, c_value,
                     significativo, asignado_estricto
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (term, cluster_id) DO UPDATE SET
+                  frecuencia_global = EXCLUDED.frecuencia_global,
+                  frecuencia_cluster = EXCLUDED.frecuencia_cluster,
+                  chi2_yates = EXCLUDED.chi2_yates, p_valor = EXCLUDED.p_valor,
+                  p_adj = EXCLUDED.p_adj, phi = EXCLUDED.phi, cramer_v = EXCLUDED.cramer_v,
+                  c_value = EXCLUDED.c_value, significativo = EXCLUDED.significativo,
+                  asignado_estricto = EXCLUDED.asignado_estricto
                 """,
                 (
                     str(term),
@@ -376,7 +429,7 @@ def migrate_terms(conn: sqlite3.Connection, data: Dict, dry_run: bool = False) -
 
 
 def migrate_annotations(
-    conn: sqlite3.Connection, data: Dict, dry_run: bool = False
+    conn: psycopg.Connection, data: Dict, dry_run: bool = False
 ) -> int:
     """
     Formato esperado en el JSON (según el plan original):
@@ -405,7 +458,7 @@ def migrate_annotations(
                 INSERT INTO annotations
                   (uce_id, agent_name, trait, quote, confidence,
                    subtype, payload_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     a["uce_id"],
@@ -421,7 +474,7 @@ def migrate_annotations(
     return len(flat)
 
 
-def migrate_network(conn: sqlite3.Connection, data: Dict, dry_run: bool = False) -> int:
+def migrate_network(conn: psycopg.Connection, data: Dict, dry_run: bool = False) -> int:
     """
     Acepta todos los formatos de edge plausibles:
 
@@ -496,14 +549,15 @@ def migrate_network(conn: sqlite3.Connection, data: Dict, dry_run: bool = False)
     with transaction(conn):
         conn.execute("DELETE FROM network_edges")
         conn.executemany(
-            "INSERT OR REPLACE INTO network_edges (src, dst, weight) VALUES (?, ?, ?)",
+            "INSERT INTO network_edges (src, dst, weight) VALUES (%s, %s, %s) "
+            "ON CONFLICT (src, dst) DO UPDATE SET weight = EXCLUDED.weight",
             norm,
         )
     logger.info("network_edges: %d filas", len(norm))
     return len(norm)
 
 
-def migrate_kv(conn: sqlite3.Connection, data: Dict, dry_run: bool = False) -> int:
+def migrate_kv(conn: psycopg.Connection, data: Dict, dry_run: bool = False) -> int:
     """
     Guarda en kv_store todo lo que no tiene tabla propia:
     config, sintesis_por_clase, multivariate, term_stability,
@@ -546,8 +600,10 @@ def migrate_kv(conn: sqlite3.Connection, data: Dict, dry_run: bool = False) -> i
         for k, v in present.items():
             conn.execute(
                 """
-                INSERT OR REPLACE INTO kv_store (key, value_json, updated_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO kv_store (key, value_json, updated_at)
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (key) DO UPDATE SET
+                  value_json = EXCLUDED.value_json, updated_at = CURRENT_TIMESTAMP
                 """,
                 (k, _json_or_empty(v) if not isinstance(v, str) else v),
             )

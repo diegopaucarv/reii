@@ -178,5 +178,46 @@ SELECT
 FROM uces u
 JOIN documents d ON d.doc_id = u.doc_id;
 
-INSERT OR IGNORE INTO _schema_version (version, applied_at)
-VALUES (1, datetime('now'));
+-- ── workflow config (v2) ─────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS workflow_config (
+    key         TEXT PRIMARY KEY,
+    value_json  TEXT NOT NULL,
+    value_type  TEXT NOT NULL,
+    category    TEXT,
+    description TEXT,
+    updated_by  TEXT,
+    updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS workflow_config_history (
+    history_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    key         TEXT NOT NULL,
+    value_json  TEXT NOT NULL,
+    value_type  TEXT NOT NULL,
+    category    TEXT,
+    description TEXT,
+    updated_by  TEXT,
+    updated_at  TEXT NOT NULL,
+    operation   TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_workflow_config_audit_update
+AFTER UPDATE ON workflow_config
+BEGIN
+    INSERT INTO workflow_config_history
+        (key, value_json, value_type, category, description, updated_by, updated_at, operation)
+    VALUES
+        (OLD.key, OLD.value_json, OLD.value_type, OLD.category, OLD.description, OLD.updated_by, OLD.updated_at, 'UPDATE');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_workflow_config_audit_delete
+AFTER DELETE ON workflow_config
+BEGIN
+    INSERT INTO workflow_config_history
+        (key, value_json, value_type, category, description, updated_by, updated_at, operation)
+    VALUES
+        (OLD.key, OLD.value_json, OLD.value_type, OLD.category, OLD.description, OLD.updated_by, OLD.updated_at, 'DELETE');
+END;
+
+INSERT OR IGNORE INTO _schema_version (version, applied_at) VALUES (1, datetime('now'));
+INSERT OR IGNORE INTO _schema_version (version, applied_at) VALUES (2, datetime('now'));

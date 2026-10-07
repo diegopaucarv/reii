@@ -84,8 +84,8 @@ DB_PATH: str = str(
 WORKFLOW_DB_PATH: str = str(
     ROOT_DIR / os.environ.get("REII_WORKFLOW_DB_PATH", "data/workflow_data.json")
 )
-WORKFLOW_SQLITE_PATH: str = str(
-    ROOT_DIR / os.environ.get("REII_WORKFLOW_SQLITE_PATH", "data/workflow_data.db")
+DATABASE_URL: str = os.environ.get(
+    "REII_DATABASE_URL", "postgresql://reii:reii@reii-db:5432/reii"
 )
 WORKFLOW_CONFIG_PATH: str = str(
     ROOT_DIR / os.environ.get("REII_WORKFLOW_CONFIG_PATH", "data/workflow_config.json")

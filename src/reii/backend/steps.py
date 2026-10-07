@@ -120,7 +120,7 @@ def _load_cached(name: str, version: int, input_hash: str) -> Optional[Any]:
         row = conn.execute(
             """
             SELECT output_json FROM step_cache
-            WHERE step_name = ? AND step_version = ? AND input_hash = ?
+            WHERE step_name = %s AND step_version = %s AND input_hash = %s
             """,
             (name, version, input_hash),
         ).fetchone()
@@ -140,10 +140,13 @@ def _save_cached(
         with transaction(conn):
             conn.execute(
                 """
-                INSERT OR REPLACE INTO step_cache
+                INSERT INTO step_cache
                   (step_name, step_version, input_hash, output_json,
                    created_at, duration_ms, n_bytes)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
+                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP, %s, %s)
+                ON CONFLICT (step_name, step_version, input_hash) DO UPDATE SET
+                  output_json = EXCLUDED.output_json, created_at = CURRENT_TIMESTAMP,
+                  duration_ms = EXCLUDED.duration_ms, n_bytes = EXCLUDED.n_bytes
                 """,
                 (name, version, input_hash, payload, duration_ms, len(payload)),
             )

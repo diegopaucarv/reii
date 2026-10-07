@@ -1,5 +1,5 @@
 {
-  "workflow_mode": "🧠 Transformer (requiere GPU)",
+  "workflow_mode": "transformer",
   "use_bigrams": true,
   "stem_backend": "snowball",
   "min_uce_words": 2,
