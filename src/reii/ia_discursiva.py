@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+from __future__ import annotations
+
 import json
 import os
 import re
+import statistics
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
-import numpy as np
 import requests
 from json_repair import repair_json
 from jsonschema import ValidationError, validate  # new import
@@ -37,7 +39,13 @@ from reii.config import (
     TOGETHER_API_URL,
     WORKFLOW_DB_PATH,
 )
-from reii.gram.gramatical_analyzer import UCE, PredicateFrame
+
+if TYPE_CHECKING:
+    # Solo para anotaciones de tipo. Importar gramatical_analyzer en tiempo
+    # de ejecución arrastra todo el stack de ML pesado (torch, spacy, stanza,
+    # transformers, sentence_transformers, gliner, gensim, cdlib), lo que
+    # ralentiza la primera carga de la vista de procesamiento por lotes.
+    from reii.gram.gramatical_analyzer import UCE, PredicateFrame
 
 # ─────────────────────────────────────────────
 # Rutas de persistencia
@@ -1381,15 +1389,15 @@ class GlobalGrammaticalSummarizer:
         # ── Finalise numeric aggregates ───────────────────────────────────
         for section in ("complejidad_sintactica", "metricas_lexicas", "subtlex"):
             for k, vals in agg[section].items():
-                agg[section][k] = float(np.mean(vals)) if vals else 0.0
+                agg[section][k] = float(statistics.mean(vals)) if vals else 0.0
 
         agg["coref"]["unique_entities"] = list(agg["coref"]["unique_entities"])
         if agg["coref"]["mentions_per_uce"]:
             agg["coref"]["mean_mentions_per_uce"] = float(
-                np.mean(agg["coref"]["mentions_per_uce"])
+                statistics.mean(agg["coref"]["mentions_per_uce"])
             )
             agg["coref"]["std_mentions_per_uce"] = float(
-                np.std(agg["coref"]["mentions_per_uce"])
+                statistics.pstdev(agg["coref"]["mentions_per_uce"])
             )
         else:
             agg["coref"]["mean_mentions_per_uce"] = 0.0
@@ -1397,8 +1405,12 @@ class GlobalGrammaticalSummarizer:
 
         for key in ["surprisal_transicion", "surprisal_interno"]:
             vals = agg["marcadores"][key]
-            agg["marcadores"][f"mean_{key}"] = float(np.mean(vals)) if vals else 0.0
-            agg["marcadores"][f"std_{key}"] = float(np.std(vals)) if vals else 0.0
+            agg["marcadores"][f"mean_{key}"] = (
+                float(statistics.mean(vals)) if vals else 0.0
+            )
+            agg["marcadores"][f"std_{key}"] = (
+                float(statistics.pstdev(vals)) if vals else 0.0
+            )
             del agg["marcadores"][key]
 
         # ── Finalise POS buckets ──────────────────────────────────────────
@@ -2206,7 +2218,7 @@ class ClassStatsReporter:
         print(f"Cargadas {len(self.uces)} UCEs en {len(self.clusters)} clases.")
 
     def _safe_mean(self, v):
-        return float(np.mean(v)) if v else 0.0
+        return float(statistics.mean(v)) if v else 0.0
 
     def aggregate_all(self, cluster_id: int) -> Dict:
         uces = self.uces_by_cluster[cluster_id]

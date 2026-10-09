@@ -57,6 +57,9 @@ services:
       - ./models:/app/models
       - ./output:/app/output
       - ./ia:/app/ia
+      - D:/SUBTLEX-ESP.xlsx:/d/SUBTLEX-ESP.xlsx:ro
+      - D:/cc.es.300.bin:/d/cc.es.300.bin:ro
+      - D:/Python/HF_Cache:/root/.cache/huggingface
     environment:
       - REII_ROOT_DIR=/app
       - REII_DATA_DIR=data
@@ -77,6 +80,9 @@ services:
       - REII_LLM_FALLBACK_MODEL=${REII_LLM_FALLBACK_MODEL:-Prism-ML/Ternary-Bonsai-27B}
       - REII_LLM_MAX_RETRIES=${REII_LLM_MAX_RETRIES:-5}
       - REII_LLM_TIMEOUT=${REII_LLM_TIMEOUT:-300}
+      - REII_SUBTLEX_PATH=/d/SUBTLEX-ESP.xlsx
+      - REII_WORD_EMBEDDINGS_PATH=/d/cc.es.300.bin
+      - REII_USE_GENSIM_EMBEDDINGS=false
       - HF_TOKEN=${HF_TOKEN:-}
     profiles: ["batch"]
     command: python src/reii/main_workflow.py
@@ -84,6 +90,8 @@ services:
   reii-db:
     image: postgres:16
     container_name: reii-db
+    ports:
+      - "5433:5432"
     environment:
       - POSTGRES_USER=reii
       - POSTGRES_PASSWORD=reii

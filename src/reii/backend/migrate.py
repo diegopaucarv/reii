@@ -208,6 +208,20 @@ def migrate_uces(conn: psycopg.Connection, data: Dict, dry_run: bool = False) ->
     )
 
     with transaction(conn):
+        # ── Anti-acumulación ──────────────────────────────────────────────
+        # Si un documento se reprocesa, sus UCEs viejas (de runs anteriores)
+        # deben reemplazarse, no acumularse. Borramos solo los docs presentes
+        # en este run; los docs no reprocesados conservan sus UCEs.
+        _doc_ids = set()
+        for u in uces:
+            _raw = u.get("doc_id")
+            if _raw is None:
+                _raw = (u.get("metadata") or {}).get("doc_idx")
+            if _raw is not None:
+                _doc_ids.add(str(_raw))
+        for _did in sorted(_doc_ids):
+            conn.execute("DELETE FROM uces WHERE doc_id = %s", (_did,))
+
         for u in uces:
             uce_id = str(u.get("id") or u.get("uce_id") or "")
             if not uce_id:

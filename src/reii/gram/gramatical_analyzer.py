@@ -145,33 +145,90 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _normalize_for_alignment(text: str) -> str:
+    """Strip [Speaker N] labels and collapse whitespace so the label-stripped
+    UCE text can be aligned against the raw transcript."""
+    text = re.sub(r"\[Speaker\s*\d+\]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _build_clean_mapping(text: str) -> tuple[str, list[int]]:
+    """Return (clean_text, mapping) where mapping[i] is the original char index
+    of clean_text[i]. Speaker labels are removed and whitespace runs are
+    collapsed to a single space, so clean_text is shorter than text."""
+    clean_chars: list[str] = []
+    mapping: list[int] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        m = re.match(r"\[Speaker\s*\d+\]", text[i:])
+        if m:
+            i += m.end()
+            continue
+        ch = text[i]
+        if ch.isspace():
+            if clean_chars and clean_chars[-1] != " ":
+                clean_chars.append(" ")
+                mapping.append(i)
+            i += 1
+            continue
+        clean_chars.append(ch)
+        mapping.append(i)
+        i += 1
+    # Strip leading/trailing spaces, keeping mapping in sync.
+    while clean_chars and clean_chars[0] == " ":
+        clean_chars.pop(0)
+        mapping.pop(0)
+    while clean_chars and clean_chars[-1] == " ":
+        clean_chars.pop()
+        mapping.pop()
+    return "".join(clean_chars), mapping
+
+
 def lock_global_offsets(texto_completo: str, uces: list) -> None:
-    cursor = 0
+    # Align against a label-stripped, whitespace-normalized copy of the full
+    # text. The UCE text is derived from the same label-stripped segments, so
+    # it is contiguous in the clean text; the raw text has [Speaker N] labels
+    # interspersed, which made the old fuzzy end-position over-shoot the cursor
+    # (spurious later matches for common words) and cascade into DESYNC.
+    clean_text, mapping = _build_clean_mapping(texto_completo)
+    if not clean_text:
+        return
+
+    cursor = 0  # cursor in clean text
     for uce in uces:
         if not uce.texto.strip():
             continue
 
+        clean_uce = _normalize_for_alignment(uce.texto)
+        if not clean_uce:
+            continue
+
         # Cascade of attempts: tighter → looser window and block size
         attempts = [
-            (max(500, len(uce.texto) * 3), 4),  # tight: original behavior
-            (max(1000, len(uce.texto) * 6), 3),  # wider window, smaller block
-            (max(2000, len(uce.texto) * 10), 2),  # very wide, minimal block
+            (max(500, len(clean_uce) * 3), 4),  # tight: original behavior
+            (max(1000, len(clean_uce) * 6), 3),  # wider window, smaller block
+            (max(2000, len(clean_uce) * 10), 2),  # very wide, minimal block
         ]
 
         aligned = False
         for window_size, min_block in attempts:
-            chunk = texto_completo[cursor : cursor + window_size]
-            matcher = SequenceMatcher(None, chunk.lower(), uce.texto.lower())
+            chunk = clean_text[cursor : cursor + window_size]
+            matcher = SequenceMatcher(None, chunk.lower(), clean_uce.lower())
             valid_blocks = [
                 b for b in matcher.get_matching_blocks() if b.size >= min_block
             ]
 
             if valid_blocks:
-                start_offset = valid_blocks[0].a
-                end_offset = valid_blocks[-1].a + valid_blocks[-1].size
-                uce.start_char = cursor + start_offset
-                uce.end_char = cursor + end_offset
-                cursor = uce.end_char
+                start_clean = cursor + valid_blocks[0].a
+                # The UCE text is contiguous in the clean text, so the end is
+                # start + length (NOT the last matching block, which can be a
+                # spurious match far ahead and over-shoot the cursor).
+                end_clean = min(start_clean + len(clean_uce), len(clean_text))
+                uce.start_char = mapping[start_clean]
+                uce.end_char = mapping[end_clean - 1] + 1
+                cursor = end_clean
                 aligned = True
                 break
 
@@ -186,13 +243,15 @@ def lock_global_offsets(texto_completo: str, uces: list) -> None:
             )
             # Log the first 80 chars of both sides to help diagnose
             logger.debug(
-                "  texto_completo[cursor:cursor+200] = %r",
-                texto_completo[cursor : cursor + 200],
+                "  clean_text[cursor:cursor+200] = %r",
+                clean_text[cursor : cursor + 200],
             )
             logger.debug("  uce.texto[:80] = %r", uce.texto[:80])
-            uce.start_char = cursor
-            uce.end_char = cursor + len(uce.texto)
-            cursor = uce.end_char
+            uce.start_char = (
+                mapping[cursor] if cursor < len(mapping) else len(texto_completo)
+            )
+            uce.end_char = uce.start_char + len(uce.texto)
+            cursor = min(cursor + len(clean_uce), len(clean_text))
 
 
 @Language.component("fix_colloquial_npi_deps")
@@ -1371,6 +1430,13 @@ class GlobalCorpus:
                     "n_mentions": n_mentions,
                     "docs": sorted(set(doc_ids)),
                 }
+            )
+        if not rows:
+            # Sin cadenas cross-doc: devolver un DataFrame vacío con el
+            # esquema esperado para que sort_values() no reviente con
+            # KeyError: 'n_docs'.
+            return pd.DataFrame(
+                columns=["representative", "n_docs", "n_mentions", "docs"]
             )
         return (
             pd.DataFrame(rows)

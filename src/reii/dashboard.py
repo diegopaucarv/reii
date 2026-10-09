@@ -82,34 +82,68 @@ st.set_page_config(
 # ══════════════════════════════════════════════════════════════
 
 
+# Número de transcripciones procesadas en paralelo por el worker de lotes.
+# Las llamadas al LLM son I/O-bound (red), así que un pool pequeño de hilos
+# solapa la latencia sin saturar la API.
+_BATCH_MAX_WORKERS = 4
+
+
 def _batch_worker(
     bp: "BatchProcessor",
     queue: List[str],
     log: List[str],
     state: Dict[str, Any],
 ) -> None:
-    """Procesa la cola en segundo plano.
+    """Procesa la cola en segundo plano, varios archivos en paralelo.
 
-    Revisa ``state["paused"]`` entre archivos: si el usuario pausa, el
-    worker termina el archivo en curso y se detiene. ``state`` es un dict
-    mutable compartido con la UI (evita tocar ``st.session_state`` desde
-    el hilo).
+    Revisa ``state["paused"]`` antes de tomar cada archivo: si el usuario
+    pausa, no se inician archivos nuevos y se espera a que terminen los que
+    ya están en vuelo. ``state`` es un dict mutable compartido con la UI
+    (evita tocar ``st.session_state`` desde el hilo).
+
+    ``bp.save_record`` hace un read-modify-write sobre el JSON compartido,
+    así que se serializa con un lock. ``log.append`` es atómico (GIL), pero
+    se protege igual para mantener el orden de los mensajes por archivo.
     """
-    while queue and not state["paused"]:
-        path = Path(queue.pop(0))
-        nombre = path.name
-        log.append(f"▶ Procesando {nombre}…")
-        try:
-            record = bp.process_file(path, log_cb=lambda m: log.append(m))
-            bp.save_record(record)
-            icono = "✅" if record.get("estado") == "completado" else "❌"
-            log.append(f"{icono} {nombre}: {record.get('estado')}")
-        except Exception as e:
-            log.append(f"❌ {nombre}: {type(e).__name__}: {e}")
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    save_lock = threading.Lock()
+    log_lock = threading.Lock()
+    pop_lock = threading.Lock()
+
+    def _log(msg: str) -> None:
+        with log_lock:
+            log.append(msg)
+
+    def _process_one() -> None:
+        # Pop perezoso: la cola se vacía a medida que los archivos terminan,
+        # así el contador "N en cola" de la UI refleja el trabajo restante.
+        while True:
+            with pop_lock:
+                if not queue or state["paused"]:
+                    return
+                path_str = queue.pop(0)
+            path = Path(path_str)
+            nombre = path.name
+            _log(f"▶ Procesando {nombre}…")
+            try:
+                record = bp.process_file(path, log_cb=_log)
+                with save_lock:
+                    bp.save_record(record)
+                icono = "✅" if record.get("estado") == "completado" else "❌"
+                _log(f"{icono} {nombre}: {record.get('estado')}")
+            except Exception as e:
+                _log(f"❌ {nombre}: {type(e).__name__}: {e}")
+
+    with ThreadPoolExecutor(max_workers=_BATCH_MAX_WORKERS) as ex:
+        futures = [ex.submit(_process_one) for _ in range(_BATCH_MAX_WORKERS)]
+        for f in as_completed(futures):
+            f.result()
+
     if state["paused"]:
-        log.append("⏸ Lote pausado.")
+        _log("⏸ Lote pausado.")
     else:
-        log.append("✅ Lote completado.")
+        _log("✅ Lote completado.")
     state["running"] = False
     state["finished"] = True
 

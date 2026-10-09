@@ -6,16 +6,19 @@ import copy
 import dataclasses
 import gc
 import glob
+import hashlib
 import json
 import logging
 import os
 import re
+import sys
 import time
 import traceback
 import uuid
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import nltk
@@ -103,6 +106,17 @@ try:
     _SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:
     _SENTENCE_TRANSFORMERS_AVAILABLE = False
+
+
+@lru_cache(maxsize=4)
+def _get_sentence_embedder(model_name: str) -> SentenceTransformer:
+    """Instancia única (cacheada) del SentenceTransformer.
+
+    Evita re-validar el cache de HuggingFace y recargar pesos en cada
+    llamada (generar_embeddings_uces/ucs, SynthesisGenerator, ...).
+    """
+    return SentenceTransformer(model_name)
+
 
 try:
     from openai import OpenAI
@@ -241,6 +255,73 @@ for indice_orden, ruta_json in enumerate(archivos_json):
             indice_interno += 1  # Aumentamos el contador solo para segmentos válidos
 
 # Listo. 'uwu' ahora tiene exactamente la arquitectura que definiste.
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SKIP DE DOCUMENTOS YA PROCESADOS
+# ══════════════════════════════════════════════════════════════════════
+# Por defecto, los documentos que ya tienen todas sus UCEs en la base de
+# datos NO se vuelven a procesar (evita re-correr 4h+ de pipeline por
+# documentos sin cambios). Para forzar el reprocesamiento completo:
+#   python src/reii/main_workflow.py --force
+# (o --reprocess, alias).
+_FORCE_REPROCESS = "--force" in sys.argv or "--reprocess" in sys.argv
+if not _FORCE_REPROCESS:
+    try:
+        from reii.backend.sql.db import connect as _pg_connect
+
+        _pg = _pg_connect(DATABASE_URL)
+        try:
+            _procesados = {
+                r[0]
+                for r in _pg.execute(
+                    "SELECT DISTINCT origen FROM documents "
+                    "WHERE origen IS NOT NULL AND n_uces > 0"
+                ).fetchall()
+            }
+        finally:
+            _pg.close()
+        _a_omitir = [k for k in uwu if k in _procesados]
+        if _a_omitir:
+            print(
+                f"   [SKIP] {len(_a_omitir)}/{len(uwu)} documentos ya procesados "
+                f"(usa --force para reprocesar): {_a_omitir}"
+            )
+            uwu = {k: v for k, v in uwu.items() if k not in _procesados}
+    except Exception as _e:
+        print(f"   [WARNING] No se pudo verificar docs procesados: {_e}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# FINGERPRINT DEL CORPUS (best_params dataset-specific)
+# ══════════════════════════════════════════════════════════════════════
+# best_params.json se optimiza para UN corpus concreto. Para no reutilizar
+# parámetros de otro dataset (o de una versión editada de este), sellamos el
+# archivo con un hash de los archivos de entrada: nombres + mtime + tamaño.
+# Cualquier cambio (añadir/quitar/editar un archivo) invalida el cache y
+# fuerza re-optimización.
+
+
+def _corpus_fingerprint() -> str:
+    """Hash del corpus: nombres + mtime + tamaño de los archivos de entrada.
+
+    Incluye los JSONs segmentados (txt_outputs/tmp), los TXTs crudos
+    (txt_outputs) y la metadata sociodemográfica (Refined_Database.csv).
+    """
+    h = hashlib.sha256()
+    _paths: List[str] = []
+    _paths += sorted(
+        glob.glob(os.path.join(REII_DATA_DIR, "txt_outputs", "tmp", "*.json"))
+    )
+    _paths += sorted(glob.glob(os.path.join(REII_DATA_DIR, "txt_outputs", "*.txt")))
+    _meta = os.path.join(REII_DATA_DIR, "Refined_Database.csv")
+    if os.path.exists(_meta):
+        _paths.append(_meta)
+    for _p in _paths:
+        h.update(os.path.basename(_p).encode("utf-8"))
+        h.update(str(os.path.getmtime(_p)).encode("utf-8"))
+        h.update(str(os.path.getsize(_p)).encode("utf-8"))
+    return h.hexdigest()[:16]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1327,6 +1408,10 @@ class SegmentadorALCESTE:
         self.section_registry = {}
 
         for doc_idx, (origen_key, doc_data) in enumerate(corpus_raw.items()):
+            # Usar indice_orden (índice original del archivo) como doc_idx:
+            # si el run filtra documentos ya procesados, el enumerate()
+            # cambiaría los índices y rompería la correspondencia con la DB.
+            doc_idx = int(doc_data.get("indice_orden", doc_idx))
             metadata_global = doc_data.get("metadata", {}).copy()
             shared_meta = {
                 **metadata_global,
@@ -1605,7 +1690,7 @@ class SegmentadorALCESTE:
         if not _SENTENCE_TRANSFORMERS_AVAILABLE:
             print("   SentenceTransformer no disponible.")
             return ucs
-        model = SentenceTransformer(self.config.embedding_model_name)
+        model = _get_sentence_embedder(self.config.embedding_model_name)
         embs = model.encode([uc.texto for uc in ucs], show_progress_bar=True)
         for uc, emb in zip(ucs, embs):
             uc.embedding = emb.tolist()
@@ -1615,7 +1700,7 @@ class SegmentadorALCESTE:
         if not _SENTENCE_TRANSFORMERS_AVAILABLE:
             print("   SentenceTransformer no disponible.")
             return uces
-        model = SentenceTransformer(self.config.embedding_model_name)
+        model = _get_sentence_embedder(self.config.embedding_model_name)
         embs = model.encode(
             [u.texto for u in uces],
             show_progress_bar=True,
@@ -5806,7 +5891,7 @@ class SynthesisGenerator:
             else None
         )
         self.embedder = (
-            SentenceTransformer(config.embedding_model_name)
+            _get_sentence_embedder(config.embedding_model_name)
             if config.use_embeddings and _SENTENCE_TRANSFORMERS_AVAILABLE
             else None
         )
@@ -6009,6 +6094,16 @@ except ImportError:
     _OPTUNA_AVAILABLE = False
 
 
+# Centinela dominado para trials inválidos (gates duros). Optuna 3.6.2
+# (pin <4.0.0) crashea en TPE multi-objetivo cuando un trial PRUNED
+# (values=None) cae en el conjunto "below" del Parzen estimator
+# (_calculate_weights_below_for_multi_objective itera trial.values).
+# Devolver un punto estrictamente dominado en vez de TrialPruned evita
+# el crash y no contamina el frente de Pareto (peor ARI, peor coverage,
+# peor −K). Ver scripts/_repro_tpe_pruned.py.
+_SENTINEL_TRIAL = (-1.0, 0.0, -2.0)
+
+
 class Optimizador:
     """
     Optimizador de hiperparámetros REII basado en Optuna.
@@ -6115,6 +6210,7 @@ class Optimizador:
             ),
             "timestamp": datetime.now().isoformat(),
             "total_uces": self.total_uces,
+            "corpus_fingerprint": _corpus_fingerprint(),
         }
         path = self._best_params_path()
         with open(path, "w", encoding="utf-8") as f:
@@ -6246,20 +6342,20 @@ class Optimizador:
     # ══════════════════════════════════════════════════════════════════════
     def _evaluate_trial(self, trial: "optuna.Trial"):
         """
-        Devuelve la tupla (ARI, coverage, −K) o lanza TrialPruned.
+        Devuelve la tupla (ARI, coverage, −K) o un centinela dominado.
 
         Los gates duros (K fuera de [2,8], coverage < umbral, excepción
-        en la evaluación) se traducen a TrialPruned en vez de a un valor
-        centinela −1e6. Esto evita contaminar el frente de Pareto con
-        puntos artificiales y permite que el sampler aprenda de los
-        trials válidos sin sesgo.
+        en la evaluación) devuelven _SENTINEL_TRIAL en vez de lanzar
+        TrialPruned. Motivo: Optuna 3.6.2 (pin <4.0.0) crashea en TPE
+        multi-objetivo cuando un trial PRUNED (values=None) cae en el
+        conjunto "below" del Parzen estimator. El centinela es
+        estrictamente dominado por cualquier trial real (peor ARI, peor
+        coverage, peor −K), así que no contamina el frente de Pareto ni
+        el conjunto "below" del sampler.
 
-        Nota sobre pruning: reportamos coverage en step=0 justo antes
-        del cálculo de ARI. Como `_evaluacion_rapida` es monolítica, no
-        hay señal intermedia disponible sin refactorizar DoubleClassifier.
-        El MedianPruner por tanto solo descarta trials cuyo coverage ya
-        cayó por debajo del running median — el resto del ahorro viene
-        del gate duro de coverage y del gate de K.
+        Nota sobre pruning: al no lanzar TrialPruned, el MedianPruner
+        queda inerte; el filtrado real lo hacen los gates duros de
+        coverage y de K.
         """
         params = self._suggest(trial, self._search_space_cached)
 
@@ -6286,46 +6382,43 @@ class Optimizador:
             result = self._evaluacion_rapida(cfg, uc_cfg=uc_cfg)
         except Exception as e:
             logger.debug("Trial %d exception: %s", trial.number, e)
-            raise optuna.TrialPruned()
+            return _SENTINEL_TRIAL
 
         uces_list = result[0] if result else None
         if not uces_list:
-            raise optuna.TrialPruned()
+            return _SENTINEL_TRIAL
 
         labels_uces = np.array(
             [u.cluster_id for u in uces_list if u.cluster_id is not None]
         )
         if len(labels_uces) == 0:
-            raise optuna.TrialPruned()
+            return _SENTINEL_TRIAL
 
         n_clusters = int(len(np.unique(labels_uces)))
 
         # ── Gate duro: K fuera de rango útil ─────────────────────────────
         if n_clusters < 2 or n_clusters > 8:
-            raise optuna.TrialPruned()
+            return _SENTINEL_TRIAL
 
         coverage = len(uces_list) / max(1, self.total_uces)
         coverage_gate = float(getattr(self.config_base, "optimize_coverage_gate", 0.65))
 
         # ── Gate duro: coverage insuficiente (Recomendación A) ──────────
         if coverage < coverage_gate:
-            raise optuna.TrialPruned()
-
-        # ── Reporte intermedio antes del cálculo caro de ARI ────────────
-        trial.report(coverage, step=0)
-        if trial.should_prune():
-            raise optuna.TrialPruned()
+            return _SENTINEL_TRIAL
 
         # ── ARI: métrica headline, se calcula al final ───────────────────
+        # (trial.report/should_prune eliminados: Optuna 3.6.2 no soporta
+        # report en optimización multi-objetivo — NotImplementedError.)
         labels1_uce = result[5]
         labels2_uce = result[6]
         if labels1_uce is None or labels2_uce is None:
-            raise optuna.TrialPruned()
+            return _SENTINEL_TRIAL
 
         # Alinear longitudes antes de ARI (por seguridad)
         n = min(len(labels1_uce), len(labels2_uce))
         if n < 2:
-            raise optuna.TrialPruned()
+            return _SENTINEL_TRIAL
         ari = float(adjusted_rand_score(labels1_uce[:n], labels2_uce[:n]))
 
         return ari, float(coverage), -float(n_clusters)
@@ -7004,11 +7097,38 @@ class WorkflowOrchestrator:
             try:
                 with open(best_params_path, "r", encoding="utf-8") as f:
                     best_data = json.load(f)
-                # Nuevo formato → 'best_params'; legacy → 'params'
-                best_params = best_data.get("best_params") or best_data.get("params")
-                if best_params:
-                    print(f"   Loaded params: {best_params}")
-                    _apply_best_params(best_params)
+                _stored_fp = best_data.get("corpus_fingerprint")
+                _current_fp = _corpus_fingerprint()
+                if _stored_fp and _stored_fp != _current_fp:
+                    print(
+                        "   [WARNING] best_params.json es de otro dataset "
+                        "(fingerprint distinto). Re-optimizando..."
+                    )
+                    best_params = None
+                else:
+                    # Nuevo formato → 'best_params'; legacy → 'params'
+                    best_params = best_data.get("best_params") or best_data.get(
+                        "params"
+                    )
+                    if best_params:
+                        print(f"   Loaded params: {best_params}")
+                        _apply_best_params(best_params)
+                    if _stored_fp is None:
+                        # Archivo legacy (sin fingerprint): asumimos que es del
+                        # dataset actual (el usuario lo validó) y lo sellamos
+                        # para que futuros cambios de dataset se detecten.
+                        try:
+                            best_data["corpus_fingerprint"] = _current_fp
+                            with open(best_params_path, "w", encoding="utf-8") as f:
+                                json.dump(best_data, f, indent=2, ensure_ascii=False)
+                            print(
+                                "   [Optimizador] best_params.json sellado con "
+                                "fingerprint del dataset actual."
+                            )
+                        except Exception as _se:
+                            print(
+                                f"   [WARNING] No se pudo sellar best_params.json: {_se}"
+                            )
             except Exception as e:
                 print(
                     f"   [WARNING] Could not load best_params.json: {e}. "
@@ -7656,7 +7776,7 @@ if __name__ == "__main__":
         optimize_sampler="tpe",
         optimize_pruner="median",
         optimize_storage="sqlite:///reii_optuna.db",  # persistencia entre sesiones
-        optimize_study_name="reii_search_v1",
+        optimize_study_name="reii_search_v2",
         optimize_n_startup_trials=25,
         optimize_multivariate=True,
         optimize_prune_n_startup=15,
