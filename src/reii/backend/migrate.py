@@ -373,6 +373,10 @@ def migrate_clusters(
         return len(all_cids)
 
     with transaction(conn):
+        # ── Anti-acumulación ──────────────────────────────────────────────
+        # clusters se deriva de uces/terminos/centroids del JSON actual.
+        # Sin DELETE, los runs anteriores acumulan clusters huérfanos.
+        conn.execute("DELETE FROM clusters")
         for cid in sorted(all_cids):
             conn.execute(
                 """
@@ -403,6 +407,11 @@ def migrate_terms(conn: psycopg.Connection, data: Dict, dry_run: bool = False) -
         return len(terms)
 
     with transaction(conn):
+        # ── Anti-acumulación ──────────────────────────────────────────────
+        # terms/clusters se derivan íntegramente del JSON actual. Sin DELETE,
+        # los runs anteriores acumulan filas (INSERT ... ON CONFLICT DO UPDATE
+        # nunca borra). Reconstrucción total, igual que migrate_annotations.
+        conn.execute("DELETE FROM terms")
         for t in terms:
             term = t.get("termino")
             cid = t.get("cluster")
@@ -448,8 +457,24 @@ def migrate_annotations(
     """
     Formato esperado en el JSON (según el plan original):
         data["annotations_by_uce"] = {uce_id: [{agent_name, trait, quote, ...}, ...]}
+
+    Las anotaciones discursivas NO las produce el workflow: viven en
+    data/discourse_state.json (las carga el dashboard en render). Si el JSON
+    del workflow no trae annotations_by_uce, las leemos de ahí.
     """
     ann_by_uce = data.get("annotations_by_uce") or {}
+    if not ann_by_uce:
+        # Fallback: discourse_state.json (fuente real de las anotaciones).
+        try:
+            from reii.config import DISCOURSE_STATE_PATH
+
+            _disc_path = Path(DISCOURSE_STATE_PATH)
+            if _disc_path.exists():
+                with open(_disc_path, "r", encoding="utf-8") as f:
+                    _disc = json.load(f)
+                ann_by_uce = _disc.get("annotations_by_uce") or {}
+        except Exception as e:
+            logger.warning("No se pudo leer discourse_state.json: %s", e)
     if not ann_by_uce:
         logger.info("annotations: no hay datos en el JSON")
         return 0

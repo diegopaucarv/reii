@@ -145,113 +145,164 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _strip_speaker_labels(text: str) -> str:
+    """Remove [Speaker N] and Speaker N: labels (with optional trailing colon)."""
+    text = re.sub(r"\[Speaker\s*\d+\]\s*:?", " ", text)
+    text = re.sub(r"\bSpeaker\s*\d+\s*:", " ", text)
+    return text
+
+
 def _normalize_for_alignment(text: str) -> str:
-    """Strip [Speaker N] labels and collapse whitespace so the label-stripped
-    UCE text can be aligned against the raw transcript."""
-    text = re.sub(r"\[Speaker\s*\d+\]", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    """Aggressively normalize for alignment: strip speaker labels, remove
+    accents, and remove ALL whitespace. This makes the UCE text match the raw
+    transcript even when the LLM inserted/removed spaces after punctuation or
+    changed accents (é→e)."""
+    text = _strip_speaker_labels(text)
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = re.sub(r"\s+", "", text)
+    return text.lower()
 
 
 def _build_clean_mapping(text: str) -> tuple[str, list[int]]:
     """Return (clean_text, mapping) where mapping[i] is the original char index
-    of clean_text[i]. Speaker labels are removed and whitespace runs are
-    collapsed to a single space, so clean_text is shorter than text."""
+    of clean_text[i]. Speaker labels are removed, accents stripped, and ALL
+    whitespace removed, so clean_text is shorter than text."""
+    text = _strip_speaker_labels(text)
     clean_chars: list[str] = []
     mapping: list[int] = []
-    i = 0
-    n = len(text)
-    while i < n:
-        m = re.match(r"\[Speaker\s*\d+\]", text[i:])
-        if m:
-            i += m.end()
-            continue
-        ch = text[i]
+    for i, ch in enumerate(text):
         if ch.isspace():
-            if clean_chars and clean_chars[-1] != " ":
-                clean_chars.append(" ")
-                mapping.append(i)
-            i += 1
             continue
-        clean_chars.append(ch)
-        mapping.append(i)
-        i += 1
-    # Strip leading/trailing spaces, keeping mapping in sync.
-    while clean_chars and clean_chars[0] == " ":
-        clean_chars.pop(0)
-        mapping.pop(0)
-    while clean_chars and clean_chars[-1] == " ":
-        clean_chars.pop()
-        mapping.pop()
+        decomposed = unicodedata.normalize("NFKD", ch)
+        for dc in decomposed:
+            if unicodedata.combining(dc):
+                continue
+            clean_chars.append(dc.lower())
+            mapping.append(i)
     return "".join(clean_chars), mapping
 
 
 def lock_global_offsets(texto_completo: str, uces: list) -> None:
-    # Align against a label-stripped, whitespace-normalized copy of the full
-    # text. The UCE text is derived from the same label-stripped segments, so
-    # it is contiguous in the clean text; the raw text has [Speaker N] labels
-    # interspersed, which made the old fuzzy end-position over-shoot the cursor
-    # (spurious later matches for common words) and cascade into DESYNC.
+    """Assign global char offsets to each UCE by aligning its text against the
+    full transcript.
+
+    The old implementation advanced a forward-only cursor assuming UCEs form a
+    contiguous partition of the text. That assumption breaks when:
+      · segments overlap (a full paragraph followed by its sub-segments),
+      · the LLM inserted/removed spaces after punctuation, or
+      · the LLM changed accents/words.
+    The cursor then over-shot and cascaded into DESYNC for every later UCE.
+
+    New approach: aggressively normalize both sides (strip speaker labels with
+    and without colon, strip accents, remove ALL whitespace, lowercase) and
+    search a backward-tolerant window for each UCE independently. Overlaps are
+    tolerated (offsets may overlap), and a fuzzy SequenceMatcher fallback
+    handles residual word-level edits.
+    """
     clean_text, mapping = _build_clean_mapping(texto_completo)
     if not clean_text:
         return
 
-    cursor = 0  # cursor in clean text
+    n_clean = len(clean_text)
+    prev_end = 0  # clean-text position where the previous UCE ended
+    prev_start = 0  # original char index where the previous UCE started
+    # Backward tolerance (clean-text chars) to tolerate overlapping segments
+    # (a full paragraph followed by its sub-segments).
+    BACKWARD_TOLERANCE = 5000
+
     for uce in uces:
         if not uce.texto.strip():
             continue
-
         clean_uce = _normalize_for_alignment(uce.texto)
         if not clean_uce:
             continue
 
-        # Cascade of attempts: tighter → looser window and block size
-        attempts = [
-            (max(500, len(clean_uce) * 3), 4),  # tight: original behavior
-            (max(1000, len(clean_uce) * 6), 3),  # wider window, smaller block
-            (max(2000, len(clean_uce) * 10), 2),  # very wide, minimal block
-        ]
+        # 1. Exact match near the expected position (tolerating overlaps).
+        search_from = max(0, prev_end - BACKWARD_TOLERANCE)
+        pos = clean_text.find(clean_uce, search_from)
 
-        aligned = False
-        for window_size, min_block in attempts:
-            chunk = clean_text[cursor : cursor + window_size]
-            matcher = SequenceMatcher(None, chunk.lower(), clean_uce.lower())
-            valid_blocks = [
-                b for b in matcher.get_matching_blocks() if b.size >= min_block
-            ]
+        # 2. If not found nearby, search strictly forward from prev_end.
+        #    (The old code fell back to find(..., 0), which let a UCE match a
+        #    repeated phrase far earlier in the document → non-monotonic
+        #    offsets → inverted coref windows → torch.cat() errors.)
+        if pos == -1:
+            pos = clean_text.find(clean_uce, prev_end)
 
-            if valid_blocks:
-                start_clean = cursor + valid_blocks[0].a
-                # The UCE text is contiguous in the clean text, so the end is
-                # start + length (NOT the last matching block, which can be a
-                # spurious match far ahead and over-shoot the cursor).
-                end_clean = min(start_clean + len(clean_uce), len(clean_text))
-                uce.start_char = mapping[start_clean]
+        if pos != -1:
+            start_clean = pos
+            end_clean = pos + len(clean_uce)
+            start_char = mapping[start_clean]
+            # 3. Monotonicity guard: a later UCE must never start before the
+            #    previous one. If the match is a repeated phrase that landed
+            #    earlier, force a forward search.
+            if start_char < prev_start:
+                pos = clean_text.find(clean_uce, prev_end)
+                if pos != -1:
+                    start_clean = pos
+                    end_clean = pos + len(clean_uce)
+                    start_char = mapping[start_clean]
+
+            if start_char >= prev_start:
+                uce.start_char = start_char
                 uce.end_char = mapping[end_clean - 1] + 1
-                cursor = end_clean
-                aligned = True
-                break
+                prev_start = start_char
+                prev_end = end_clean
+                continue
+
+        # 4. Fuzzy fallback (word-level edits the LLM introduced), searching
+        #    strictly forward to preserve monotonicity.
+        aligned = False
+        for window_size, min_block in [
+            (max(500, len(clean_uce) * 3), 4),
+            (max(1000, len(clean_uce) * 6), 3),
+            (max(2000, len(clean_uce) * 10), 2),
+        ]:
+            chunk = clean_text[prev_end : prev_end + window_size]
+            matcher = SequenceMatcher(None, chunk, clean_uce)
+            blocks = [b for b in matcher.get_matching_blocks() if b.size >= min_block]
+            if blocks:
+                start_clean = prev_end + blocks[0].a
+                end_clean = min(start_clean + len(clean_uce), n_clean)
+                start_char = mapping[start_clean]
+                if start_char >= prev_start:
+                    uce.start_char = start_char
+                    uce.end_char = mapping[end_clean - 1] + 1
+                    prev_start = start_char
+                    prev_end = end_clean
+                    aligned = True
+                    break
 
         if not aligned:
             logger.error(
-                "DESYNC: alignment failed for UCE %s after %d attempts. "
-                "Cursor=%d, UCE length=%d. Falling back to cursor position.",
+                "DESYNC: alignment failed for UCE %s. Falling back to cursor position.",
                 uce.id,
-                len(attempts),
-                cursor,
-                len(uce.texto),
             )
-            # Log the first 80 chars of both sides to help diagnose
             logger.debug(
-                "  clean_text[cursor:cursor+200] = %r",
-                clean_text[cursor : cursor + 200],
+                "  clean_text[prev_end:prev_end+200] = %r",
+                clean_text[prev_end : prev_end + 200],
             )
             logger.debug("  uce.texto[:80] = %r", uce.texto[:80])
             uce.start_char = (
-                mapping[cursor] if cursor < len(mapping) else len(texto_completo)
+                mapping[prev_end] if prev_end < len(mapping) else len(texto_completo)
             )
             uce.end_char = uce.start_char + len(uce.texto)
-            cursor = min(cursor + len(clean_uce), len(clean_text))
+            prev_start = uce.start_char
+            prev_end = min(prev_end + len(clean_uce), n_clean)
+
+
+def _assign_cumulative_offsets(uces: list) -> None:
+    """Assign monotonic char offsets by cumulative length (no alignment).
+
+    Used when the raw transcript (.txt) diverges from the LLM-processed
+    segments (reordering, edits, added content), which makes
+    ``lock_global_offsets`` fail and produce stuck offsets (DESYNC).
+    """
+    cursor = 0
+    for uce in uces:
+        uce.start_char = cursor
+        uce.end_char = cursor + len(uce.texto)
+        cursor = uce.end_char + 1  # +1 for the joining space
 
 
 @Language.component("fix_colloquial_npi_deps")
@@ -763,6 +814,10 @@ class CoreferenceResolver:
 
         window_start = self._buffer[0][0]
         window_end = self._buffer[-1][1]
+        if window_start >= window_end:
+            # Inverted window (offsets desynced). Skip rather than feed Stanza
+            # an empty slice, which raises torch.cat() errors.
+            return
         window_text = full_doc_text[window_start:window_end]
 
         try:
@@ -2868,12 +2923,22 @@ class SubordinationClassifier:
             }
 
         # 3. Caso ambiguo o no cubierto: usar clasificador de adverbios
-        if conj_text in AMBIGUOUS_SUBORDINATORS and self.adverb_clf is not None:
+        if (
+            conj_text in AMBIGUOUS_SUBORDINATORS
+            and self.adverb_clf is not None
+            and self.embedder is not None
+        ):
             # Obtener la oración completa donde está el verbo
             sent = verb_token.sent.text
-            # Usamos el clasificador de adverbios para ver si la palabra se comporta como subordinante
-            # (podríamos entrenar un clasificador específico, pero reutilizamos el de adverbios)
-            cat, conf, _ = self.adverb_clf.classify(sent, target=conj_text)
+            # El clasificador de adverbios es un LogisticRegression crudo de
+            # sklearn: NO tiene .classify() ni .confidence_threshold. Usamos
+            # el helper classify_adverb() (predict_proba + classes_).
+            cat, conf, is_confident, _ = classify_adverb(
+                self.embedder,
+                self.adverb_clf,
+                sent,
+                target_adverb=conj_text,
+            )
             # Si la categoría es 'conjuntivo' o 'tiempo' o similar, podría ser subordinante
             # Mapeo de categorías de adverbio a tipo de subordinación
             mapping = {
@@ -2882,7 +2947,7 @@ class SubordinationClassifier:
                 "modo": ("adverbial", "modal"),
                 "conjuntivo": ("adverbial", "otra"),
             }
-            if cat in mapping and conf >= self.adverb_clf.confidence_threshold:
+            if cat in mapping and is_confident:
                 tipo, subtipo = mapping[cat]
                 return {
                     "tipo_subordinacion": tipo,
@@ -5531,15 +5596,14 @@ class PipelineGramatical:
             full_text = doc_data.get("texto_completo_txt", "")
             metadata = doc_data.get("metadata", {})
 
-            if not full_text:
-                print(
-                    f"WARNING: No full text for doc {origen_key}. Reconstructing from UCE segments..."
-                )
-                # Glue the segments together yourself
-                full_text = " ".join([u.texto for u in doc_uces])
-
-            if full_text:
-                lock_global_offsets(full_text, doc_uces)
+            # Reconstruct the full text from the UCEs themselves. The raw
+            # .txt transcript can diverge from the LLM-processed segments
+            # (reordering, edits, added content), which makes
+            # lock_global_offsets fail and produce stuck offsets (DESYNC).
+            # Reconstructing guarantees monotonic, correct offsets for the
+            # coref resolution.
+            full_text = " ".join([u.texto for u in doc_uces])
+            _assign_cumulative_offsets(doc_uces)
 
             # ──────────────────────────────────────────────────────────────
             # 1. Coreference resolution using the new slice‑based method

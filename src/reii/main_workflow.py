@@ -184,7 +184,9 @@ def obtener_llave_maestra(nombre):
 
 
 # 0. Cargamos tu metadata usando la llave maestra
-metadata_csv = os.path.join(REII_DATA_DIR, "Refined_Database.csv")
+# batch_processor.exportar_para_workflow() escribe Refined_Database.csv en
+# data/txt_outputs/ (no en data/).
+metadata_csv = os.path.join(REII_DATA_DIR, "txt_outputs", "Refined_Database.csv")
 df_meta = (
     pd.read_csv(metadata_csv, sep=";")
     if os.path.exists(metadata_csv)
@@ -314,7 +316,7 @@ def _corpus_fingerprint() -> str:
         glob.glob(os.path.join(REII_DATA_DIR, "txt_outputs", "tmp", "*.json"))
     )
     _paths += sorted(glob.glob(os.path.join(REII_DATA_DIR, "txt_outputs", "*.txt")))
-    _meta = os.path.join(REII_DATA_DIR, "Refined_Database.csv")
+    _meta = os.path.join(REII_DATA_DIR, "txt_outputs", "Refined_Database.csv")
     if os.path.exists(_meta):
         _paths.append(_meta)
     for _p in _paths:
@@ -5724,7 +5726,10 @@ class NetworkAnalyzer:
     def build_cooccurrence_graph(self, voc: List[str], matriz: np.ndarray):
         if not _NETWORKX_AVAILABLE:
             return None, {}
-        bin_mat = matriz > 0
+        # Cast to int BEFORE matmul: a boolean matmul yields True/False
+        # co-occurrence counts, so `cij < thr` skips every pair and the
+        # network ends up empty.
+        bin_mat = (matriz > 0).astype(int)
         N, n_t = bin_mat.shape[0], len(voc)
         cooc = bin_mat.T @ bin_mat
         np.fill_diagonal(cooc, 0)
@@ -7249,6 +7254,13 @@ class WorkflowOrchestrator:
             voc_uc = voc_p1
             uces_por_doc = uces_por_doc_p1
             resultados_por_umbral = resultados_p1
+
+        # ── Persist UCs ───────────────────────────────────────────────────────
+        # Las UCs se construyen dentro de double_clf.run() pero nunca se
+        # serializaban → la tabla `ucs` quedaba vacía (ucs=0). Guardamos las
+        # UCs del resultado primario (word-count tight en wc_only).
+        if resultados_por_umbral and resultados_por_umbral[0].get("ucs"):
+            self.db.save_ucs(resultados_por_umbral[0]["ucs"])
 
         self._enrich_uces_with_doc_metadata(uces_por_doc, doc_metadata_map)
         self.db.data["section_registry"] = getattr(

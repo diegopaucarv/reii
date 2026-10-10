@@ -39,6 +39,9 @@ services:
       - REII_LLM_TIMEOUT=${REII_LLM_TIMEOUT:-300}
       - HF_TOKEN=${HF_TOKEN:-}
     restart: unless-stopped
+    depends_on:
+      reii-db:
+        condition: service_healthy
     command: >
       streamlit run src/reii/dashboard.py
       --server.address=0.0.0.0
@@ -85,6 +88,9 @@ services:
       - REII_USE_GENSIM_EMBEDDINGS=false
       - HF_TOKEN=${HF_TOKEN:-}
     profiles: ["batch"]
+    depends_on:
+      reii-db:
+        condition: service_healthy
     command: python src/reii/main_workflow.py
 
   reii-db:
@@ -98,6 +104,11 @@ services:
       - POSTGRES_DB=reii
     volumes:
       - reii_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reii -d reii"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     restart: unless-stopped
 
 volumes:
