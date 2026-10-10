@@ -1,14 +1,14 @@
 """
-Migración JSON → SQLite.
+Migración JSON → PostgreSQL.
 
 Diseño:
-  · Idempotente: INSERT OR REPLACE sobre PKs.
+  · Idempotente: INSERT ... ON CONFLICT DO UPDATE sobre PKs.
   · Transaccional: cada tabla va en su propia transacción.
   · No destructivo: nunca toca el JSON de entrada.
   · Reporta counts antes/después y aborta si no cuadran.
 
 Uso:
-    python -m reii.backend.migrate --json data/workflow_data.json --db data/workflow.db
+    python -m reii.backend.migrate --json data/workflow_data.json --db postgresql://reii:reii@reii-db:5432/reii
     python -m reii.backend.migrate --json ... --db ... --dry-run
 """
 
@@ -43,14 +43,36 @@ def _json_or_empty(x: Any) -> str:
         return "{}"
 
 
-def _safe_str(x: Any) -> str:
+def _doc_id_of(item: Dict) -> Any:
+    """Derive the doc_id for a UC/UCE dict.
+
+    The ``UC`` dataclass has no top-level ``doc_id`` field; the numeric doc id
+    lives in ``metadata`` under ``doc_idx`` (or ``indice_orden``). The ``UCE``
+    dataclass carries it at top level, but older records may only have it
+    inside ``metadata``. Try all locations, preserving 0 as valid and
+    treating None/"" as missing.
     """
-    str() sin la trampa de `or`: 0 y False son valores válidos,
-    solo None y el string vacío colapsan a "".
-    """
-    if x is None:
-        return ""
-    return str(x)
+    v = item.get("doc_id")
+    if (
+        v is not None
+        and v != ""
+        and isinstance(v, (str, int, float))
+        and not isinstance(v, bool)
+    ):
+        return v
+    meta = item.get("metadata") or {}
+    if not isinstance(meta, dict):
+        return None
+    for key in ("doc_id", "doc_idx", "indice_orden"):
+        v = meta.get(key)
+        if (
+            v is not None
+            and v != ""
+            and isinstance(v, (str, int, float))
+            and not isinstance(v, bool)
+        ):
+            return v
+    return None
 
 
 def _json_or_list(x: Any) -> str:
@@ -91,22 +113,28 @@ def migrate_documents(
     all_ids: Dict[str, Dict] = {}
     for did, meta in doc_meta.items():
         all_ids[str(did)] = {"metadata": meta or {}, "texto": doc_texto.get(str(did))}
+
+    # doc_id de cada UCE: top-level o metadata (doc_idx/indice_orden).
+    # UCEs sin doc_id derivable se ignoran (no crear un doc "None").
+    _uce_docs = []
     for u in uces:
-        did = str(u.get("doc_id"))
+        _raw = _doc_id_of(u)
+        if _raw is not None:
+            _uce_docs.append((str(_raw), u))
+
+    for did, _u in _uce_docs:
         if did not in all_ids:
             all_ids[did] = {"metadata": {}, "texto": None}
 
     # doc_idx / orden del primer UCE de cada doc
-    for u in uces:
-        did = str(u.get("doc_id"))
-        if did in all_ids and "doc_idx" not in all_ids[did]:
+    for did, u in _uce_docs:
+        if "doc_idx" not in all_ids[did]:
             all_ids[did]["doc_idx"] = u.get("metadata", {}).get("doc_idx")
             all_ids[did]["orden"] = u.get("metadata", {}).get("indice_orden")
             all_ids[did]["origen"] = u.get("metadata", {}).get("origen")
 
     n_uces_per_doc: Dict[str, int] = {}
-    for u in uces:
-        did = str(u.get("doc_id"))
+    for did, _u in _uce_docs:
         n_uces_per_doc[did] = n_uces_per_doc.get(did, 0) + 1
 
     if dry_run:
@@ -214,9 +242,7 @@ def migrate_uces(conn: psycopg.Connection, data: Dict, dry_run: bool = False) ->
         # en este run; los docs no reprocesados conservan sus UCEs.
         _doc_ids = set()
         for u in uces:
-            _raw = u.get("doc_id")
-            if _raw is None:
-                _raw = (u.get("metadata") or {}).get("doc_idx")
+            _raw = _doc_id_of(u)
             if _raw is not None:
                 _doc_ids.add(str(_raw))
         for _did in sorted(_doc_ids):
@@ -228,11 +254,13 @@ def migrate_uces(conn: psycopg.Connection, data: Dict, dry_run: bool = False) ->
                 continue
 
             # OJO: doc_id puede ser 0 (int), y `0 or ""` devuelve "".
-            # Hay que comprobar None explícitamente.
-            _raw_doc_id = u.get("doc_id")
+            # _doc_id_of preserva 0 y devuelve None solo si no hay doc_id
+            # en ningún sitio; en ese caso la UCE no se puede ubicar y se omite.
+            _raw_doc_id = _doc_id_of(u)
             if _raw_doc_id is None:
-                _raw_doc_id = (u.get("metadata") or {}).get("doc_idx")
-            doc_id = str(_raw_doc_id) if _raw_doc_id is not None else ""
+                logger.warning("UCE %s sin doc_id; se omite", uce_id)
+                continue
+            doc_id = str(_raw_doc_id)
 
             linguistic = {k: u[k] for k in LINGUISTIC_KEYS if k in u}
             metrics = {k: u[k] for k in METRIC_KEYS if k in u}
@@ -295,9 +323,18 @@ def migrate_ucs(conn: psycopg.Connection, data: Dict, dry_run: bool = False) -> 
         return len(ucs)
 
     with transaction(conn):
+        # ── Anti-acumulación ──────────────────────────────────────────────
+        # ucs se deriva íntegramente del JSON actual. Sin DELETE, los runs
+        # anteriores acumulan filas (INSERT ... ON CONFLICT DO UPDATE nunca
+        # borra). Reconstrucción total, igual que clusters/terms.
+        conn.execute("DELETE FROM ucs")
         for uc in ucs:
             uc_id = str(uc.get("id") or "")
             if not uc_id:
+                continue
+            _raw_doc_id = _doc_id_of(uc)
+            if _raw_doc_id is None:
+                logger.warning("UC %s sin doc_id; se omite", uc_id)
                 continue
             lemmas = uc.get("lemmas") or []
             conn.execute(
@@ -313,11 +350,7 @@ def migrate_ucs(conn: psycopg.Connection, data: Dict, dry_run: bool = False) -> 
                 """,
                 (
                     uc_id,
-                    _safe_str(
-                        uc.get("doc_id")
-                        if uc.get("doc_id") is not None
-                        else uc.get("metadata", {}).get("doc_id")
-                    ),
+                    str(_raw_doc_id),
                     uc.get("texto") or "",
                     uc.get("cluster_id"),
                     _json_or_list(uc.get("uce_ids")),
@@ -489,9 +522,23 @@ def migrate_annotations(
         logger.info("[dry-run] annotations: %d filas", len(flat))
         return len(flat)
 
+    # Solo anotamos UCEs que existen en el run actual. Las anotaciones de
+    # discourse_state.json usan un esquema de ids distinto (doc_idx_uce_idx)
+    # y romperían la FK annotations.uce_id -> uces.uce_id.
+    valid_uce_ids = {
+        str(u.get("id") or u.get("uce_id") or "")
+        for u in (data.get("uces") or [])
+        if (u.get("id") or u.get("uce_id")) and _doc_id_of(u) is not None
+    }
+
     with transaction(conn):
         conn.execute("DELETE FROM annotations")  # reconstrucción total
         for a in flat:
+            if a["uce_id"] not in valid_uce_ids:
+                logger.warning(
+                    "Anotación con uce_id %s desconocido; se omite", a["uce_id"]
+                )
+                continue
             conn.execute(
                 """
                 INSERT INTO annotations
@@ -528,7 +575,14 @@ def migrate_network(conn: psycopg.Connection, data: Dict, dry_run: bool = False)
     net = data.get("network") or {}
     edges = net.get("edges") if isinstance(net, dict) else net
     if not edges:
-        logger.info("network_edges: no hay datos en el JSON")
+        # Reconstrucción total: si el JSON no trae aristas, la tabla debe
+        # quedar vacía (no conservar aristas de runs anteriores).
+        if not dry_run:
+            with transaction(conn):
+                conn.execute("DELETE FROM network_edges")
+            logger.info("network_edges: no hay datos en el JSON; tabla vaciada")
+        else:
+            logger.info("[dry-run] network_edges: 0 filas")
         return 0
 
     norm: List[tuple] = []
@@ -587,11 +641,12 @@ def migrate_network(conn: psycopg.Connection, data: Dict, dry_run: bool = False)
 
     with transaction(conn):
         conn.execute("DELETE FROM network_edges")
-        conn.executemany(
-            "INSERT INTO network_edges (src, dst, weight) VALUES (%s, %s, %s) "
-            "ON CONFLICT (src, dst) DO UPDATE SET weight = EXCLUDED.weight",
-            norm,
-        )
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO network_edges (src, dst, weight) VALUES (%s, %s, %s) "
+                "ON CONFLICT (src, dst) DO UPDATE SET weight = EXCLUDED.weight",
+                norm,
+            )
     logger.info("network_edges: %d filas", len(norm))
     return len(norm)
 

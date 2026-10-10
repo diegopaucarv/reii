@@ -300,8 +300,12 @@ def _assign_cumulative_offsets(uces: list) -> None:
     """
     cursor = 0
     for uce in uces:
+        # Defensive: a UCE with empty/None texto must not break the cumulative
+        # sum. An empty UCE gets start == end (zero-width), which the coref
+        # windowing already skips (window_start >= window_end).
+        texto = uce.texto or ""
         uce.start_char = cursor
-        uce.end_char = cursor + len(uce.texto)
+        uce.end_char = cursor + len(texto)
         cursor = uce.end_char + 1  # +1 for the joining space
 
 
@@ -819,71 +823,81 @@ class CoreferenceResolver:
             # an empty slice, which raises torch.cat() errors.
             return
         window_text = full_doc_text[window_start:window_end]
+        if not window_text.strip():
+            # Whitespace-only window: nothing for Stanza to resolve. Feeding it
+            # would make the coref model receive an empty document and raise
+            # ``torch.cat(): expected a non-empty list of Tensors``.
+            return
 
+        # The whole per-window processing lives inside the try/except: a
+        # degenerate input (e.g. a window that tokenizes to zero sentences) can
+        # make Stanza's coref model raise inside ``doc.coref`` too, not only in
+        # ``self.nlp(window_text)``. Catching it here degrades gracefully (the
+        # window's chains are dropped) instead of aborting the whole document.
         try:
             doc = self.nlp(window_text)
+
+            window_mapper = OffsetMapper(window_start)
+            new_chains = []
+
+            for chain in doc.coref:
+                mentions = []
+                for mention in chain.mentions:
+                    # --- 1. Defensively extract integer for sentence index ---
+                    s_idx = mention.sentence
+                    if isinstance(s_idx, (tuple, list)):
+                        s_idx = s_idx[0]
+                    sent = doc.sentences[s_idx]
+
+                    # --- 2. Defensively extract integers for word indices ---
+                    sw_idx = mention.start_word
+                    if isinstance(sw_idx, (tuple, list)):
+                        sw_idx = sw_idx[0]
+
+                    ew_idx = mention.end_word
+                    if isinstance(ew_idx, (tuple, list)):
+                        ew_idx = ew_idx[-1]
+
+                    # --- 3. Locate words and extract character offsets ---
+                    first_word = sent.words[sw_idx]
+                    last_word = sent.words[ew_idx - 1]
+
+                    # Stanza MWT fix: fallback to the parent Token if the Word lacks offsets
+                    m_start_local = first_word.start_char
+                    if m_start_local is None and getattr(first_word, "parent", None):
+                        m_start_local = first_word.parent.start_char
+
+                    m_end_local = last_word.end_char
+                    if m_end_local is None and getattr(last_word, "parent", None):
+                        m_end_local = last_word.parent.end_char
+
+                    # Final defensive net: if it's somehow STILL None, skip to avoid crashing
+                    if m_start_local is None or m_end_local is None:
+                        continue
+
+                    m_start_global, m_end_global = window_mapper.to_global(
+                        m_start_local, m_end_local
+                    )
+
+                    mentions.append(
+                        {
+                            "text": window_text[m_start_local:m_end_local],
+                            "start_char": m_start_global,
+                            "end_char": m_end_global,
+                        }
+                    )
+                if mentions:
+                    new_chains.append(
+                        {
+                            "representative": chain.representative_text,
+                            "mentions": mentions,
+                        }
+                    )
+
+            self._merge_chains(new_chains)
         except Exception as e:
             print(f"Stanza error on window [{window_start}:{window_end}]: {e}")
             return
-
-        window_mapper = OffsetMapper(window_start)
-        new_chains = []
-
-        for chain in doc.coref:
-            mentions = []
-            for mention in chain.mentions:
-                # --- 1. Defensively extract integer for sentence index ---
-                s_idx = mention.sentence
-                if isinstance(s_idx, (tuple, list)):
-                    s_idx = s_idx[0]
-                sent = doc.sentences[s_idx]
-
-                # --- 2. Defensively extract integers for word indices ---
-                sw_idx = mention.start_word
-                if isinstance(sw_idx, (tuple, list)):
-                    sw_idx = sw_idx[0]
-
-                ew_idx = mention.end_word
-                if isinstance(ew_idx, (tuple, list)):
-                    ew_idx = ew_idx[-1]
-
-                # --- 3. Locate words and extract character offsets ---
-                first_word = sent.words[sw_idx]
-                last_word = sent.words[ew_idx - 1]
-
-                # Stanza MWT fix: fallback to the parent Token if the Word lacks offsets
-                m_start_local = first_word.start_char
-                if m_start_local is None and getattr(first_word, "parent", None):
-                    m_start_local = first_word.parent.start_char
-
-                m_end_local = last_word.end_char
-                if m_end_local is None and getattr(last_word, "parent", None):
-                    m_end_local = last_word.parent.end_char
-
-                # Final defensive net: if it's somehow STILL None, skip to avoid crashing
-                if m_start_local is None or m_end_local is None:
-                    continue
-
-                m_start_global, m_end_global = window_mapper.to_global(
-                    m_start_local, m_end_local
-                )
-
-                mentions.append(
-                    {
-                        "text": window_text[m_start_local:m_end_local],
-                        "start_char": m_start_global,
-                        "end_char": m_end_global,
-                    }
-                )
-            if mentions:
-                new_chains.append(
-                    {
-                        "representative": chain.representative_text,
-                        "mentions": mentions,
-                    }
-                )
-
-        self._merge_chains(new_chains)
 
     def _merge_chains(self, new_chains: List[Dict]) -> None:
         for new in new_chains:
@@ -2522,7 +2536,7 @@ class CorefPredicateAnalyzer:
         top_k_similar: int = 10,
         louvain_resolution: float = 1.0,
         paraphrase_top_k: int = 15,
-        embed_batch_size: int = 64,
+        embed_batch_size: int = 32,
     ):
         self.nlp = nlp
         self.we_analyzer = we_analyzer
@@ -2596,8 +2610,45 @@ class CorefPredicateAnalyzer:
         for f in expansions:
             span_index.add(f)
 
-        # Stamp provenance + sequential frame_idx
+        # Dedupe por UCE: la misma entidad + verbo (mismos offsets globales)
+        # es el mismo evento, aunque la resolución de coreferencia lo asigne
+        # a varias cadenas. Nos quedamos con la cadena más descriptiva
+        # (chain_representative más largo); empates → primera aparición.
+        # Determinista e idempotente.
         all_frames = span_index._frames
+        best_idx: Dict[Tuple, int] = {}
+        best_frame: Dict[Tuple, PredicateFrame] = {}
+        deduped: List[PredicateFrame] = []
+        for frame in all_frames:
+            key = (
+                frame.uce_id,
+                frame.entity_start_char,
+                frame.entity_end_char,
+                frame.verb_start_char,
+                frame.verb_end_char,
+                frame.is_expansion,
+            )
+            if key not in best_idx:
+                best_idx[key] = len(deduped)
+                best_frame[key] = frame
+                deduped.append(frame)
+            elif len(frame.chain_representative) > len(
+                best_frame[key].chain_representative
+            ):
+                deduped[best_idx[key]] = frame
+                best_frame[key] = frame
+        span_index._frames = deduped
+        all_frames = deduped
+
+        # Reconstruir los índices con los frames ya deduplicados
+        span_index.by_uce.clear()
+        span_index.by_chain.clear()
+        for frame in all_frames:
+            span_index.by_uce[frame.uce_id].append(frame)
+            if frame.chain_representative:
+                span_index.by_chain[frame.chain_representative].append(frame)
+
+        # Stamp provenance + sequential frame_idx
         for i, frame in enumerate(all_frames):
             frame.doc_id = doc_id
             frame.frame_idx = i
@@ -2618,6 +2669,10 @@ class CorefPredicateAnalyzer:
             len(expansions),
             len(self._pending_frames),
         )
+
+        # Liberar el índice de spans de este documento cuanto antes
+        del span_index
+        gc.collect()
 
     # ================================================================
     # PHASE B — called once after all documents
@@ -2688,6 +2743,9 @@ class CorefPredicateAnalyzer:
             top_k=self.paraphrase_top_k,
             score_function=st_util.dot_score,
         )
+        # Las embeddings ya no se necesitan tras el paraphrase mining
+        del embeddings
+        gc.collect()
 
         # En cluster_all(), antes de exact_groups
         frames_normalized = []
@@ -2730,6 +2788,7 @@ class CorefPredicateAnalyzer:
             if score >= self.similarity_threshold and i != j:
                 w = G[i][j]["weight"] if G.has_edge(i, j) else 0.0
                 G.add_edge(i, j, weight=max(w, score))
+        del paraphrases
 
         if G.number_of_edges() == 0:
             return [-1] * len(frames), {}
@@ -2827,50 +2886,63 @@ class CorefPredicateAnalyzer:
         unique_heads = list(
             {f.entity_head_lemma for f in base_frames if f.entity_head_lemma}
         )
-        q_vecs = np.array([self.we_analyzer.vector(h) for h in unique_heads])
+        # Procesar las cabezas por bloques para acotar la memoria de sim_matrix
+        # (bloque × n_nouns en vez de n_heads × n_nouns de una sola vez).
+        head_block_size = 256
         n_vecs = np.array([n["vector"] for n in all_nouns])
-        q_norms = np.linalg.norm(q_vecs, axis=1, keepdims=True) + 1e-8
         n_norms = np.linalg.norm(n_vecs, axis=1, keepdims=True) + 1e-8
-        sim_matrix = (q_vecs / q_norms) @ (n_vecs / n_norms).T
+        n_unit = n_vecs / n_norms
+        del n_vecs, n_norms
         head_set = set(h.lower() for h in unique_heads)
         expansions = []
-        for h_idx, head in enumerate(unique_heads):
-            sims = sim_matrix[h_idx]
-            k = min(self.top_k_similar, len(all_nouns))
-            top_idx = np.argpartition(sims, -k)[-k:]
-            for n_idx in top_idx:
-                if sims[n_idx] < self.similarity_threshold:
-                    continue
-                noun = all_nouns[n_idx]
-                if noun["lemma"] in head_set:
-                    continue
-                neg_flag = "NEG" if noun["grammar"].get("negacion") else ""
-                obj_lemma = noun["grammar"].get("obj_lemma", "")
-                voice = noun["grammar"].get("voz", "Act")
-                fingerprint = " ".join(
-                    x for x in [noun["verb_lemma"], obj_lemma, voice, neg_flag] if x
-                )
-                expansions.append(
-                    PredicateFrame(
-                        entity_text=noun["text"],
-                        entity_head_lemma=noun["lemma"],
-                        entity_start_char=noun["char_start"],
-                        entity_end_char=noun["char_end"],
-                        chain_representative="",
-                        verb_lemma=noun["verb_lemma"],
-                        verb_text=noun["verb_text"],
-                        verb_start_char=0,
-                        verb_end_char=0,
-                        voice=voice,
-                        tense=noun["grammar"].get("tiempo", ""),
-                        mood=noun["grammar"].get("modo", ""),
-                        negated=bool(noun["grammar"].get("negacion", False)),
-                        frame_fingerprint=fingerprint,
-                        uce_id=noun["uce_id"],
-                        is_expansion=True,
-                        original_entity=head,
-                    )
-                )
+        if unique_heads:
+            for start in range(0, len(unique_heads), head_block_size):
+                block = unique_heads[start : start + head_block_size]
+                q_block = np.array([self.we_analyzer.vector(h) for h in block])
+                q_block_norms = np.linalg.norm(q_block, axis=1, keepdims=True) + 1e-8
+                sim_block = (q_block / q_block_norms) @ n_unit.T
+                for local_idx, head in enumerate(block):
+                    sims = sim_block[local_idx]
+                    k = min(self.top_k_similar, len(all_nouns))
+                    top_idx = np.argpartition(sims, -k)[-k:]
+                    for n_idx in top_idx:
+                        if sims[n_idx] < self.similarity_threshold:
+                            continue
+                        noun = all_nouns[n_idx]
+                        if noun["lemma"] in head_set:
+                            continue
+                        neg_flag = "NEG" if noun["grammar"].get("negacion") else ""
+                        obj_lemma = noun["grammar"].get("obj_lemma", "")
+                        voice = noun["grammar"].get("voz", "Act")
+                        fingerprint = " ".join(
+                            x
+                            for x in [noun["verb_lemma"], obj_lemma, voice, neg_flag]
+                            if x
+                        )
+                        expansions.append(
+                            PredicateFrame(
+                                entity_text=noun["text"],
+                                entity_head_lemma=noun["lemma"],
+                                entity_start_char=noun["char_start"],
+                                entity_end_char=noun["char_end"],
+                                chain_representative="",
+                                verb_lemma=noun["verb_lemma"],
+                                verb_text=noun["verb_text"],
+                                verb_start_char=0,
+                                verb_end_char=0,
+                                voice=voice,
+                                tense=noun["grammar"].get("tiempo", ""),
+                                mood=noun["grammar"].get("modo", ""),
+                                negated=bool(noun["grammar"].get("negacion", False)),
+                                frame_fingerprint=fingerprint,
+                                uce_id=noun["uce_id"],
+                                is_expansion=True,
+                                original_entity=head,
+                            )
+                        )
+            # Liberar las matrices temporales del último bloque
+            del sim_block, q_block, q_block_norms, sims, n_unit
+            gc.collect()
         return expansions
 
 
@@ -5602,13 +5674,16 @@ class PipelineGramatical:
             # lock_global_offsets fail and produce stuck offsets (DESYNC).
             # Reconstructing guarantees monotonic, correct offsets for the
             # coref resolution.
-            full_text = " ".join([u.texto for u in doc_uces])
+            full_text = " ".join([(u.texto or "") for u in doc_uces])
             _assign_cumulative_offsets(doc_uces)
 
             # ──────────────────────────────────────────────────────────────
             # 1. Coreference resolution using the new slice‑based method
             # ──────────────────────────────────────────────────────────────
             all_chains = []
+            # Defined unconditionally so the per-doc cleanup below can del it
+            # even when coref is disabled (coref_resolver is None).
+            segments = []
             if self.coref_resolver:
                 # Prepare segments list: (text, global_start_char)
                 segments = [(uce.texto, uce.start_char) for uce in doc_uces]
@@ -5632,65 +5707,24 @@ class PipelineGramatical:
             # 3. Enrich each UCE in‑place (grammatical features)
             # ──────────────────────────────────────────────────────────────
             textos = [uce.texto for uce in doc_uces]
-            docs_nlp = list(self.nlp.pipe(textos, batch_size=32))
             prev_span = None
-            for uce, doc_spacy in zip(doc_uces, docs_nlp):
+            # Iterate the spaCy pipe generator directly (batch_size=32) so only
+            # one batch of Docs is alive at a time. Materializing the whole
+            # list (list(self.nlp.pipe(...))) held every Doc of the document in
+            # memory at once and contributed to the OOM on the 28-doc run.
+            #
+            # NOTE: _enriquecer_uce_desde_span() already performs the full
+            # enrichment (surprisals, negaciones, NER, pronombres, verbos,
+            # cuantificadores, adverbios, marcadores, insubordinaciones, NPI,
+            # métricas, registro). The inline re-extraction that used to follow
+            # it re-ran GLiNER NER and re-appended the same adverbs (duplicating
+            # them in the output) — removed here.
+            for uce, doc_spacy in zip(doc_uces, self.nlp.pipe(textos, batch_size=32)):
                 # Una UCE problemática no debe abortar el enriquecimiento del
                 # documento completo (ni del corpus): se registra y se sigue.
                 try:
                     span = doc_spacy[:]
-                    mapper = OffsetMapper(
-                        uce.start_char or 0
-                    )  # ← construct ONCE per UCE
                     self._enriquecer_uce_desde_span(uce, span, prev_span)
-                    uce.token_surprisals = self._calcular_token_surprisals(span, mapper)
-                    uce.negaciones = extraer_negaciones(span, mapper)
-                    uce.entidades = ner(
-                        span, gliner_model=self.gliner_model, offset_mapper=mapper
-                    )
-                    uce.pronombres = extraer_pronombres_y_prodrop(span, mapper)
-                    uce.verbos = extraer_verbos_enriquecido(
-                        span,
-                        deriver=self._morph_deriver,
-                        sub_clf=self.sub_clf,
-                        offset_mapper=mapper,
-                    )
-                    uce.cuantificadores = extraer_cuantificadores(
-                        span,
-                        self.we_analyzer,
-                        self.config.use_wordnet_quantifiers,
-                        self.marcadores_matcher,
-                        offset_mapper=mapper,
-                    )
-                    marcadores, densidad, _ = extraer_marcadores_discursivos(
-                        span,
-                        self.marcadores_matcher,
-                        self.surprisal_source,
-                        uce.texto,
-                        offset_mapper=mapper,
-                    )
-                    uce.marcadores_discursivos = marcadores
-
-                    for adv_m in extraer_adverbios_robusto(
-                        span, self.adverb_matcher, offset_mapper=mapper
-                    ):
-                        ctx = extraer_contexto_inteligente(doc_spacy, adv_m["root"])
-                        cat, conf = self._clasificar_adverbio_con_cache(
-                            ctx, adv_m["text"]
-                        )
-                        uce.adverbios.append(
-                            {
-                                "texto": adv_m["text"],
-                                "categoria": cat,
-                                "confianza": conf,
-                                "es_multipalabra": adv_m["is_multiword"],
-                                "char_start": adv_m[
-                                    "char_start"
-                                ],  # already global from extractor
-                                "char_end": adv_m["char_end"],
-                            }
-                        )
-
                     prev_span = span
                 except Exception as e:
                     logger.warning(
@@ -5737,8 +5771,11 @@ class PipelineGramatical:
             if lex_analyzer is not None:
                 lex_analyzer.add_document(record)
 
-            # Clean up
-            del docs_nlp
+            # Clean up per-document transient structures so memory does not
+            # accumulate across documents (OOM on the 28-doc run).
+            del textos, full_text, segments, all_chains
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             gc.collect()
 
     # ------------------------------------------------------------------
@@ -6212,7 +6249,7 @@ class PipelineGramatical:
         if self.coref_resolver:
             all_chains = self.coref_resolver.resolve(
                 texto_normalizado,
-                segmentos_txt=[(s.text, s.start_char) for s in segmentos],
+                segments=[(s.text, s.start_char) for s in segmentos],
             )
         logger.info("doc='%s' → %d cadenas coref", doc_id, len(all_chains))
 

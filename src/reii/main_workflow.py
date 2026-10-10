@@ -1214,8 +1214,56 @@ class Database:
             "shap_analysis": {},
         }
 
+    # ── Guarda anti-borrado accidental ───────────────────────────────────
+    def _guard_against_ucs_network_wipe(self) -> None:
+        """Evita que un _save() borre ucs/network_edges en PostgreSQL.
+
+        Si el buffer en memoria (JSON) tiene 0 ucs (o red vacía) pero
+        PostgreSQL ya tiene filas, un _save() escribiría el JSON con 0 ucs y
+        migrate_network haría DELETE FROM network_edges → borrado accidental.
+        Esto ocurre típicamente con --skip-classify sobre un JSON que ya
+        perdió sus ucs. Lanzamos RuntimeError antes de escribir nada; el
+        usuario debe re-ejecutar con clasificación o limpiar las tablas
+        explícitamente.
+        """
+        ucs_count = len(self.data.get("ucs", []) or [])
+        net = self.data.get("network") or {}
+        net_edges = len(net.get("edges", [])) if isinstance(net, dict) else 0
+        if ucs_count > 0 and net_edges > 0:
+            return
+        try:
+            from reii.backend.sql.db import connect
+
+            conn = connect(self.dsn)
+            try:
+                pg_ucs = conn.execute("SELECT count(*) AS count FROM ucs").fetchone()[
+                    "count"
+                ]
+                pg_edges = conn.execute(
+                    "SELECT count(*) AS count FROM network_edges"
+                ).fetchone()["count"]
+            finally:
+                conn.close()
+        except Exception:
+            # BD inaccesible: no bloqueamos el save; la migración
+            # reportará el error real.
+            return
+        problems = []
+        if ucs_count == 0 and pg_ucs > 0:
+            problems.append(f"ucs: JSON=0 pero PostgreSQL={pg_ucs}")
+        if net_edges == 0 and pg_edges > 0:
+            problems.append(f"network_edges: JSON=0 pero PostgreSQL={pg_edges}")
+        if problems:
+            raise RuntimeError(
+                "Refusing to save: posible borrado accidental de "
+                + "; ".join(problems)
+                + ". Re-ejecuta con clasificación (sin --skip-classify) o "
+                "limpia explícitamente las tablas antes de continuar."
+            )
+
     # ── Persistencia ──────────────────────────────────────────────────────
     def _save(self):
+        self._guard_against_ucs_network_wipe()
         if self.dual_write:
             self.data["doc_metadata"] = self.doc_metadata
             tmp = self.path + ".tmp"
@@ -1268,7 +1316,10 @@ class Database:
         self.data["uces"] = [u.to_dict() for u in uces]
 
     def save_ucs(self, ucs):
-        self._upsert("ucs", ucs)
+        # Reemplazo total (no upsert): save_ucs siempre recibe el set completo
+        # de UCs del run. El upsert dejaba UCs obsoletas en el JSON cuando la
+        # clasificación producía menos UCs que el run anterior.
+        self.data["ucs"] = [u.to_dict() for u in ucs]
 
     def save_terminos(self, df):
         self.data["terminos"] = df.to_dict(orient="records")
@@ -6104,9 +6155,19 @@ except ImportError:
 # (values=None) cae en el conjunto "below" del Parzen estimator
 # (_calculate_weights_below_for_multi_objective itera trial.values).
 # Devolver un punto estrictamente dominado en vez de TrialPruned evita
-# el crash y no contamina el frente de Pareto (peor ARI, peor coverage,
-# peor −K). Ver scripts/_repro_tpe_pruned.py.
-_SENTINEL_TRIAL = (-1.0, 0.0, -2.0)
+# el crash y no contamina el frente de Pareto.
+#
+# Valores FUERA de los rangos válidos para que el centinela sea
+# estrictamente dominado por CUALQUIER trial real, sin depender de los
+# gates: ARI ∈ [-1,1] → -2.0; coverage ∈ [0,1] → -1.0; −K ∈ [-8,-2]
+# (minimizar) → 0.0. Ningún trial válido puede igualarlo ni empeorarlo
+# en ningún objetivo. Ver scripts/_repro_tpe_pruned.py.
+_SENTINEL_TRIAL = (-2.0, -1.0, 0.0)
+
+
+def _is_sentinel(values) -> bool:
+    """True si `values` es el centinela de trial inválido."""
+    return tuple(values) == _SENTINEL_TRIAL
 
 
 class Optimizador:
@@ -6185,8 +6246,14 @@ class Optimizador:
             print("   [!] save_pareto_front: frente vacío, nada que guardar.")
             return
 
-        best_idx = self._select_preference(study)
-        best_trial = study.best_trials[best_idx]
+        # Excluir trials centinela (todos inválidos → nada que guardar)
+        best_trials = [t for t in study.best_trials if not _is_sentinel(t.values)]
+        if not best_trials:
+            print("   [!] save_pareto_front: sin trials válidos, nada que guardar.")
+            return
+
+        best_idx = self._select_preference(best_trials)
+        best_trial = best_trials[best_idx]
 
         payload = {
             # ── Compatibilidad con lector legacy ────────────────────────
@@ -6204,7 +6271,7 @@ class Optimizador:
                     "values": list(t.values),
                     "trial": int(t.number),
                 }
-                for t in study.best_trials
+                for t in best_trials
             ],
             "n_trials_total": len(study.trials),
             "n_trials_completed": sum(
@@ -6237,7 +6304,7 @@ class Optimizador:
             print(f"   [Optimizador] Loaded params from {path}: {params}")
         return params
 
-    def _select_preference(self, study: "optuna.Study") -> int:
+    def _select_preference(self, best_trials: List) -> int:
         """
         Elige el índice del trial del frente de Pareto que se aplicará
         al pipeline definitivo.
@@ -6247,7 +6314,7 @@ class Optimizador:
         knee          → punto más cercano al ideal normalizado (1, 1, 0)
         """
         pref = getattr(self.config_base, "optimize_preference", "max_ari")
-        best = study.best_trials
+        best = best_trials
         if not best:
             return 0
 
@@ -6458,6 +6525,32 @@ class Optimizador:
             return HyperbandPruner(min_resource=1, max_resource=n_trials)
         return NopPruner()
 
+    def _normalize_storage(self, storage: Optional[str], study_name: str):
+        """Remapea el storage sqlite a la carpeta de datos montada y aísla
+        el estudio por fingerprint del corpus.
+
+        - storage falsy → estudio en memoria (None, study_name).
+        - sqlite relativo (sqlite:///reii_optuna.db) → se reescribe dentro
+          de la carpeta de datos (montada en el contenedor; la misma de
+          best_params.json).
+        - El nombre del estudio se sella con el fingerprint del corpus para
+          que un cambio de dataset no reutilice trials viejos.
+        """
+        if not storage:
+            return None, study_name
+        if storage.startswith("sqlite:///"):
+            db_path = storage[len("sqlite:///") :]
+            # isabs() en Windows no reconoce rutas POSIX (/app/...);
+            # comprobamos también el prefijo '/' explícitamente.
+            if not (os.path.isabs(db_path) or db_path.startswith("/")):
+                data_dir = os.path.dirname(self.config_base.db_local_path)
+                db_path = os.path.join(data_dir, os.path.basename(db_path)).replace(
+                    "\\", "/"
+                )
+                storage = f"sqlite:///{db_path}"
+        study_name = f"{study_name}_{_corpus_fingerprint()}"
+        return storage, study_name
+
     def optimizar(self, n_trials: int = 200) -> Dict[str, Any]:
         if not _OPTUNA_AVAILABLE:
             print("   [!] optuna no instalado. Ejecuta: pip install optuna")
@@ -6479,14 +6572,38 @@ class Optimizador:
         storage = getattr(self.config_base, "optimize_storage", None)
         study_name = getattr(self.config_base, "optimize_study_name", "reii_search")
 
-        study = optuna.create_study(
-            study_name=study_name,
-            storage=storage,
-            load_if_exists=bool(storage),
-            sampler=sampler,
-            pruner=pruner,
-            directions=directions,
-        )
+        # ── Storage: el CWD del contenedor es /app (NO montado) ─────────
+        # sqlite:///reii_optuna.db se crearía en /app y se perdería al
+        # salir del contenedor; además load_if_exists=True cargaría trials
+        # stale o un DB corrupto. Remapeamos el DB a la carpeta de datos
+        # montada (la misma de best_params.json) y aislamos el estudio por
+        # fingerprint del corpus. Si el DB no es utilizable, caemos a
+        # estudio en memoria.
+        storage, study_name = self._normalize_storage(storage, study_name)
+
+        try:
+            study = optuna.create_study(
+                study_name=study_name,
+                storage=storage,
+                load_if_exists=bool(storage),
+                sampler=sampler,
+                pruner=pruner,
+                directions=directions,
+            )
+        except Exception as e:
+            logger.warning(
+                "Storage Optuna no utilizable (%s: %s). Usando estudio en memoria.",
+                type(e).__name__,
+                e,
+            )
+            study = optuna.create_study(
+                study_name=study_name,
+                storage=None,
+                load_if_exists=False,
+                sampler=sampler,
+                pruner=pruner,
+                directions=directions,
+            )
 
         print(f"\n=== Optuna · {n_trials} trials ===")
         print(f"   Sampler    : {self.config_base.optimize_sampler}")
@@ -6518,16 +6635,17 @@ class Optimizador:
             f"{n_pruned} pruned, {n_failed} failed"
         )
 
-        if not study.best_trials:
-            print("   [!] Sin soluciones válidas en el frente de Pareto.")
+        best_trials = [t for t in study.best_trials if not _is_sentinel(t.values)]
+        if not best_trials:
+            print("   [!] Sin soluciones válidas (todos los trials fueron centinela).")
             return {}
 
         # Persistir frente completo
         self.save_pareto_front(study)
 
         # Selección según preferencia
-        best_idx = self._select_preference(study)
-        best_trial = study.best_trials[best_idx]
+        best_idx = self._select_preference(best_trials)
+        best_trial = best_trials[best_idx]
 
         print(
             f"\n   >>> Pareto front: {len(study.best_trials)} soluciones no-dominadas"

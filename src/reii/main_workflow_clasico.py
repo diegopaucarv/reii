@@ -1036,7 +1036,9 @@ class ClasificadorDescendente:
         self._rng = np.random.default_rng(config.random_state)
         self._min_cluster_size: int = 5  # resolved in clasificar()
 
-    def clasificar(self, mat_sparse) -> Tuple[np.ndarray, CDHNode]:
+    def clasificar(
+        self, mat_sparse, uc_vectors: Optional[np.ndarray] = None
+    ) -> Tuple[np.ndarray, CDHNode]:
         self._leaf_counter = 0
         n_total = mat_sparse.shape[0]
 
@@ -1048,12 +1050,14 @@ class ClasificadorDescendente:
         )
 
         indices = np.arange(n_total)
-        arbol = self._partition(indices, mat_sparse, depth=0)
+        arbol = self._partition(indices, mat_sparse, depth=0, uc_vectors=uc_vectors)
         labels = np.full(n_total, -1, dtype=int)
         self._fill_labels(arbol, labels)
         return labels, arbol
 
-    def _primer_factor(self, sub_mat) -> np.ndarray:
+    def _primer_factor(
+        self, sub_mat, uc_vectors: Optional[np.ndarray] = None
+    ) -> np.ndarray:
         """
         Calcula las coordenadas del primer eje factorial mediante
         el algoritmo de promedios recíprocos (reciprocal averaging).
@@ -1137,6 +1141,7 @@ class ClasificadorDescendente:
         sub_mat,  # csr_matrix (n × m) — presencia/ausencia
         labels: np.ndarray,
         max_iter: int,
+        uc_vectors: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Mueve cada UC a la clase contraria si el Δχ² es positivo.
@@ -1296,6 +1301,7 @@ class ClasificadorDescendente:
         indices,
         mat_sparse,
         depth,
+        uc_vectors: Optional[np.ndarray] = None,
     ) -> CDHNode:
         n = len(indices)
         # Criterios de parada
@@ -1311,6 +1317,9 @@ class ClasificadorDescendente:
             node.label = self._next_leaf()
             return node
         sub_mat = mat_sparse[indices]
+
+        # Slice uc_vectors to this partition's rows — keeps indices aligned
+        sub_vecs = uc_vectors[indices] if uc_vectors is not None else None
 
         # 1. Primer factor
         coord = self._primer_factor(sub_mat, uc_vectors=sub_vecs)  # ← warm-start
@@ -1330,7 +1339,10 @@ class ClasificadorDescendente:
         # 4. Refinamiento por intercambio
         if self.config.swap_iterations > 0:
             labels = self._intercambio(
-                sub_mat, labels, max_iter=self.config.swap_iterations
+                sub_mat,
+                labels,
+                max_iter=self.config.swap_iterations,
+                uc_vectors=sub_vecs,
             )
 
         # Verificar que el intercambio no colapsó una clase
@@ -1349,8 +1361,8 @@ class ClasificadorDescendente:
         idx1 = indices[labels == 1]
 
         # 5. Recursión
-        child0 = self._partition(idx0, mat_sparse, depth + 1)
-        child1 = self._partition(idx1, mat_sparse, depth + 1)
+        child0 = self._partition(idx0, mat_sparse, depth + 1, uc_vectors=uc_vectors)
+        child1 = self._partition(idx1, mat_sparse, depth + 1, uc_vectors=uc_vectors)
 
         return CDHNode(
             depth=depth,
@@ -2982,9 +2994,71 @@ except ImportError:
     _OPTUNA_AVAILABLE = False
 
 import copy
+import hashlib
+import logging
 import time
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+# Centinela dominado para trials inválidos (gates duros). Optuna 3.6.2
+# (pin <4.0.0) crashea en TPE multi-objetivo cuando un trial PRUNED
+# (values=None) cae en el conjunto "below" del Parzen estimator
+# (_calculate_weights_below_for_multi_objective itera trial.values).
+# Devolver un punto estrictamente dominado en vez de TrialPruned evita
+# el crash y no contamina el frente de Pareto.
+#
+# Valores FUERA de los rangos válidos para que el centinela sea
+# estrictamente dominado por CUALQUIER trial real, sin depender de los
+# gates: ARI ∈ [-1,1] → -2.0; coverage ∈ [0,1] → -1.0; −K ∈ [-8,-2]
+# (minimizar) → 0.0. Ningún trial válido puede igualarlo ni empeorarlo
+# en ningún objetivo.
+_SENTINEL_TRIAL = (-2.0, -1.0, 0.0)
+
+
+def _is_sentinel(values) -> bool:
+    """True si `values` es el centinela de trial inválido."""
+    return tuple(values) == _SENTINEL_TRIAL
+
+
+def _corpus_fingerprint() -> str:
+    """Hash del corpus: nombres + mtime + tamaño de los archivos de entrada.
+
+    Idéntica a la de main_workflow.py para que un best_params.json sellado
+    por cualquiera de los dos workflows sea validado por el otro.
+    """
+    h = hashlib.sha256()
+    _paths: List[str] = []
+    _paths += sorted(
+        glob.glob(os.path.join(REII_DATA_DIR, "txt_outputs", "tmp", "*.json"))
+    )
+    _paths += sorted(glob.glob(os.path.join(REII_DATA_DIR, "txt_outputs", "*.txt")))
+    _meta = os.path.join(REII_DATA_DIR, "txt_outputs", "Refined_Database.csv")
+    if os.path.exists(_meta):
+        _paths.append(_meta)
+    for _p in _paths:
+        h.update(os.path.basename(_p).encode("utf-8"))
+        h.update(str(os.path.getmtime(_p)).encode("utf-8"))
+        h.update(str(os.path.getsize(_p)).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+class UCBuilderConfig:
+    """Hiperparámetros de construcción de UCs por cohesión.
+
+    Copia mínima de la definición de main_workflow.py para que el
+    Optimizador legacy (usado por el dashboard en modo classic) pueda
+    instanciarse sin NameError.
+    """
+
+    similarity_threshold: float = 0.45
+    coref_weight: float = 0.20
+    window_size: int = 3
+    min_drop: float = 0.05
+    section_hard_boundary: bool = True
+    min_gap: int = 2
 
 
 class Optimizador:
@@ -3063,8 +3137,14 @@ class Optimizador:
             print("   [!] save_pareto_front: frente vacío, nada que guardar.")
             return
 
-        best_idx = self._select_preference(study)
-        best_trial = study.best_trials[best_idx]
+        # Excluir trials centinela (todos inválidos → nada que guardar)
+        best_trials = [t for t in study.best_trials if not _is_sentinel(t.values)]
+        if not best_trials:
+            print("   [!] save_pareto_front: sin trials válidos, nada que guardar.")
+            return
+
+        best_idx = self._select_preference(best_trials)
+        best_trial = best_trials[best_idx]
 
         payload = {
             # ── Compatibilidad con lector legacy ────────────────────────
@@ -3082,7 +3162,7 @@ class Optimizador:
                     "values": list(t.values),
                     "trial": int(t.number),
                 }
-                for t in study.best_trials
+                for t in best_trials
             ],
             "n_trials_total": len(study.trials),
             "n_trials_completed": sum(
@@ -3093,6 +3173,7 @@ class Optimizador:
             ),
             "timestamp": datetime.now().isoformat(),
             "total_uces": self.total_uces,
+            "corpus_fingerprint": _corpus_fingerprint(),
         }
         path = self._best_params_path()
         with open(path, "w", encoding="utf-8") as f:
@@ -3114,7 +3195,7 @@ class Optimizador:
             print(f"   [Optimizador] Loaded params from {path}: {params}")
         return params
 
-    def _select_preference(self, study: "optuna.Study") -> int:
+    def _select_preference(self, best_trials: List) -> int:
         """
         Elige el índice del trial del frente de Pareto que se aplicará
         al pipeline definitivo.
@@ -3124,7 +3205,7 @@ class Optimizador:
         knee          → punto más cercano al ideal normalizado (1, 1, 0)
         """
         pref = getattr(self.config_base, "optimize_preference", "max_ari")
-        best = study.best_trials
+        best = best_trials
         if not best:
             return 0
 
@@ -3191,53 +3272,34 @@ class Optimizador:
     # Evaluación con caché (idéntica a la anterior)
     # ══════════════════════════════════════════════════════════════════════
     def _evaluacion_rapida(self, cfg: Config, uc_cfg: UCBuilderConfig = None):
-        uc_config_actual = uc_cfg or self.uc_config
-        uc_builder = UCBuilder(
-            self.we_analyzer, self.subtlex_analyzer, uc_config_actual, self.config_base
+        # El Optimizador legacy quedó incompleto tras el merge con
+        # main_workflow.py: referencia a UCBuilder/DoubleClassifier 3-arg que
+        # no existen en este archivo. El orquestador ya no lo instancia
+        # (degradación a config base); si algo lo llamara, falla claro.
+        raise NotImplementedError(
+            "Optimizador legacy no disponible: usa main_workflow.py (modo "
+            "transformer) para re-optimizar."
         )
-        uc_builder.vectorizer.clear_cache()  # evita contaminación entre trials
-        double_clf = DoubleClassifier(cfg, self.segmentador, uc_builder)
-
-        cache_ref = self.uces_por_doc
-        for doc_uces in cache_ref:
-            for uce in doc_uces:
-                uce.id = normalizar_id_uce(uce)
-
-        original_seg = self.segmentador.segmentar_en_uces
-        original_lem = self.segmentador.lematizar_uces
-        self.segmentador.segmentar_en_uces = lambda x: (
-            copy.deepcopy(cache_ref),
-            self.doc_metadata_map,
-        )
-        self.segmentador.lematizar_uces = lambda x: x
-
-        try:
-            resultados = double_clf.run(self.corpus_raw)
-        finally:
-            self.segmentador.segmentar_en_uces = original_seg
-            self.segmentador.lematizar_uces = original_lem
-
-        return resultados
 
     # ══════════════════════════════════════════════════════════════════════
     # Objetivo multi-objective
     # ══════════════════════════════════════════════════════════════════════
     def _evaluate_trial(self, trial: "optuna.Trial"):
         """
-        Devuelve la tupla (ARI, coverage, −K) o lanza TrialPruned.
+        Devuelve la tupla (ARI, coverage, −K) o un centinela dominado.
 
         Los gates duros (K fuera de [2,8], coverage < umbral, excepción
-        en la evaluación) se traducen a TrialPruned en vez de a un valor
-        centinela −1e6. Esto evita contaminar el frente de Pareto con
-        puntos artificiales y permite que el sampler aprenda de los
-        trials válidos sin sesgo.
+        en la evaluación) devuelven _SENTINEL_TRIAL en vez de lanzar
+        TrialPruned. Motivo: Optuna 3.6.2 (pin <4.0.0) crashea en TPE
+        multi-objetivo cuando un trial PRUNED (values=None) cae en el
+        conjunto "below" del Parzen estimator. El centinela es
+        estrictamente dominado por cualquier trial real (peor ARI, peor
+        coverage, peor −K), así que no contamina el frente de Pareto ni
+        el conjunto "below" del sampler.
 
-        Nota sobre pruning: reportamos coverage en step=0 justo antes
-        del cálculo de ARI. Como `_evaluacion_rapida` es monolítica, no
-        hay señal intermedia disponible sin refactorizar DoubleClassifier.
-        El MedianPruner por tanto solo descarta trials cuyo coverage ya
-        cayó por debajo del running median — el resto del ahorro viene
-        del gate duro de coverage y del gate de K.
+        Nota sobre pruning: al no lanzar TrialPruned, el MedianPruner
+        queda inerte; el filtrado real lo hacen los gates duros de
+        coverage y de K.
         """
         params = self._suggest(trial, self._search_space_cached)
 
@@ -3264,46 +3326,43 @@ class Optimizador:
             result = self._evaluacion_rapida(cfg, uc_cfg=uc_cfg)
         except Exception as e:
             logger.debug("Trial %d exception: %s", trial.number, e)
-            raise optuna.TrialPruned()
+            return _SENTINEL_TRIAL
 
         uces_list = result[0] if result else None
         if not uces_list:
-            raise optuna.TrialPruned()
+            return _SENTINEL_TRIAL
 
         labels_uces = np.array(
             [u.cluster_id for u in uces_list if u.cluster_id is not None]
         )
         if len(labels_uces) == 0:
-            raise optuna.TrialPruned()
+            return _SENTINEL_TRIAL
 
         n_clusters = int(len(np.unique(labels_uces)))
 
         # ── Gate duro: K fuera de rango útil ─────────────────────────────
         if n_clusters < 2 or n_clusters > 8:
-            raise optuna.TrialPruned()
+            return _SENTINEL_TRIAL
 
         coverage = len(uces_list) / max(1, self.total_uces)
         coverage_gate = float(getattr(self.config_base, "optimize_coverage_gate", 0.65))
 
         # ── Gate duro: coverage insuficiente (Recomendación A) ──────────
         if coverage < coverage_gate:
-            raise optuna.TrialPruned()
-
-        # ── Reporte intermedio antes del cálculo caro de ARI ────────────
-        trial.report(coverage, step=0)
-        if trial.should_prune():
-            raise optuna.TrialPruned()
+            return _SENTINEL_TRIAL
 
         # ── ARI: métrica headline, se calcula al final ───────────────────
+        # (trial.report/should_prune eliminados: Optuna 3.6.2 no soporta
+        # report en optimización multi-objetivo — NotImplementedError.)
         labels1_uce = result[5]
         labels2_uce = result[6]
         if labels1_uce is None or labels2_uce is None:
-            raise optuna.TrialPruned()
+            return _SENTINEL_TRIAL
 
         # Alinear longitudes antes de ARI (por seguridad)
         n = min(len(labels1_uce), len(labels2_uce))
         if n < 2:
-            raise optuna.TrialPruned()
+            return _SENTINEL_TRIAL
         ari = float(adjusted_rand_score(labels1_uce[:n], labels2_uce[:n]))
 
         return ari, float(coverage), -float(n_clusters)
@@ -3338,6 +3397,32 @@ class Optimizador:
             return HyperbandPruner(min_resource=1, max_resource=n_trials)
         return NopPruner()
 
+    def _normalize_storage(self, storage: Optional[str], study_name: str):
+        """Remapea el storage sqlite a la carpeta de datos montada y aísla
+        el estudio por fingerprint del corpus.
+
+        - storage falsy → estudio en memoria (None, study_name).
+        - sqlite relativo (sqlite:///reii_optuna.db) → se reescribe dentro
+          de la carpeta de datos (montada en el contenedor; la misma de
+          best_params.json).
+        - El nombre del estudio se sella con el fingerprint del corpus para
+          que un cambio de dataset no reutilice trials viejos.
+        """
+        if not storage:
+            return None, study_name
+        if storage.startswith("sqlite:///"):
+            db_path = storage[len("sqlite:///") :]
+            # isabs() en Windows no reconoce rutas POSIX (/app/...);
+            # comprobamos también el prefijo '/' explícitamente.
+            if not (os.path.isabs(db_path) or db_path.startswith("/")):
+                data_dir = os.path.dirname(self.config_base.db_local_path)
+                db_path = os.path.join(data_dir, os.path.basename(db_path)).replace(
+                    "\\", "/"
+                )
+                storage = f"sqlite:///{db_path}"
+        study_name = f"{study_name}_{_corpus_fingerprint()}"
+        return storage, study_name
+
     def optimizar(self, n_trials: int = 200) -> Dict[str, Any]:
         if not _OPTUNA_AVAILABLE:
             print("   [!] optuna no instalado. Ejecuta: pip install optuna")
@@ -3359,14 +3444,38 @@ class Optimizador:
         storage = getattr(self.config_base, "optimize_storage", None)
         study_name = getattr(self.config_base, "optimize_study_name", "reii_search")
 
-        study = optuna.create_study(
-            study_name=study_name,
-            storage=storage,
-            load_if_exists=bool(storage),
-            sampler=sampler,
-            pruner=pruner,
-            directions=directions,
-        )
+        # ── Storage: el CWD del contenedor es /app (NO montado) ─────────
+        # sqlite:///reii_optuna.db se crearía en /app y se perdería al
+        # salir del contenedor; además load_if_exists=True cargaría trials
+        # stale o un DB corrupto. Remapeamos el DB a la carpeta de datos
+        # montada (la misma de best_params.json) y aislamos el estudio por
+        # fingerprint del corpus. Si el DB no es utilizable, caemos a
+        # estudio en memoria.
+        storage, study_name = self._normalize_storage(storage, study_name)
+
+        try:
+            study = optuna.create_study(
+                study_name=study_name,
+                storage=storage,
+                load_if_exists=bool(storage),
+                sampler=sampler,
+                pruner=pruner,
+                directions=directions,
+            )
+        except Exception as e:
+            logger.warning(
+                "Storage Optuna no utilizable (%s: %s). Usando estudio en memoria.",
+                type(e).__name__,
+                e,
+            )
+            study = optuna.create_study(
+                study_name=study_name,
+                storage=None,
+                load_if_exists=False,
+                sampler=sampler,
+                pruner=pruner,
+                directions=directions,
+            )
 
         print(f"\n=== Optuna · {n_trials} trials ===")
         print(f"   Sampler    : {self.config_base.optimize_sampler}")
@@ -3398,16 +3507,17 @@ class Optimizador:
             f"{n_pruned} pruned, {n_failed} failed"
         )
 
-        if not study.best_trials:
-            print("   [!] Sin soluciones válidas en el frente de Pareto.")
+        best_trials = [t for t in study.best_trials if not _is_sentinel(t.values)]
+        if not best_trials:
+            print("   [!] Sin soluciones válidas (todos los trials fueron centinela).")
             return {}
 
         # Persistir frente completo
         self.save_pareto_front(study)
 
         # Selección según preferencia
-        best_idx = self._select_preference(study)
-        best_trial = study.best_trials[best_idx]
+        best_idx = self._select_preference(best_trials)
+        best_trial = best_trials[best_idx]
 
         print(
             f"\n   >>> Pareto front: {len(study.best_trials)} soluciones no-dominadas"
@@ -3451,6 +3561,7 @@ class WorkflowOrchestrator:
         self.meta_analyzer = MetaAnalyzer(config)
         self.synthesis = SynthesisGenerator(config)
         self.multivariate = MultivariateAnalyzer(config)
+        self.uc_config = UCBuilderConfig()
         self.network = NetworkAnalyzer(config)
         self.term_stability = TermStabilityAnalyzer(config)
         if _RF_SHAP_AVAILABLE:  # guard import availability
@@ -3977,24 +4088,23 @@ class WorkflowOrchestrator:
             )
 
         if best_params is None and self.config.optimize:
-            # Desactivar embeddings durante la optimización (coste)
-            self.config.use_embeddings = False
-
-            optimizador = Optimizador(
-                self.config,
-                self.uc_config,
-                corpus_raw,
-                self.we_analyzer,
-                self.subtlex_analyzer,
+            # El Optimizador legacy de este archivo quedó incompleto tras el
+            # merge con main_workflow.py (referencia a UCBuilder/we_analyzer/
+            # subtlex_analyzer que no existen aquí). En vez de crashear, se
+            # degrada a la config base y avisa. Usa main_workflow.py (modo
+            # transformer) si necesitas re-optimizar.
+            print(
+                "   [WARNING] Optimizador legacy no disponible en este archivo. "
+                "Usando config base (usa main_workflow.py para re-optimizar)."
             )
-            mejores_params = optimizador.optimizar(n_trials=self.config.optimize_trials)
+            mejores_params = None
             if mejores_params:
                 # El frente de Pareto ya quedó persistido dentro de optimizar()
                 _apply_best_params(mejores_params)
             else:
                 print("   [!] Optimización no viable. Usando config base.")
-            cached_uces_por_doc = optimizador.uces_por_doc
-            cached_doc_metadata_map = optimizador.doc_metadata_map
+            # Sin cache del optimizador: cached_uces_por_doc/doc_metadata_map
+            # ya están en None (inicializados arriba).
 
         # Restaurar embeddings para la corrida principal
         self.config.use_embeddings = True
