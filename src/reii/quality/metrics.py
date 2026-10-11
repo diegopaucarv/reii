@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+import warnings
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy import sparse
 from scipy.optimize import linear_sum_assignment
 from scipy.stats import kendalltau
+from sklearn.metrics import (
+    adjusted_rand_score,
+    cohen_kappa_score,
+    fowlkes_mallows_score,
+    normalized_mutual_info_score,
+    silhouette_score,
+)
 
 # NumPy 2.0 renombró np.trapz a np.trapezoid; soportar ambos.
 _trapz = getattr(np, "trapezoid", None) or getattr(np, "trapz", None)
@@ -420,3 +429,222 @@ def pareto_mask(
         if dom.any():
             keep[i] = False
     return pd.Series(keep, index=df.index)
+
+
+# ── Matrices de términos y validez interna (Silhouette) ─────────────────────
+
+
+def prune_vocabulary(
+    term_lists: Iterable[Sequence[str]], tsj: int = 3, min_abs: int = 2
+) -> List[str]:
+    """Réplica de ``MatrizBuilder.construir_vocabulario`` para listas de términos.
+
+    Conserva los términos con frecuencia documental >= ``tsj`` y frecuencia
+    absoluta >= ``min_abs``. Se usa cuando el vocabulario real del CDH no se
+    persistió (corridas ya guardadas).
+    """
+    doc_freq: Dict[str, int] = {}
+    raw_freq: Dict[str, int] = {}
+    for terms in term_lists:
+        for t in terms:
+            raw_freq[t] = raw_freq.get(t, 0) + 1
+        for t in set(terms):
+            doc_freq[t] = doc_freq.get(t, 0) + 1
+    min_abs = max(1, int(min_abs))
+    return sorted(t for t, c in doc_freq.items() if c >= tsj and raw_freq[t] >= min_abs)
+
+
+def binary_term_matrix(
+    term_lists: Sequence[Sequence[str]], vocab: Sequence[str]
+) -> sparse.csr_matrix:
+    """Matriz binaria UCE x término (CSR, int32), misma construcción que el pipeline."""
+    vocab = list(dict.fromkeys(vocab))
+    idx = {t: i for i, t in enumerate(vocab)}
+    rows: List[int] = []
+    cols: List[int] = []
+    for i, terms in enumerate(term_lists):
+        for t in set(terms):
+            j = idx.get(t)
+            if j is not None:
+                rows.append(i)
+                cols.append(j)
+    return sparse.coo_matrix(
+        (np.ones(len(rows), dtype=np.int32), (rows, cols)),
+        shape=(len(term_lists), len(vocab)),
+        dtype=np.int32,
+    ).tocsr()
+
+
+def chi2_profiles(matrix) -> Tuple[Optional[sparse.csr_matrix], np.ndarray]:
+    """Perfiles fila escalados de modo que la distancia euclídea sea la distancia χ².
+
+    Z_ij = (x_ij / x_i.) / sqrt(x_.j / x_..): es la geometría del AFC/ALCESTE (la
+    misma de ``consensus.chi2_margin``). Descarta filas sin términos y columnas
+    sin masa. Devuelve ``(Z, keep_rows)``; ``Z`` es None si no hay masa.
+    """
+    X = (
+        matrix.tocsr().astype(np.float64)
+        if sparse.issparse(matrix)
+        else sparse.csr_matrix(np.asarray(matrix, dtype=np.float64))
+    )
+    row_sums = np.asarray(X.sum(axis=1)).ravel()
+    col_mass = np.asarray(X.sum(axis=0)).ravel()
+    keep_rows = row_sums > 0
+    keep_cols = col_mass > 0
+    total = float(col_mass.sum())
+    if total <= 0 or keep_rows.sum() == 0 or keep_cols.sum() == 0:
+        return None, keep_rows
+    X = X[keep_rows][:, keep_cols]
+    P = sparse.diags(1.0 / row_sums[keep_rows]) @ X
+    marg = col_mass[keep_cols] / total
+    Z = P @ sparse.diags(1.0 / np.sqrt(marg))
+    return Z.tocsr(), keep_rows
+
+
+def silhouette_labels(
+    matrix,
+    labels: Sequence[int],
+    metric: str = "cosine",
+    sample_size: Optional[int] = 3000,
+    seed: int = 42,
+) -> Optional[float]:
+    """Silhouette medio de ``labels`` en el espacio de ``matrix`` (la matriz la aporta el llamador).
+
+    metric : "cosine" | "euclidean" | "chi2" (perfiles χ² + euclídea).
+    Ignora etiquetas < 0 y filas vacías. Si hay más de ``sample_size`` filas se
+    submuestrea con semilla fija (O(n²)). Devuelve None si no es calculable
+    (< 3 filas, < 2 clases o una clase por fila).
+    """
+    y = np.asarray(labels).astype(int)
+    if matrix.shape[0] != len(y):
+        raise ValueError("matrix y labels deben tener el mismo número de filas")
+    keep = y >= 0
+    X = matrix[keep] if sparse.issparse(matrix) else np.asarray(matrix)[keep]
+    y = y[keep]
+    if metric == "chi2":
+        X, ok = chi2_profiles(X)
+        if X is None:
+            return None
+        y, metric = y[ok], "euclidean"
+    elif metric == "cosine":
+        norms = (
+            np.asarray(abs(X).sum(axis=1)).ravel()
+            if sparse.issparse(X)
+            else np.abs(X).sum(axis=1)
+        )
+        ok = norms > 0
+        X, y = X[ok], y[ok]
+    if len(y) < 3 or len(np.unique(y)) < 2:
+        return None
+    if sample_size and len(y) > sample_size:
+        idx = np.random.default_rng(seed).choice(len(y), size=sample_size, replace=False)
+        X, y = X[idx], y[idx]
+    k = len(np.unique(y))
+    if k < 2 or k > len(y) - 1:
+        return None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return float(silhouette_score(X, y, metric=metric))
+
+
+# ── Acuerdo entre particiones, entre codificadores y contra el estándar humano ──
+
+
+def cross_partition_agreement(
+    labels_a: Mapping[str, int], labels_b: Mapping[str, int]
+) -> Dict[str, float]:
+    """FMI / NMI / ARI entre dos particiones, en las UCEs comunes con etiqueta >= 0.
+
+    Invariante a la permutación de etiquetas. Pura y sin mutar sus entradas.
+    """
+    pairs = [
+        (int(labels_a[u]), int(labels_b[u]))
+        for u in sorted(set(labels_a) & set(labels_b))
+        if labels_a[u] is not None
+        and labels_b[u] is not None
+        and labels_a[u] >= 0
+        and labels_b[u] >= 0
+    ]
+    out = {
+        "n_common": len(pairs),
+        "fmi": float("nan"),
+        "nmi": float("nan"),
+        "ari": float("nan"),
+    }
+    if len(pairs) < 2:
+        return out
+    la, lb = (list(x) for x in zip(*pairs))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        out["fmi"] = float(fowlkes_mallows_score(la, lb))
+        out["nmi"] = float(normalized_mutual_info_score(la, lb))
+        out["ari"] = float(adjusted_rand_score(la, lb))
+    return out
+
+
+def _paired(a: Sequence, b: Sequence) -> Tuple[np.ndarray, np.ndarray]:
+    x = pd.to_numeric(pd.Series(list(a)), errors="coerce").to_numpy(float)
+    y = pd.to_numeric(pd.Series(list(b)), errors="coerce").to_numpy(float)
+    if len(x) != len(y):
+        raise ValueError("a y b deben tener la misma longitud")
+    ok = ~(np.isnan(x) | np.isnan(y))
+    return x[ok].astype(int), y[ok].astype(int)
+
+
+def percent_agreement(a: Sequence[int], b: Sequence[int]) -> float:
+    """Proporción de ítems con la misma etiqueta (NaN si no hay pares)."""
+    x, y = _paired(a, b)
+    return float((x == y).mean()) if len(x) else float("nan")
+
+
+def cohen_kappa(a: Sequence[int], b: Sequence[int]) -> float:
+    """Kappa de Cohen. NaN si hay < 2 pares comunes o el kappa es degenerado
+    (una sola categoría observada en total: acuerdo perfecto sin variación)."""
+    x, y = _paired(a, b)
+    if len(x) < 2 or len(set(x) | set(y)) < 2:
+        return float("nan")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        k = cohen_kappa_score(x, y)
+    return float(k) if np.isfinite(k) else float("nan")
+
+
+def external_coherence(
+    assigned: Sequence[int], gold: Sequence[int]
+) -> Dict[str, float]:
+    """C_ext: coincidencia entre las clases del pipeline y las del estándar humano.
+
+    accuracy         : proporción con la misma etiqueta (requiere el MISMO espacio de ids)
+    kappa            : kappa de Cohen entre ambas etiquetas (mismo requisito)
+    accuracy_aligned : exactitud tras emparejar clases con Hungarian (si el codificador
+                       usó su propia numeración)
+    nmi, ari         : invariantes a la numeración de las clases
+    """
+    x, y = _paired(assigned, gold)
+    n = len(x)
+    out = {
+        "n": n,
+        "accuracy": float("nan"),
+        "kappa": float("nan"),
+        "accuracy_aligned": float("nan"),
+        "nmi": float("nan"),
+        "ari": float("nan"),
+    }
+    if n == 0:
+        return out
+    out["accuracy"] = float((x == y).mean())
+    out["kappa"] = cohen_kappa(x, y)
+    ca, cb = np.unique(x), np.unique(y)
+    ov = np.zeros((len(ca), len(cb)))
+    ia = {int(v): i for i, v in enumerate(ca)}
+    ib = {int(v): i for i, v in enumerate(cb)}
+    for u, v in zip(x, y):
+        ov[ia[int(u)], ib[int(v)]] += 1
+    r, c = linear_sum_assignment(-ov)
+    out["accuracy_aligned"] = float(ov[r, c].sum() / n)
+    if n >= 2:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out["nmi"] = float(normalized_mutual_info_score(x, y))
+            out["ari"] = float(adjusted_rand_score(x, y))
+    return out

@@ -15,5 +15,6 @@ __all__ = [
     "hooks",
     "migrate_legacy",
     "dashboard_panel",
+    "compare_modes",
     "cli",
 ]

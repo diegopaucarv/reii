@@ -533,7 +533,20 @@ def migrate_annotations(
 
     with transaction(conn):
         conn.execute("DELETE FROM annotations")  # reconstrucción total
+        from reii.pipelines.discourse_db import build_id_resolver  # [pipeline-patch] m1
+
+        _resolve = build_id_resolver(
+            {
+                "uce_id": str(u.get("id") or u.get("uce_id") or ""),
+                "doc_id": _doc_id_of(u),
+                "local_idx": u.get("local_idx"),
+                "section_id": (u.get("metadata") or {}).get("section_id", 0),
+            }
+            for u in (data.get("uces") or [])
+            if (u.get("id") or u.get("uce_id"))
+        )
         for a in flat:
+            a["uce_id"] = _resolve(a["uce_id"]) or a["uce_id"]
             if a["uce_id"] not in valid_uce_ids:
                 logger.warning(
                     "Anotación con uce_id %s desconocido; se omite", a["uce_id"]

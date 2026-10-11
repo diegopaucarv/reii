@@ -194,6 +194,31 @@ def build_extras(
         term_lists = [_terms(u) for u in stable_uces]
         extras["coverage"] = M.vocabulary_coverage(term_lists, vocab)
 
+    # Silhouette de las clases (nivel UCE) en espacio χ², coseno binario y, si el
+    # pipeline usó PPMI, coseno PPMI. Nunca interrumpe el guardado de la corrida.
+    try:
+        labelled = [u for u in stable_uces if getattr(u, "cluster_id", None) is not None]
+        if labelled:
+            sil_terms = [_terms(u) for u in labelled]
+            if vocab:
+                sil_vocab, vocab_source = list(vocab), "cdh"
+            else:
+                sil_vocab = M.prune_vocabulary(
+                    sil_terms, tsj, int(getattr(cfg, "min_term_abs_freq", 2))
+                )
+                vocab_source = "derived_tsj"
+            extras["silhouette"] = service.silhouette_report(
+                sil_terms,
+                [int(u.cluster_id) for u in labelled],
+                sil_vocab,
+                vocab_source=vocab_source,
+                ppmi_builder=getattr(wf, "ppmi_builder", None),
+                seed=int(getattr(cfg, "random_state", 42) or 42),
+                origin="pipeline",
+            )
+    except Exception as e:
+        logger.debug("silhouette falló: %s", e)
+
     pw = getattr(getattr(wf, "double_clf", None), "last_pairwise_stability", None) or {}
     ov = pw.get("overlap_aa")
     if ov:
@@ -229,14 +254,9 @@ def save_quality_run(
         stable_uces = [u for u in uces if getattr(u, "is_stable", False)]
         df, avail = build_assignments(uces)
         cfg_dict = redact_config(wf.config)
-        corpus_hash = hashlib.sha1(
-            "\n".join(
-                sorted(
-                    f"{u.id}|{hashlib.sha1((getattr(u, 'texto', '') or '').encode()).hexdigest()[:8]}"
-                    for u in uces
-                )
-            ).encode()
-        ).hexdigest()[:16]
+        corpus_hash = service.corpus_fingerprint(
+            (u.id, getattr(u, "texto", "") or "") for u in uces
+        )
         cv = code_version()
         seed = getattr(wf.config, "random_state", None)
         mode = getattr(wf.config, "classification_mode", None)

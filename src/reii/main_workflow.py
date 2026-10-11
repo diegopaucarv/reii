@@ -392,7 +392,7 @@ class Config:
     # (projected_cluster_id, projection_distance, ...) que ningún cálculo
     # de φ, AFC, inercia o estabilidad de términos consume.
     # Default False: ALCESTE puro.
-    use_liminal_projection: bool = False
+    use_liminal_projection: bool = True
     # Umbral opcional de confianza: si d2_second / d2_best < este valor,
     # la UCE queda sin proyección (ambigua entre clases).
     liminal_projection_min_ratio: float = 1.10
@@ -3919,11 +3919,15 @@ class DoubleClassifier:
         overlap     : raw overlap matrix (n_real_a × n_real_b)
         mapping_a_b : {class_a → class_b}  (Hungarian assignment)
         """
-        _q_strategy = os.environ.get("REII_STABILITY_MAPPING", "hungarian")  # [quality-patch] mapping
+        _q_strategy = os.environ.get(
+            "REII_STABILITY_MAPPING", "hungarian"
+        )  # [quality-patch] mapping
         if _q_strategy != "hungarian":
             from reii.quality.mapping import hungarian_compatible
 
-            return hungarian_compatible(uce_to_ca, uce_to_cb, strategy=_q_strategy, label=label)
+            return hungarian_compatible(
+                uce_to_ca, uce_to_cb, strategy=_q_strategy, label=label
+            )
         if linear_sum_assignment is None:
             logger.error("scipy.optimize.linear_sum_assignment not available.")
             return {}, 0.0, np.array([]), np.array([]), np.zeros((0, 0)), {}

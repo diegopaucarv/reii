@@ -77,14 +77,16 @@ def patch_mapping_env(text):
 
 
 def patch_dashboard_tab(text):
+    import re
+
     if MARK + " tab" in text:
         return text, "ya aplicado"
     old_head = "tab_a, tab_b, tab_c, tab_d, tab_e = st.tabs("
-    old_item = '        "E · Discurso por clase",\n'
-    if old_head not in text or old_item not in text:
+    m = re.search(r'        "E · [^"\n]*",\n', text)  # acepta el nombre original o el renombrado
+    if old_head not in text or not m:
         return text, "ANCLA NO ENCONTRADA (pestañas)"
     text = text.replace(old_head, "tab_a, tab_b, tab_c, tab_d, tab_e, tab_f = st.tabs(  # " + MARK + " tab", 1)
-    text = text.replace(old_item, old_item + '        "F · Calidad y niveles",\n', 1)
+    text = text.replace(m.group(0), m.group(0) + '        "F · Calidad y niveles",\n', 1)
     anchor = "# ── Sidebar: botones de salto (JMP)"
     if anchor not in text:
         return text, "ANCLA NO ENCONTRADA (sidebar)"

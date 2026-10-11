@@ -164,6 +164,13 @@ def _workflow_runner(
     os.makedirs(os.path.dirname(WORKFLOW_CONFIG_PATH), exist_ok=True)
     with open(WORKFLOW_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(params, f, ensure_ascii=False, indent=2)
+    try:  # [pipeline-patch] d1
+        from reii.pipelines.config_sync import push_params_to_store
+
+        _pp = push_params_to_store(params)
+        log.append(f"⚙️ Configuración enviada a la BD: {len(_pp['pushed'])} claves.")
+    except Exception as _qe:
+        log.append(f"⚠️ No se pudo enviar la configuración a la BD: {_qe}")
 
     mode = params.get("workflow_mode", "classic")
     raw = str(params.get("workflow_mode", "classic")).lower()
@@ -211,6 +218,7 @@ def _discourse_runner(
     store: bool,
     workflow: Optional[str],
     force: bool = False,
+    source: str = "db",  # [pipeline-patch] d2
 ) -> None:
     """Ejecuta un workflow de análisis de discurso en un hilo en segundo plano.
 
@@ -252,13 +260,20 @@ def _discourse_runner(
     try:
         with contextlib.redirect_stdout(stream):
             workflow_paths = [str(IA_DIR / f) for f in list_workflow_files()]
+            from reii.pipelines.runtime import prepare_discourse_input, sync_after_run
+
+            _q_input = prepare_discourse_input(source, WORKFLOW_DB_PATH)
             mon = DebugOrchestrator(
                 grammar_config_path=GRAMMAR_CONFIG_PATH,
                 workflow_config_paths=workflow_paths,
-                workflow_data_path=WORKFLOW_DB_PATH,
+                workflow_data_path=_q_input,
                 state_path=DISCOURSE_STATE_PATH,
             )
             mon.run_workflow(workflow_file, store=store, workflow=workflow, force=force)
+            try:
+                sync_after_run(DISCOURSE_STATE_PATH)
+            except Exception as _qe:
+                log.append(f"⚠️ No se pudo sincronizar con la BD: {_qe}")
         log.append("✅ Análisis de discurso completado.")
         state["exit_code"] = 0
     except Exception as e:
@@ -11270,7 +11285,7 @@ tab_a, tab_b, tab_c, tab_d, tab_e, tab_f = st.tabs(  # [quality-patch] tab
         "B · Resultados de clasificación",
         "C · Análisis por clase",
         "D· Correlaciones y calidad",
-        "E · Discurso por clase",
+        "E · Pipelines y configuración",
         "F · Calidad y niveles",
     ],
     on_change="rerun",
@@ -12570,6 +12585,17 @@ def _render_tab_c():
                         ):
                             st.session_state[lk] = not done2
                             st.rerun()
+
+
+    # ── Figuras del discurso (análisis IA, desde la BD) · [pipeline-patch] d3 ──
+    try:
+        from reii.pipelines.discourse_results import render_discourse_results_from_db
+
+        render_discourse_results_from_db(
+            locals().get("cur_c"), globals().get("class_colors"), uces, sec_rule=_sec_rule
+        )
+    except Exception as _qe:
+        st.error(f"Figuras del discurso no disponibles: {_qe}")
 
 
 @st.fragment
@@ -14481,6 +14507,155 @@ def _render_tab_e_crud():
             st.code(", ".join(_inactive))
 
 
+# ── [pipeline-patch] Pestaña E: Pipelines y configuración ─────────────────────────────
+@st.cache_data(ttl=10, show_spinner=False)
+def _pipeline_status_cached(_nonce: int = 0):
+    from reii.backend.config_store import ConfigStore
+    from reii.backend.sql.db import get_conn
+    from reii.config import DISCOURSE_STATE_PATH, WORKFLOW_CONFIG_PATH, WORKFLOW_DB_PATH
+    from reii.pipelines.status import collect_status
+
+    try:
+        overrides = ConfigStore().get_all()
+    except Exception:
+        overrides = {}
+    with get_conn() as conn:
+        return collect_status(
+            conn,
+            {
+                "workflow_db": WORKFLOW_DB_PATH,
+                "discourse_state": DISCOURSE_STATE_PATH,
+                "workflow_config": WORKFLOW_CONFIG_PATH,
+            },
+            store_overrides=overrides,
+        )
+
+
+def _pipeline_run_fix(fix_id: str) -> str:
+    from reii.backend.config_store import ConfigStore
+    from reii.config import DISCOURSE_STATE_PATH, WORKFLOW_CONFIG_PATH, WORKFLOW_DB_PATH
+    from reii.pipelines import config_sync, runtime
+
+    _pipeline_status_cached.clear()
+    if fix_id == "sync_annotations":
+        rep = runtime.sync_after_run(DISCOURSE_STATE_PATH)
+        _load_discourse.clear()
+        return f"{rep['n_written']} de {rep['n_annotations']} anotaciones sincronizadas (sin resolver: {rep['n_unmatched']})."
+    if fix_id == "export_input":
+        runtime.prepare_discourse_input("db", WORKFLOW_DB_PATH)
+        return "Entrada del análisis regenerada desde la base de datos."
+    if fix_id == "unify_config":
+        config_sync.save_unified(ConfigStore().get_all(), WORKFLOW_CONFIG_PATH)
+        return "workflow_config.json igualado a la configuración de la base de datos."
+    return "Acción desconocida."
+
+
+def _pipeline_start_workflow(params):
+    from reii.batch_processor import BatchProcessor
+
+    ss = st.session_state
+    ss.setdefault("workflow_state", {"running": False, "finished": False, "exit_code": None})
+    ss.setdefault("workflow_log", [])
+    try:
+        exportado = BatchProcessor(db_path=BATCH_DB_PATH).exportar_para_workflow()
+        note = f"📤 Se exportaron {len(exportado['json'])} entrevista(s) a `data/txt_outputs/tmp/`."
+    except Exception as e:
+        note = f"⚠️ No se pudo exportar ({type(e).__name__}: {e}); se usan los JSON ya existentes."
+    ss.workflow_log = [note]
+    ss.workflow_state.update(running=True, finished=False, exit_code=None)
+    threading.Thread(
+        target=_workflow_runner, args=(ss.workflow_log, ss.workflow_state, params), daemon=True
+    ).start()
+
+
+def _pipeline_start_discourse(wf_file, store, workflow, force, source):
+    ss = st.session_state
+    ss.setdefault("discourse_state", {"running": False, "finished": False, "exit_code": None, "refreshed": False})
+    ss.discourse_log = []
+    ss.discourse_state.update(running=True, finished=False, exit_code=None, refreshed=False)
+    _pipeline_status_cached.clear()
+    threading.Thread(
+        target=_discourse_runner,
+        args=(ss.discourse_log, ss.discourse_state, wf_file, store, workflow, force, source),
+        daemon=True,
+    ).start()
+
+
+def _render_pipeline_hub():
+    from reii.backend.config_store import CONFIG_CATEGORIES, ConfigStore
+    from reii.config import WORKFLOW_CONFIG_PATH
+    from reii.ia_config_editor import (
+        get_workflow_agents,
+        list_workflow_files,
+        load_discourse_state_progress,
+        load_workflow_names,
+        save_workflow_names,
+    )
+    from reii.pipelines import config_sync
+    from reii.pipelines.hub_tab import HubContext, render_pipeline_hub
+
+    ss = st.session_state
+    if ss.get("discourse_state", {}).get("finished") and not ss["discourse_state"].get("refreshed"):
+        ss["discourse_state"]["refreshed"] = True
+        _load_discourse.clear()
+        _pipeline_status_cached.clear()
+
+    def _effective():
+        try:
+            overrides = ConfigStore().get_all()
+        except Exception:
+            overrides = {}
+        return config_sync.effective_config(data.get("config") or {}, overrides)
+
+    def _save(updates):
+        _pipeline_status_cached.clear()
+        return config_sync.save_unified(updates, WORKFLOW_CONFIG_PATH)
+
+    def _reset():
+        store = ConfigStore()
+        for k in list(store.get_all()):
+            store.reset(k)
+        _pipeline_status_cached.clear()
+
+    def _workflows():
+        total, by_agent = load_discourse_state_progress()
+        names = load_workflow_names()
+        out = []
+        for f in list_workflow_files():
+            agents = get_workflow_agents(f)
+            done = sum(by_agent.get(a, 0) for a in agents)
+            out.append({"file": f, "name": names.get(f, f), "agents": agents,
+                        "progress": min(1.0, done / (len(agents) * total)) if total and agents else 0.0})
+        return out
+
+    def _rename(f, n):
+        names = load_workflow_names()
+        names[f] = n
+        save_workflow_names(names)
+
+    def _open_batch():
+        ss.show_batch_view = True
+        st.rerun()
+
+    render_pipeline_hub(
+        HubContext(
+            get_status=_pipeline_status_cached,
+            session=ss,
+            batch_open=_open_batch,
+            get_effective_config=_effective,
+            config_categories=CONFIG_CATEGORIES,
+            save_config=_save,
+            reset_config=_reset,
+            start_workflow=_pipeline_start_workflow,
+            list_workflows=_workflows,
+            rename_workflow=_rename,
+            start_discourse=_pipeline_start_discourse,
+            run_fix=_pipeline_run_fix,
+            render_agents_crud=_render_tab_e_crud,
+        )
+    )
+
+
 if tab_a.open:
     with tab_a:
         _render_tab_a()
@@ -14505,12 +14680,9 @@ elif tab_d.open:
     # ─────────────────────────────────────────────────────────────
 
 
-elif tab_e.open:
+elif tab_e.open:  # [pipeline-patch] d4
     with tab_e:
-        _render_tab_e()
-        _ds = st.session_state.get("discourse_state", {})
-        if not _ds.get("finished") and not _ds.get("running"):
-            _render_tab_e_crud()
+        _render_pipeline_hub()
 
 if tab_f.open:
     with tab_f:
