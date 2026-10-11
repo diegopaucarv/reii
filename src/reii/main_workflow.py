@@ -3919,6 +3919,11 @@ class DoubleClassifier:
         overlap     : raw overlap matrix (n_real_a × n_real_b)
         mapping_a_b : {class_a → class_b}  (Hungarian assignment)
         """
+        _q_strategy = os.environ.get("REII_STABILITY_MAPPING", "hungarian")  # [quality-patch] mapping
+        if _q_strategy != "hungarian":
+            from reii.quality.mapping import hungarian_compatible
+
+            return hungarian_compatible(uce_to_ca, uce_to_cb, strategy=_q_strategy, label=label)
         if linear_sum_assignment is None:
             logger.error("scipy.optimize.linear_sum_assignment not available.")
             return {}, 0.0, np.array([]), np.array([]), np.zeros((0, 0)), {}
@@ -7722,6 +7727,12 @@ class WorkflowOrchestrator:
             ]
 
         self._save_all_uces(uces_est_list, uces_por_doc)  # ← replaces save_uces
+        try:  # [quality-patch] hook
+            from reii.quality.hooks import save_quality_run
+
+            save_quality_run(self, uces_est_list, uces_por_doc)
+        except Exception as _qe:  # nunca rompe el pipeline
+            logger.warning("quality hook falló: %s", _qe)
 
         # Build every key the dashboard expects
         self._build_dashboard_keys(

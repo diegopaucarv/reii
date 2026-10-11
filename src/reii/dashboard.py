@@ -1642,7 +1642,7 @@ def _cached_corpus_search(
     n_terms = len(terms)
     _uces = _load_snapshot(_version).get("uces", [])
     _uce_phi_dict = {
-        item["uce_id"]: item.get("phi_score", 0.0)
+        item["uce_id"]: item.get("phi_score") or 0.0
         for item in _load_snapshot(_version).get("uce_phi", [])
         if item.get("uce_id")
     }
@@ -11264,13 +11264,14 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────
 # PESTAÑAS PRINCIPALES
 # ─────────────────────────────────────────────────────────────
-tab_a, tab_b, tab_c, tab_d, tab_e = st.tabs(
+tab_a, tab_b, tab_c, tab_d, tab_e, tab_f = st.tabs(  # [quality-patch] tab
     [
         "A · Análisis gramatical",
         "B · Resultados de clasificación",
         "C · Análisis por clase",
         "D· Correlaciones y calidad",
         "E · Discurso por clase",
+        "F · Calidad y niveles",
     ],
     on_change="rerun",
 )
@@ -14510,6 +14511,15 @@ elif tab_e.open:
         _ds = st.session_state.get("discourse_state", {})
         if not _ds.get("finished") and not _ds.get("running"):
             _render_tab_e_crud()
+
+if tab_f.open:
+    with tab_f:
+        try:
+            from reii.quality.dashboard_panel import render_quality_panel
+
+            render_quality_panel()
+        except Exception as _qe:
+            st.error(f"Panel de calidad no disponible: {_qe}")
 
 # ── Sidebar: botones de salto (JMP) desde la búsqueda de contextos (tab C) ──
 with st.sidebar:
