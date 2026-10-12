@@ -24,7 +24,9 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Filesystem paths
 # ---------------------------------------------------------------------------
-ROOT_DIR = Path(os.environ.get("REII_ROOT_DIR", ".")).resolve()
+ROOT_DIR = Path(
+    os.environ.get("REII_ROOT_DIR", Path(__file__).resolve().parents[2])
+).resolve()
 DATA_DIR = ROOT_DIR / os.environ.get("REII_DATA_DIR", "data")
 OUTPUT_DIR = ROOT_DIR / os.environ.get("REII_OUTPUT_DIR", "output")
 MODELS_DIR = ROOT_DIR / os.environ.get("REII_MODELS_DIR", "models")
@@ -137,6 +139,12 @@ USE_WORDNET_QUANTIFIERS: bool = (
 USE_GENSIM_EMBEDDINGS: bool = (
     os.environ.get("REII_USE_GENSIM_EMBEDDINGS", "true").lower() == "true"
 )
+# COREF: sujetos raíz por UCE. Sin coref (basta depparse+constituency) y por lotes.
+# Para volver al comportamiento anterior: REII_ROOTS_SKIP_COREF=false REII_ROOTS_BATCH_SIZE=0
+ROOTS_SKIP_COREF: bool = (
+    os.environ.get("REII_ROOTS_SKIP_COREF", "true").lower() == "true"
+)
+ROOTS_BATCH_SIZE: int = int(os.environ.get("REII_ROOTS_BATCH_SIZE", "32"))  # <=1: sin lotes
 
 # ---------------------------------------------------------------------------
 # API keys / tokens

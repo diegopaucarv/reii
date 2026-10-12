@@ -60,6 +60,7 @@ services:
       - ./models:/app/models
       - ./output:/app/output
       - ./ia:/app/ia
+      - ./scripts:/app/scripts:ro
       - D:/SUBTLEX-ESP.xlsx:/d/SUBTLEX-ESP.xlsx:ro
       - D:/cc.es.300.bin:/d/cc.es.300.bin:ro
       - D:/Python/HF_Cache:/root/.cache/huggingface

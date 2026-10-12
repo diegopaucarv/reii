@@ -82,6 +82,7 @@ _UCE_PROJECTION_FIELDS = (
 from reii.gram.gramatical_analyzer import (
     Config as GramConfig,
 )
+from reii.seg.root_cache import RootSubjectCache, boundary_tails, root_context
 from reii.seg.segmentador import ProgressiveSegmenter
 
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -3519,21 +3520,16 @@ class DoubleClassifier:
                 uce.id = normalizar_id_uce(uce)
                 uce.id = f"{uce.id}{suffix}"
 
-        # ── 2. Pre-compute root subjects for every UCE (one Stanza call each) ─
-        #       Cached by suffixed UCE id.  Executed BEFORE the merge loop so
-        #       van_unidos never needs to call Stanza again.
-        total_uces = sum(len(d) for d in uces_por_doc_local)
-        print(f"   [COREF] Pre-computing root subjects for {total_uces} UCEs...")
+        # ── 2. Root subjects (lazy, per document) ─────────────────────────────
+        #       The greedy merge (3d) only looks up the TAIL UCE of each pre-merged
+        #       group, so roots are computed right after the pre-merge (3a') for
+        #       those UCEs only, through a cache shared by the B1 and B2 passes.
+        #       (Before: one Stanza call per UCE per pass, keyed by suffixed id.)
         root_cache: Dict[str, set] = {}
-        for doc_uces in uces_por_doc_local:
-            for uce in doc_uces:
-                ctx = uce.texto[-500:] if len(uce.texto) > 500 else uce.texto
-                try:
-                    roots = set(ps.find_subjects_for_roots(ctx))
-                except Exception as e:
-                    logger.debug("root_cache miss for %s: %s", uce.id, e)
-                    roots = set()
-                root_cache[uce.id] = roots
+        rcache = getattr(ps, "root_cache", None) or RootSubjectCache(
+            ps.find_subjects_for_roots
+        )
+        _calls0 = rcache.misses
 
         # ── 3. Per-document UC construction ──────────────────────────────────
         ucs: List[UC] = []
@@ -3576,6 +3572,15 @@ class DoubleClassifier:
                     premerged_groups = [[u] for u in doc_uces]
             else:
                 premerged_groups = [doc_uces]
+
+            # ── 3a'. Root subjects for the tails of the pre-merged groups only ──
+            _tails = boundary_tails(premerged_groups)
+            rcache.prefetch(
+                [root_context(u.texto) for u in _tails],
+                label=f"ctx={context_units} ",
+            )
+            for u in _tails:
+                root_cache[u.id] = rcache.get(root_context(u.texto))
 
             # ── 3b. Rebuild segments_info from PRE-MERGED groups ──
             full_doc_text = ""
@@ -3703,6 +3708,12 @@ class DoubleClassifier:
                         if u.id == uid:
                             u.uc_id = uc.id
                 global_uc_counter += 1
+
+        print(
+            f"   [COREF context={context_units}] roots: "
+            f"{rcache.misses - _calls0} Stanza calls for {total_boundaries} boundaries "
+            f"({len(rcache)} contexts cached)"
+        )
 
         # ── 4. Strip suffix from all uce_ids (restore bare IDs for Hungarian) ─
         for uc in ucs:
@@ -5125,9 +5136,10 @@ class CAHTerminos:
         col_std = np.array(afc_result["col_std"])
         if len(col_std) < 2:
             return {}
+        labels = afc_result.get("voc") or voc
         dist_vector = pdist(col_std, metric="euclidean")
         Z = linkage(dist_vector, method="ward")
-        return {"Z": Z.tolist(), "labels": voc, "n_terms": len(voc)}
+        return {"Z": Z.tolist(), "labels": labels, "n_terms": len(labels)}
 
     def run_per_class(
         self,

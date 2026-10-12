@@ -920,9 +920,6 @@ def _set_multiple_filters(tab_name: str, filters_dict: dict):
     clean_filters = {k: str(v) for k, v in filters_dict.items() if v}
     st.session_state[SUBCAT_FILTER_KEY] = clean_filters
 
-    # ESTO ES CRÍTICO: Debe ser el nombre exacto de la 'key' del st.radio
-    st.session_state.radio_tabs_a = tab_name
-
     st.rerun()
 
 
@@ -8463,9 +8460,6 @@ def _set_multiple_filters(tab_name: str, filters_dict: dict):
     clean_filters = {k: str(v) for k, v in filters_dict.items() if v}
     st.session_state[SUBCAT_FILTER_KEY] = clean_filters
 
-    # ESTO ES CRÍTICO: Debe ser el nombre exacto de la 'key' del st.radio
-    st.session_state.radio_tabs_a = tab_name
-
     st.rerun()
 
 
@@ -11154,7 +11148,7 @@ def _render_subtype_tab(
                 tr,
                 key=f"te_sub_trait_{tr}",
                 type="primary" if active else "secondary",
-                use_container_width=True,
+                width="stretch",
             ):
                 st.session_state["te_sub_trait"] = tr
                 st.rerun()
@@ -11190,7 +11184,7 @@ def _render_subtype_tab(
     _section_label(f"Distribución de subtipos · {sel_trait}")
     st.plotly_chart(
         _chart_subtype_bars(stats, sel_trait, active_classes, class_colors),
-        use_container_width=True,
+        width="stretch",
         config={"displayModeBar": False},
     )
 
@@ -11204,7 +11198,7 @@ def _render_subtype_tab(
             x_col=scatter_opts[x_lbl],
             y_col=scatter_opts[y_lbl],
         ),
-        use_container_width=True,
+        width="stretch",
         config={"displayModeBar": False},
     )
 
@@ -11230,7 +11224,7 @@ def _render_subtype_tab(
         ]
         st.dataframe(
             view,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "Conf.media": st.column_config.ProgressColumn(
@@ -12586,13 +12580,15 @@ def _render_tab_c():
                             st.session_state[lk] = not done2
                             st.rerun()
 
-
     # ── Figuras del discurso (análisis IA, desde la BD) · [pipeline-patch] d3 ──
     try:
         from reii.pipelines.discourse_results import render_discourse_results_from_db
 
         render_discourse_results_from_db(
-            locals().get("cur_c"), globals().get("class_colors"), uces, sec_rule=_sec_rule
+            locals().get("cur_c"),
+            globals().get("class_colors"),
+            uces,
+            sec_rule=_sec_rule,
         )
     except Exception as _qe:
         st.error(f"Figuras del discurso no disponibles: {_qe}")
@@ -12712,13 +12708,15 @@ def _render_tab_d():
         _sec_rule("CAH Global · estructura léxica AFC")
         gcah_fig = make_global_cah_dendrogram(_dm)
         if gcah_fig:
-            st.plotly_chart(gcah_fig, width="stretch", config={"displayModeBar": False})
-            st.markdown(
-                '<div style="font-family:var(--font-serif);font-size:12px;font-style:italic;'
-                'color:var(--text-low);padding:4px 0 16px;line-height:1.6">'
-                "Agrupamiento jerárquico de todos los términos del vocabulario AFC. "
-                "Color = clase con mayor |φ| para ese término.</div>",
-                unsafe_allow_html=True,
+            st.plotly_chart(
+                gcah_fig,
+                width="stretch",
+                height=1500,
+                config={
+                    "displayModeBar": False,
+                    "useScrollPane": True,  # ← habilita scroll
+                    "scrollZoom": False,  # ← opcional: deshabilita zoom por scroll
+                },
             )
         else:
             st.info("Sin datos CAH global. Activa use_projection=True en el pipeline.")
@@ -13690,7 +13688,7 @@ def _render_tab_e():
             if st.button(
                 f"Clase {_c}",
                 key=f"te_cls_{_c}",
-                use_container_width=True,
+                width="stretch",
                 type="primary" if _is_act_cls else "secondary",
             ):
                 st.session_state.te_active_cls = _c
@@ -13714,7 +13712,7 @@ def _render_tab_e():
             if st.button(
                 _tr,
                 key=f"te_tr_{_tr}",
-                use_container_width=True,
+                width="stretch",
                 type="primary" if _is_act_tr else "secondary",
             ):
                 st.session_state.te_trait = _tr
@@ -13741,7 +13739,7 @@ def _render_tab_e():
             if st.button(
                 _cv,
                 key=f"te_conf_{_cv}",
-                use_container_width=True,
+                width="stretch",
                 type="primary" if _conf_in else "secondary",
             ):
                 _cur_c = list(st.session_state.te_confs)
@@ -14554,7 +14552,9 @@ def _pipeline_start_workflow(params):
     from reii.batch_processor import BatchProcessor
 
     ss = st.session_state
-    ss.setdefault("workflow_state", {"running": False, "finished": False, "exit_code": None})
+    ss.setdefault(
+        "workflow_state", {"running": False, "finished": False, "exit_code": None}
+    )
     ss.setdefault("workflow_log", [])
     try:
         exportado = BatchProcessor(db_path=BATCH_DB_PATH).exportar_para_workflow()
@@ -14564,19 +14564,34 @@ def _pipeline_start_workflow(params):
     ss.workflow_log = [note]
     ss.workflow_state.update(running=True, finished=False, exit_code=None)
     threading.Thread(
-        target=_workflow_runner, args=(ss.workflow_log, ss.workflow_state, params), daemon=True
+        target=_workflow_runner,
+        args=(ss.workflow_log, ss.workflow_state, params),
+        daemon=True,
     ).start()
 
 
 def _pipeline_start_discourse(wf_file, store, workflow, force, source):
     ss = st.session_state
-    ss.setdefault("discourse_state", {"running": False, "finished": False, "exit_code": None, "refreshed": False})
+    ss.setdefault(
+        "discourse_state",
+        {"running": False, "finished": False, "exit_code": None, "refreshed": False},
+    )
     ss.discourse_log = []
-    ss.discourse_state.update(running=True, finished=False, exit_code=None, refreshed=False)
+    ss.discourse_state.update(
+        running=True, finished=False, exit_code=None, refreshed=False
+    )
     _pipeline_status_cached.clear()
     threading.Thread(
         target=_discourse_runner,
-        args=(ss.discourse_log, ss.discourse_state, wf_file, store, workflow, force, source),
+        args=(
+            ss.discourse_log,
+            ss.discourse_state,
+            wf_file,
+            store,
+            workflow,
+            force,
+            source,
+        ),
         daemon=True,
     ).start()
 
@@ -14595,7 +14610,9 @@ def _render_pipeline_hub():
     from reii.pipelines.hub_tab import HubContext, render_pipeline_hub
 
     ss = st.session_state
-    if ss.get("discourse_state", {}).get("finished") and not ss["discourse_state"].get("refreshed"):
+    if ss.get("discourse_state", {}).get("finished") and not ss["discourse_state"].get(
+        "refreshed"
+    ):
         ss["discourse_state"]["refreshed"] = True
         _load_discourse.clear()
         _pipeline_status_cached.clear()
@@ -14624,8 +14641,16 @@ def _render_pipeline_hub():
         for f in list_workflow_files():
             agents = get_workflow_agents(f)
             done = sum(by_agent.get(a, 0) for a in agents)
-            out.append({"file": f, "name": names.get(f, f), "agents": agents,
-                        "progress": min(1.0, done / (len(agents) * total)) if total and agents else 0.0})
+            out.append(
+                {
+                    "file": f,
+                    "name": names.get(f, f),
+                    "agents": agents,
+                    "progress": min(1.0, done / (len(agents) * total))
+                    if total and agents
+                    else 0.0,
+                }
+            )
         return out
 
     def _rename(f, n):

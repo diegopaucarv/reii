@@ -18,7 +18,14 @@ from sklearn.metrics.pairwise import cosine_similarity
 from spacy.language import Language
 from transformers import AutoTokenizer, BertModel, BertTokenizer, pipeline
 
-from reii.config import NLI_MODEL, SEGMENTER_EMBEDDING_MODEL, SPACY_MODEL
+from reii.config import (
+    NLI_MODEL,
+    ROOTS_BATCH_SIZE,
+    ROOTS_SKIP_COREF,
+    SEGMENTER_EMBEDDING_MODEL,
+    SPACY_MODEL,
+)
+from reii.seg.root_cache import RootSubjectCache, StanzaRootExtractor
 
 # ── Stanza coref bug-fix ──────────────────────────────────────────────────────
 try:
@@ -270,6 +277,9 @@ class ProgressiveSegmenter:
         device=None,
         # ── new: control debug verbosity ────────────────────────────
         debug_coref=True,
+        # sujetos raíz de COREF: None -> valores de config (REII_ROOTS_*)
+        roots_skip_coref=None,
+        roots_batch_size=None,
     ):
         self.similarity_threshold = similarity_threshold
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
@@ -281,7 +291,9 @@ class ProgressiveSegmenter:
         self.hnsw_ef = hnsw_ef
         self.hnsw_m = hnsw_m
         self.stanza_lang = stanza_lang
-        self.stanza_use_gpu = device is not None
+        # Antes: ``device is not None`` -> Stanza siempre en CPU cuando no se pasaba device
+        # (el caso habitual), aunque SentenceTransformer sí usara CUDA.
+        self.stanza_use_gpu = str(self.device).startswith("cuda")
         self.debug_coref = debug_coref  # toggle for coref debug prints
 
         self.model = SentenceTransformer(model_name).to(self.device)
@@ -295,6 +307,18 @@ class ProgressiveSegmenter:
         # self.attention_detector = AttentionShiftDetector()  # now safe (device fixed)
         self.tfidf_vectorizer = TfidfVectorizer()
         self._stanza_pipeline = None
+        # Sujetos raíz: sin coref (subconjunto de procesadores del pipeline ya cargado)
+        # y, opcionalmente, por lotes. La caché (últimos 500 chars) la comparten B1 y B2.
+        self._roots = StanzaRootExtractor(
+            self.get_stanza,
+            skip_coref=ROOTS_SKIP_COREF if roots_skip_coref is None else roots_skip_coref,
+        )
+        _bs = ROOTS_BATCH_SIZE if roots_batch_size is None else int(roots_batch_size)
+        self.root_cache = RootSubjectCache(
+            self.find_subjects_for_roots,
+            batch_extractor=self._roots.batch if _bs > 1 else None,
+            batch_size=max(1, _bs),
+        )
         logging.info(f"[Init] Device: {self.device}")
 
     # ── debug helper ──────────────────────────────────────────────────────────
@@ -316,14 +340,24 @@ class ProgressiveSegmenter:
                     processors="tokenize,pos,lemma,depparse,constituency,coref",
                     verbose=False,
                 )
-                # ── FIX: use self._stanza_pipeline (with underscore) ─────────
-                self._stanza_pipeline = stanza.Pipeline(
-                    self.stanza_lang,
-                    processors="tokenize,pos,lemma,depparse,constituency,coref",
-                    use_gpu=self.stanza_use_gpu,
-                    verbose=False,
+                # GPU si hay CUDA; si falla (p. ej. VRAM compartida con
+                # SentenceTransformer) se reintenta en CPU en vez de desactivar COREF.
+                for use_gpu in [True, False] if self.stanza_use_gpu else [False]:
+                    try:
+                        self._stanza_pipeline = stanza.Pipeline(
+                            self.stanza_lang,
+                            processors="tokenize,pos,lemma,depparse,constituency,coref",
+                            use_gpu=use_gpu,
+                            verbose=False,
+                        )
+                        break
+                    except Exception as gpu_err:
+                        if not use_gpu:
+                            raise
+                        print(f"[COREF] ✗ Stanza en GPU falló ({gpu_err}); reintentando en CPU.")
+                print(
+                    f"[COREF] ✓ Stanza coref pipeline cargado ({'GPU' if use_gpu else 'CPU'})."
                 )
-                print("[COREF] ✓ Stanza coref pipeline cargado correctamente.")
             except Exception as e:
                 print(
                     f"[COREF] ✗ Error cargando Stanza: {e}. Correferencias deshabilitadas."
@@ -644,45 +678,12 @@ class ProgressiveSegmenter:
         """
         Extracts full Noun Phrases (NP) as subjects.
         Includes fallback logic for MWT index mismatches.
+
+        Runs only tokenize/mwt/pos/lemma/depparse/constituency (no coref) unless
+        ``roots_skip_coref=False``; the extraction itself lives in
+        ``reii.seg.root_cache.subjects_from_doc``.
         """
-        subjects = []
-        try:
-            stanza_pipe = self.get_stanza()
-            if not stanza_pipe:
-                return []
-
-            doc = stanza_pipe(text)
-            for sentence in doc.sentences:
-                tree = sentence.constituency
-                root_ids = [word.id for word in sentence.words if word.head == 0]
-
-                for word in sentence.words:
-                    if word.head in root_ids and "nsubj" in word.deprel:
-                        phrase_found = False
-                        try:
-                            # 1. Attempt to find the phrase 'box' (NP)
-                            # word.id is 1-based, tree index is 0-based
-                            leaf = tree.get_leaf_for_index(word.id - 1)
-                            curr = leaf
-                            while curr.parent is not None:
-                                if curr.label == "NP":
-                                    subjects.append(" ".join(curr.leaf_labels()))
-                                    phrase_found = True
-                                    break
-                                curr = curr.parent
-                        except Exception:
-                            # Catch potential index out of range for MWTs
-                            phrase_found = False
-
-                        # 2. FALLBACK: If tree traversal failed, take the raw word
-                        if not phrase_found:
-                            subjects.append(word.text)
-
-            return list(set([s.strip() for s in subjects if s]))
-
-        except Exception as e:
-            logging.error(f"[COREF] Subject extraction  failure: {e}")
-            return []
+        return self._roots.single(text)
 
     # ─────────────────────────────────────────────────────────────────────────
     # _extract_global_chains — with full debug prints + chain deduplication FIX
