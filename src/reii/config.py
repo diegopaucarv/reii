@@ -125,6 +125,16 @@ DISCOURSE_CONFIG_PATH: str = str(
 LOCALISMOS_PATH: str = str(
     ROOT_DIR / os.environ.get("REII_LOCALISMOS_PATH", "ia/localismos.json")
 )
+SEGMENTACION_CONFIG_PATH: str = str(
+    ROOT_DIR
+    / os.environ.get(
+        "REII_SEGMENTACION_CONFIG_PATH", "ia/entrevistas/segmentacion.json"
+    )
+)
+EXTRACCION_CONFIG_PATH: str = str(
+    ROOT_DIR
+    / os.environ.get("REII_EXTRACCION_CONFIG_PATH", "ia/entrevistas/extraccion.json")
+)
 
 # ---------------------------------------------------------------------------
 # SUPTLEX-ESP

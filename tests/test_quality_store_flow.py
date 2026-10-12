@@ -2,13 +2,14 @@
 
 import json
 import os
-import shutil
+import subprocess
 import sys
 import types
 
 import numpy as np
 import pandas as pd
 import pytest
+
 from reii.quality import calibration as cal
 from reii.quality import hooks, service
 from reii.quality import migrate_legacy as ml
@@ -343,12 +344,43 @@ def test_redact_config_masks_secrets():
 # ── parches ─────────────────────────────────────────────────────────────────
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# Los parches de apply_quality_patches.py ya están aplicados y commiteados en
+# el repo. Esta prueba valida el script de parches, así que debe partir de los
+# archivos pristinos (sin parchear), que viven en el commit anterior al que
+# introdujo los parches (3445ddf^).
+PRISTINE_COMMIT = "3445ddf^"
+
+
+def _pristine(rel: str) -> str:
+    """Devuelve el contenido pristino (sin parches) de ``rel`` desde git."""
+    out = subprocess.run(
+        ["git", "show", f"{PRISTINE_COMMIT}:{rel}"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=ROOT,
+    )
+    if out.returncode != 0:
+        raise RuntimeError(
+            f"No se pudo leer {rel} desde {PRISTINE_COMMIT}: {out.stderr}"
+        )
+    return out.stdout
+
 
 def test_patch_script_idempotent_crlf_and_revert(tmp_path):
     repo = tmp_path / "repo"
-    (repo / "src/reii").mkdir(parents=True)
-    for f in ("main_workflow.py", "dashboard.py"):
-        shutil.copy(os.path.join(ROOT, "src/reii", f), repo / "src/reii" / f)
+    for rel in ("src/reii/main_workflow.py", "src/reii/dashboard.py"):
+        dst = repo / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        text = _pristine(rel)
+        # Conserva los finales de línea del archivo actual del repo (CRLF) para
+        # que la aserción CRLF siga valiendo.
+        current = open(os.path.join(ROOT, rel), "rb").read().decode("utf-8")
+        if "\r\n" in current:
+            text = text.replace("\n", "\r\n")
+        # write_bytes (no write_text): en Windows el modo texto traduciría
+        # \n -> \r\n y dejaría \r\r\n, rompiendo los anchors de los parches.
+        dst.write_bytes(text.encode("utf-8"))
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import apply_quality_patches as ap
 

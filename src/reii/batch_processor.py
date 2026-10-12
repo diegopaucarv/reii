@@ -25,7 +25,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-from reii.config import BATCH_DB_PATH, DATA_DIR, LOCALISMOS_PATH, TRANSCRIPTS_DIR
+from reii.config import (
+    BATCH_DB_PATH,
+    DATA_DIR,
+    EXTRACCION_CONFIG_PATH,
+    LOCALISMOS_PATH,
+    SEGMENTACION_CONFIG_PATH,
+    TRANSCRIPTS_DIR,
+)
 from reii.guia_entrevista import guia_como_texto
 from reii.ia_discursiva import call_deepseek_structured
 
@@ -238,6 +245,36 @@ Reglas estrictas:
 - Devuelve ÚNICAMENTE un objeto JSON válido según el esquema. Sin saludos, explicaciones ni etiquetas."""
 
 # ---------------------------------------------------------------------------
+# Configuración de prompts (JSON en ia/entrevistas/)
+# ---------------------------------------------------------------------------
+
+
+def load_prompt_config(path: str) -> Dict:
+    """Carga un archivo de configuración de prompt (JSON).
+
+    Formato esperado: ``{"name", "role", "instructions", "json_schema",
+    "few_shot_examples"}``. Devuelve ``{}`` si el archivo no existe o es
+    inválido, para que el llamador use el fallback hardcodeado.
+    """
+    ruta = Path(path)
+    if not ruta.exists():
+        return {}
+    try:
+        with open(ruta, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+# Cargados a nivel de módulo; si el JSON falta o es inválido, se usan los
+# valores hardcodeados de arriba como fallback (comportamiento previo).
+_PROMPT_SEGMENTACION: Dict = load_prompt_config(SEGMENTACION_CONFIG_PATH)
+_PROMPT_EXTRACCION: Dict = load_prompt_config(EXTRACCION_CONFIG_PATH)
+
+# ---------------------------------------------------------------------------
 # Constructores de mensajes
 # ---------------------------------------------------------------------------
 
@@ -296,7 +333,7 @@ def build_prompt_segmentacion(
     """Construye los mensajes (system + user) para la Ruta 1 (segmentación)."""
     if localismos is None:
         localismos = load_localismos()
-    system = SYSTEM_PROMPT_SEGMENTACION
+    system = _PROMPT_SEGMENTACION.get("instructions") or SYSTEM_PROMPT_SEGMENTACION
     bloque = _bloque_localismos(localismos)
     if bloque:
         system = system + "\n\n" + bloque
@@ -319,7 +356,7 @@ def build_prompt_extraccion(
     """Construye los mensajes (system + user) para la Ruta 2 (extracción)."""
     if localismos is None:
         localismos = load_localismos()
-    system = SYSTEM_PROMPT_EXTRACCION
+    system = _PROMPT_EXTRACCION.get("instructions") or SYSTEM_PROMPT_EXTRACCION
     bloque = _bloque_localismos(localismos)
     if bloque:
         system = system + "\n\n" + bloque
@@ -528,14 +565,14 @@ class BatchProcessor:
 
             segmentos = call_deepseek_structured(
                 build_prompt_segmentacion(transcripcion, self.localismos),
-                SCHEMA_SEGMENTACION,
+                _PROMPT_SEGMENTACION.get("json_schema") or SCHEMA_SEGMENTACION,
                 max_retries=self.max_retries,
                 temperature=self.temperature,
                 log_cb=_cb,
             )
             extraccion = call_deepseek_structured(
                 build_prompt_extraccion(transcripcion, self.localismos),
-                SCHEMA_EXTRACCION,
+                _PROMPT_EXTRACCION.get("json_schema") or SCHEMA_EXTRACCION,
                 max_retries=self.max_retries,
                 temperature=self.temperature,
                 log_cb=_cb,
