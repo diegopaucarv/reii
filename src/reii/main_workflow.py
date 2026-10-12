@@ -4673,6 +4673,7 @@ class DoubleClassifier:
         ppmi_builder: Optional["SubtlexPPMIBuilder"] = None,
         cached_uces_por_doc: Optional[List[List[UCE]]] = None,
         cached_doc_metadata_map: Optional[Dict] = None,
+        checkpoint_path: Optional[str] = None,
     ) -> Tuple:
         self.ppmi_builder = ppmi_builder
         mode = getattr(self.config, "classification_mode", "wc_only")
@@ -4760,6 +4761,7 @@ class DoubleClassifier:
                 mf1,
                 cu_tight,
                 retrofitted_vectors=retrofitted_vectors,
+                checkpoint_path=checkpoint_path,
             )
             print(f"--- Classification B2: coref loose (context_units={cu_loose}) ---")
             res_coref2 = self._clasificar_umbral_coref(
@@ -4767,6 +4769,7 @@ class DoubleClassifier:
                 mf2,
                 cu_loose,
                 retrofitted_vectors=retrofitted_vectors,
+                checkpoint_path=checkpoint_path,
             )
 
             if res_coref1 and res_coref2:
