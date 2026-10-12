@@ -210,6 +210,13 @@ def main() -> int:
         action="store_true",
         help="Abort if best_params.json's fingerprint mismatches the corpus.",
     )
+    parser.add_argument(
+        "--checkpoint-path",
+        default=None,
+        help="Ruta del checkpoint de la clasificación coref (Method B). Si el "
+        "proceso muere (OOM), re-ejecutar con la misma ruta reanuda saltando "
+        "los documentos ya procesados. Por defecto: sin checkpointing.",
+    )
     args = parser.parse_args()
 
     # ── 1. Rebuild corpus_raw ────────────────────────────────────────────
@@ -370,6 +377,7 @@ def main() -> int:
         global_corpus=None,
         lex_analyzer=None,
         grammatical_dashboard_path="",  # ← skip legacy grammar JSON
+        checkpoint_path=args.checkpoint_path,
     )
     print("=== Done ===")
     return 0

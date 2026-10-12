@@ -7461,6 +7461,7 @@ class WorkflowOrchestrator:
         grammatical_pipeline: Optional[PipelineGramatical] = None,
         grammatical_dashboard_path: str = "",
         lex_analyzer=None,  # GlobalLexicalAnalyzer instance, optional
+        checkpoint_path: Optional[str] = None,
     ) -> None:
         print("=== Iniciando Pipeline ALCESTE v5 ===")
 
@@ -7600,6 +7601,7 @@ class WorkflowOrchestrator:
             ppmi_builder=self.ppmi_builder,
             cached_uces_por_doc=cached_uces_por_doc,  # from optimizer, or None
             cached_doc_metadata_map=cached_doc_metadata_map,
+            checkpoint_path=checkpoint_path,
         )
 
         # ── Retrofitting on pass-1 output ─────────────────────────────────────────
@@ -7643,6 +7645,7 @@ class WorkflowOrchestrator:
                 ppmi_builder=self.ppmi_builder,
                 cached_uces_por_doc=uces_por_doc_p1,  # always reuse pass-1 UCEs
                 cached_doc_metadata_map=doc_metadata_map,
+                checkpoint_path=checkpoint_path,
             )
 
             # ── Persist pairwise stability matrices ───────────────────────────────
