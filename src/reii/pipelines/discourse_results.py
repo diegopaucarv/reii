@@ -28,7 +28,7 @@ def _alpha(color: str, a: float = 0.2) -> str:
     if c.startswith("#") and len(c) in (4, 7):
         h = "".join(ch * 2 for ch in c[1:]) if len(c) == 4 else c[1:]
         try:
-            r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+            r, g, b = (int(h[i : i + 2], 16) for i in (0, 2, 4))
             return f"rgba({r},{g},{b},{a})"
         except ValueError:
             pass
@@ -37,7 +37,11 @@ def _alpha(color: str, a: float = 0.2) -> str:
 
 def resolve_span(text: str, span: Dict[str, Any]) -> Optional[Tuple[int, int]]:
     """Posición (inicio, fin) de la cita en el texto: offsets si son válidos, si no búsqueda."""
-    s, e, q = span.get("start_char", -1), span.get("end_char", -1), (span.get("quote") or "").strip()
+    s, e, q = (
+        span.get("start_char", -1),
+        span.get("end_char", -1),
+        (span.get("quote") or "").strip(),
+    )
     if isinstance(s, int) and isinstance(e, int) and 0 <= s < e <= len(text):
         if not q or text[s:e].strip().lower() == q.lower():
             return s, e
@@ -58,13 +62,17 @@ def highlight(text: str, spans: Iterable[Tuple[int, int]], color: str) -> str:
     out, pos = [], 0
     for s, e in merged:
         out.append(_esc(text[pos:s]))
-        out.append(f'<mark style="background:{_alpha(color)};color:inherit;border-bottom:1px solid {color};padding:0 1px">{_esc(text[s:e])}</mark>')
+        out.append(
+            f'<mark style="background:{_alpha(color)};color:inherit;border-bottom:1px solid {color};padding:0 1px">{_esc(text[s:e])}</mark>'
+        )
         pos = e
     out.append(_esc(text[pos:]))
     return "".join(out)
 
 
-def build_frame(annotations_by_uce: Dict[str, List[Dict[str, Any]]], uces: Iterable[Dict[str, Any]]) -> pd.DataFrame:
+def build_frame(
+    annotations_by_uce: Dict[str, List[Dict[str, Any]]], uces: Iterable[Dict[str, Any]]
+) -> pd.DataFrame:
     """Una fila por cita (span). Une cada anotación con su UCE (texto, clase, documento)."""
     by_id = {str(u.get("uce_id") or u.get("id")): u for u in uces}
     rows = []
@@ -74,18 +82,44 @@ def build_frame(annotations_by_uce: Dict[str, List[Dict[str, Any]]], uces: Itera
             continue
         text = u.get("texto") or ""
         for a in anns or []:
-            spans = a.get("spans") or [{"quote": a.get("quote", ""), "start_char": -1, "end_char": -1}]
+            spans = a.get("spans") or [
+                {"quote": a.get("quote", ""), "start_char": -1, "end_char": -1}
+            ]
             for sp in spans:
                 pos = resolve_span(text, sp)
-                rows.append({
-                    "uce_id": str(uid), "trait": a.get("trait") or "?", "agent": a.get("agent") or "?",
-                    "subtype": a.get("subtype") or "", "confidence": a.get("confidence") or "baja",
-                    "quote": sp.get("quote") or "", "start": pos[0] if pos else -1, "end": pos[1] if pos else -1,
-                    "reasoning": (a.get("metadata") or {}).get("reasoning", ""),
-                    "cluster_id": u.get("cluster_id"), "doc_id": u.get("doc_id"), "texto": text,
-                })
-    df = pd.DataFrame(rows, columns=["uce_id", "trait", "agent", "subtype", "confidence", "quote", "start", "end",
-                                     "reasoning", "cluster_id", "doc_id", "texto"])
+                rows.append(
+                    {
+                        "uce_id": str(uid),
+                        "trait": a.get("trait") or "?",
+                        "agent": a.get("agent") or "?",
+                        "subtype": a.get("subtype") or "",
+                        "confidence": a.get("confidence") or "baja",
+                        "quote": sp.get("quote") or "",
+                        "start": pos[0] if pos else -1,
+                        "end": pos[1] if pos else -1,
+                        "reasoning": (a.get("metadata") or {}).get("reasoning", ""),
+                        "cluster_id": u.get("cluster_id"),
+                        "doc_id": u.get("doc_id"),
+                        "texto": text,
+                    }
+                )
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "uce_id",
+            "trait",
+            "agent",
+            "subtype",
+            "confidence",
+            "quote",
+            "start",
+            "end",
+            "reasoning",
+            "cluster_id",
+            "doc_id",
+            "texto",
+        ],
+    )
     if not df.empty:
         df["conf_rank"] = df["confidence"].map(CONF_RANK).fillna(1).astype(int)
     return df
@@ -96,13 +130,17 @@ def evidence_card(group: pd.DataFrame, color: str) -> str:
     spans = [(int(s), int(e)) for s, e in zip(group["start"], group["end"]) if s >= 0]
     conf = r["confidence"]
     cc = CONF_COLOR.get(conf, "#888")
-    reason = f'<div style="font-size:11px;color:var(--text-low);font-style:italic;margin-top:6px">{_esc(r["reasoning"])}</div>' if r["reasoning"] else ""
-    sub = f' · {_esc(r["subtype"])}' if r["subtype"] else ""
+    reason = (
+        f'<div style="font-size:11px;color:var(--text-low);font-style:italic;margin-top:6px">{_esc(r["reasoning"])}</div>'
+        if r["reasoning"]
+        else ""
+    )
+    sub = f" · {_esc(r['subtype'])}" if r["subtype"] else ""
     return (
         f'<div style="border-left:3px solid {color};padding:10px 12px;margin-bottom:8px;border-radius:0 6px 6px 0;'
         f'background:var(--bg-card,transparent)">'
         f'<div style="font-family:var(--font-mono,monospace);font-size:10px;color:var(--text-low);margin-bottom:6px">'
-        f'{_esc(r["uce_id"])} · doc {_esc(r["doc_id"])} · {_esc(r["agent"])}{sub} '
+        f"{_esc(r['uce_id'])} · doc {_esc(r['doc_id'])} · {_esc(r['agent'])}{sub} "
         f'<span style="color:{cc};border:.5px solid {cc}66;border-radius:8px;padding:0 6px;margin-left:4px">{_esc(conf)}</span></div>'
         f'<div style="font-size:13px;line-height:1.6;color:var(--text-hi)">{highlight(r["texto"], spans, color)}</div>{reason}</div>'
     )
@@ -113,9 +151,9 @@ def kwic_rows(group_df: pd.DataFrame, width: int = 45) -> str:
     for r in group_df.itertuples():
         if r.start < 0:
             continue
-        left = _esc(r.texto[max(0, r.start - width): r.start]).rjust(0)
-        mid = _esc(r.texto[r.start: r.end])
-        right = _esc(r.texto[r.end: r.end + width])
+        left = _esc(r.texto[max(0, r.start - width) : r.start]).rjust(0)
+        mid = _esc(r.texto[r.start : r.end])
+        right = _esc(r.texto[r.end : r.end + width])
         rows.append(
             f'<tr><td style="text-align:right;color:var(--text-low);padding:2px 6px;white-space:nowrap">…{left}</td>'
             f'<td style="font-weight:600;color:var(--text-hi);padding:2px 6px;white-space:nowrap">{mid}</td>'
@@ -123,43 +161,72 @@ def kwic_rows(group_df: pd.DataFrame, width: int = 45) -> str:
         )
     if not rows:
         return '<div style="font-size:12px;color:var(--text-low)">Sin posiciones localizables para el KWIC.</div>'
-    return ('<div style="overflow-x:auto"><table style="font-family:var(--font-mono,monospace);font-size:11px;'
-            'border-collapse:collapse">' + "".join(rows) + "</table></div>")
+    return (
+        '<div style="overflow-x:auto"><table style="font-family:var(--font-mono,monospace);font-size:11px;'
+        'border-collapse:collapse">' + "".join(rows) + "</table></div>"
+    )
 
 
 ALL_WF, NO_WF = "__all__", "__none__"
 
 
-def workflow_options(df: pd.DataFrame, workflows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def workflow_options(
+    df: pd.DataFrame, workflows: List[Dict[str, Any]]
+) -> Dict[str, Dict[str, Any]]:
     """Opciones del selector: clave -> {label, agents|None}. Cuenta las citas de cada pipeline."""
-    opts: Dict[str, Dict[str, Any]] = {ALL_WF: {"label": f"Todos los pipelines · {len(df)} citas", "agents": None}}
+    opts: Dict[str, Dict[str, Any]] = {
+        ALL_WF: {"label": f"Todos los pipelines · {len(df)} citas", "agents": None}
+    }
     known: set = set()
     for w in workflows:
         ag = set(w.get("agents") or [])
         known |= ag
         n = int(df["agent"].isin(ag).sum()) if not df.empty else 0
-        opts[w["file"]] = {"label": f"{w.get('name') or w['file']} · {n} citas", "agents": ag}
+        opts[w["file"]] = {
+            "label": f"{w.get('name') or w['file']} · {n} citas",
+            "agents": ag,
+        }
     orphans = set(df["agent"].unique()) - known if not df.empty else set()
     if orphans:
-        opts[NO_WF] = {"label": f"Sin pipeline (agentes ya no configurados) · {int(df['agent'].isin(orphans).sum())} citas",
-                       "agents": orphans}
+        opts[NO_WF] = {
+            "label": f"Sin pipeline (agentes ya no configurados) · {int(df['agent'].isin(orphans).sum())} citas",
+            "agents": orphans,
+        }
     return opts
 
 
-def _pick_workflow(st, df: pd.DataFrame, workflows: List[Dict[str, Any]], key_prefix: str) -> Tuple[pd.DataFrame, str]:
+def _pick_workflow(
+    st, df: pd.DataFrame, workflows: List[Dict[str, Any]], key_prefix: str
+) -> Tuple[pd.DataFrame, str]:
     opts = workflow_options(df, workflows)
-    choice = st.selectbox("Pipeline discursivo", list(opts), format_func=lambda k: opts[k]["label"], key=f"{key_prefix}_wf")
+    choice = st.selectbox(
+        "Pipeline discursivo",
+        list(opts),
+        format_func=lambda k: opts[k]["label"],
+        key=f"{key_prefix}_wf",
+    )
     agents = opts[choice]["agents"]
     return (df if agents is None else df[df["agent"].isin(agents)]), choice
 
 
 def summarize(df: pd.DataFrame, n_uces_scope: int) -> Dict[str, Any]:
     if df.empty:
-        return {"n_spans": 0, "n_uces": 0, "coverage": 0.0, "n_agents": 0, "pct_alta": 0.0, "n_traits": 0}
-    return {"n_spans": int(len(df)), "n_uces": int(df["uce_id"].nunique()),
-            "coverage": df["uce_id"].nunique() / n_uces_scope if n_uces_scope else 0.0,
-            "n_agents": int(df["agent"].nunique()), "n_traits": int(df["trait"].nunique()),
-            "pct_alta": float((df["confidence"] == "alta").mean())}
+        return {
+            "n_spans": 0,
+            "n_uces": 0,
+            "coverage": 0.0,
+            "n_agents": 0,
+            "pct_alta": 0.0,
+            "n_traits": 0,
+        }
+    return {
+        "n_spans": int(len(df)),
+        "n_uces": int(df["uce_id"].nunique()),
+        "coverage": df["uce_id"].nunique() / n_uces_scope if n_uces_scope else 0.0,
+        "n_agents": int(df["agent"].nunique()),
+        "n_traits": int(df["trait"].nunique()),
+        "pct_alta": float((df["confidence"] == "alta").mean()),
+    }
 
 
 def render_discourse_results(
@@ -175,14 +242,28 @@ def render_discourse_results(
     """``workflows``: [{file, name, agents}] — un pipeline discursivo por JSON de ``ia/``."""
     import streamlit as st
 
-    (sec_rule or st.subheader)("Figuras del discurso · análisis IA")
     df_all = build_frame(annotations_by_uce, uces)
     if df_all.empty:
-        st.info("Todavía no hay análisis del discurso en la base de datos. Ejecútalo en la última pestaña "
-                "(paso 3 · Discurso) y se sincronizará automáticamente.")
+        # Estado vacío honesto: no se ha ejecutado el pipeline discursivo, así que
+        # NO mostramos el encabezado de sección como si hubiera resultados.
+        st.info(
+            "Todavía no hay análisis del discurso en la base de datos. Ejecútalo en la última pestaña "
+            "(paso 3 · Discurso) y se sincronizará automáticamente."
+        )
+        st.caption(
+            "La sección «Figuras del discurso» aparecerá aquí con sus pestañas de Evidencia/KWIC "
+            "una vez que el pipeline haya generado anotaciones."
+        )
         return
-    all_classes = st.toggle("Todas las clases", value=class_id is None, key=f"{key_prefix}_all")
-    scope_ids = {str(u.get("uce_id") or u.get("id")) for u in uces if all_classes or u.get("cluster_id") == class_id}
+    (sec_rule or st.subheader)("Figuras del discurso · análisis IA")
+    all_classes = st.toggle(
+        "Todas las clases", value=class_id is None, key=f"{key_prefix}_all"
+    )
+    scope_ids = {
+        str(u.get("uce_id") or u.get("id"))
+        for u in uces
+        if all_classes or u.get("cluster_id") == class_id
+    }
     df = df_all[df_all["uce_id"].isin(scope_ids)]
     wf_choice = ALL_WF
     if workflows:
@@ -199,33 +280,59 @@ def render_discourse_results(
     f1, f2, f3 = st.columns([2, 2, 1])
     agents = sorted(df["agent"].unique())
     # la clave incluye el pipeline: al cambiarlo, el filtro de agentes se reinicia
-    pick_agents = f1.multiselect("Agente", agents, default=agents, key=f"{key_prefix}_agents_{wf_choice}")
+    pick_agents = f1.multiselect(
+        "Agente", agents, default=agents, key=f"{key_prefix}_agents_{wf_choice}"
+    )
     confs = [c for c in ("alta", "media", "baja") if c in set(df["confidence"])]
-    pick_conf = f2.multiselect("Confianza", confs, default=confs, key=f"{key_prefix}_conf")
+    pick_conf = f2.multiselect(
+        "Confianza", confs, default=confs, key=f"{key_prefix}_conf"
+    )
     show_all = f3.checkbox("Ver todas", value=False, key=f"{key_prefix}_showall")
     df = df[df["agent"].isin(pick_agents) & df["confidence"].isin(pick_conf)]
-    order = df.groupby("trait").agg(n=("quote", "size"), best=("conf_rank", "max")).sort_values(["n", "best"], ascending=False)
+    order = (
+        df.groupby("trait")
+        .agg(n=("quote", "size"), best=("conf_rank", "max"))
+        .sort_values(["n", "best"], ascending=False)
+    )
     for ti, (trait, info) in enumerate(order.iterrows()):
-        g = df[df["trait"] == trait].sort_values(["conf_rank", "uce_id"], ascending=[False, True])
+        g = df[df["trait"] == trait].sort_values(
+            ["conf_rank", "uce_id"], ascending=[False, True]
+        )
         mix = Counter(g["confidence"])
-        chips = " ".join(f'<span style="color:{CONF_COLOR[c]};font-size:10px">{mix[c]} {c}</span>' for c in ("alta", "media", "baja") if mix.get(c))
+        chips = " ".join(
+            f'<span style="color:{CONF_COLOR[c]};font-size:10px">{mix[c]} {c}</span>'
+            for c in ("alta", "media", "baja")
+            if mix.get(c)
+        )
         st.markdown(
             f'<div style="display:flex;align-items:center;gap:10px;padding:10px 0 4px;border-bottom:.5px solid var(--border2,#8884)">'
             f'<span style="font-family:var(--font-mono,monospace);font-size:12px;font-weight:600;color:var(--text-hi)">{_esc(trait)}</span>'
             f'<span style="font-size:11px;color:var(--text-low)">{int(info["n"])} citas · {g["uce_id"].nunique()} UCEs</span>{chips}</div>',
-            unsafe_allow_html=True)
+            unsafe_allow_html=True,
+        )
         shown = g if show_all else g.head(per_trait_limit)
         ev, kw = st.tabs([f"Evidencia {ti + 1}", f"KWIC {ti + 1}"])
         with ev:
-            st.markdown("".join(evidence_card(grp, class_color) for _, grp in shown.groupby(["uce_id", "agent", "subtype"], sort=False)),
-                        unsafe_allow_html=True)
+            st.markdown(
+                "".join(
+                    evidence_card(grp, class_color)
+                    for _, grp in shown.groupby(
+                        ["uce_id", "agent", "subtype"], sort=False
+                    )
+                ),
+                unsafe_allow_html=True,
+            )
         with kw:
             st.markdown(kwic_rows(shown), unsafe_allow_html=True)
         if not show_all and len(g) > per_trait_limit:
-            st.caption(f"Mostrando {per_trait_limit} de {len(g)} citas. Activa «Ver todas» para ver el resto.")
+            st.caption(
+                f"Mostrando {per_trait_limit} de {len(g)} citas. Activa «Ver todas» para ver el resto."
+            )
 
 
-def render_discourse_results_from_db(class_id, class_colors, uces, sec_rule=None, conn_factory=None) -> None:
+def render_discourse_results_from_db(
+    class_id, class_colors, uces, sec_rule=None, conn_factory=None
+) -> None:
     """Lee las anotaciones de la BD (con caché por firma de la tabla) y dibuja la sección."""
     import streamlit as st
 
@@ -240,19 +347,34 @@ def render_discourse_results_from_db(class_id, class_colors, uces, sec_rule=None
             return ddb.load_annotations_by_uce(conn)
 
     with conn_factory() as conn:
-        row = conn.execute("SELECT COUNT(*) AS n, MAX(annotation_id) AS m FROM annotations").fetchone()
+        row = conn.execute(
+            "SELECT COUNT(*) AS n, MAX(annotation_id) AS m FROM annotations"
+        ).fetchone()
     sig = (row["n"], row["m"]) if row else (0, None)
     ann = _load(sig) if sig[0] else {}
-    color = (class_colors or {}).get(class_id, "#7C6BF8") if class_id is not None else "#7C6BF8"
-    render_discourse_results(ann, uces, class_id, color, sec_rule, workflows=list_workflows())
+    color = (
+        (class_colors or {}).get(class_id, "#7C6BF8")
+        if class_id is not None
+        else "#7C6BF8"
+    )
+    render_discourse_results(
+        ann, uces, class_id, color, sec_rule, workflows=list_workflows()
+    )
 
 
 def list_workflows() -> List[Dict[str, Any]]:
     """Pipelines discursivos configurados (un JSON de ``ia/`` cada uno), con su nombre y agentes."""
     try:
-        from reii.ia_config_editor import get_workflow_agents, list_workflow_files, load_workflow_names
+        from reii.ia_config_editor import (
+            get_workflow_agents,
+            list_workflow_files,
+            load_workflow_names,
+        )
 
         names = load_workflow_names()
-        return [{"file": f, "name": names.get(f, f), "agents": get_workflow_agents(f)} for f in list_workflow_files()]
+        return [
+            {"file": f, "name": names.get(f, f), "agents": get_workflow_agents(f)}
+            for f in list_workflow_files()
+        ]
     except Exception:
         return []

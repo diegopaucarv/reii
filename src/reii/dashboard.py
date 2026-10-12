@@ -50,12 +50,9 @@ from reii.ia_config_editor import (
     delete_agent_from_source,
     get_workflow_agents,
     list_all_agents,
-    list_inactive_agent_files,
     list_workflow_files,
     load_discourse_config,
     load_discourse_state_progress,
-    load_grammar_config,
-    load_workflow_config,
     load_workflow_names,
     parse_json_text,
     parse_list_text,
@@ -63,7 +60,6 @@ from reii.ia_config_editor import (
     save_agent_to_source,
     save_discourse_config,
     save_grammar_config,
-    save_workflow_config,
     save_workflow_names,
     to_json_text,
     to_list_text,
@@ -6843,6 +6839,9 @@ def make_modalization_radar(cluster_id: int, _dm_key: bool):
     class_counts, class_totals = _compute_modalization(
         tuple(clusters_unicos), len(uces)
     )
+    # Estado vacío: si ninguna clase tiene palabras contadas, no hay datos que dibujar.
+    if not any(class_totals.get(str(c), 0) for c in clusters_unicos):
+        return None
     fig = go.Figure()
     for c in clusters_unicos:
         col = class_colors.get(c, "#AAA")
@@ -11753,6 +11752,10 @@ def _render_tab_c():
                 "Alta deóntica = discurso normativo. Alta polifonía = discurso referido.</div>",
                 unsafe_allow_html=True,
             )
+        else:
+            st.info(
+                "Perfil de modalización no disponible. Ejecuta el análisis discursivo para generarlo."
+            )
         _sec_rule("Análisis isotópico")
         if "iso_view" not in st.session_state:
             st.session_state.iso_view = "hyp"
@@ -12059,6 +12062,31 @@ def _render_tab_c():
                             st.rerun()
 
     # ── Figuras del discurso (análisis IA, desde la BD) · [pipeline-patch] d3 ──
+    # Indicador de vinculación: deja claro si el análisis discursivo se ha ejecutado
+    # y cuántas anotaciones existen, para que los resultados no parezcan "flotantes".
+    try:
+        from reii.ia_config_editor import load_discourse_state_summary
+
+        _disc_counts = load_discourse_state_summary()
+        _disc_total = sum(_disc_counts.values())
+        if _disc_total:
+            _disc_agents = ", ".join(
+                f"{a} ({n})" for a, n in sorted(_disc_counts.items())
+            )
+            st.caption(
+                f"Análisis discursivo ejecutado · {_disc_total} anotaciones en "
+                f"{len(_disc_counts)} agente(s): {_disc_agents}. "
+                "Estos resultados están vinculados a la ejecución del pipeline (paso 3 · Discurso)."
+            )
+        else:
+            st.caption(
+                "Análisis discursivo no ejecutado en esta sesión · 0 anotaciones. "
+                "Ejecuta el pipeline en la última pestaña (paso 3 · Discurso) para generar "
+                "las figuras del discurso."
+            )
+    except Exception:
+        pass
+
     try:
         from reii.pipelines.discourse_results import render_discourse_results_from_db
 
@@ -13894,40 +13922,115 @@ def _render_tab_e_crud():
     st.divider()
     st.subheader("⚙️ Configuración de agentes IA")
 
-    gram = load_grammar_config()
-    with st.expander(
-        "📝 Resumidor gramatical (ia/analisis_discursivo/resumidor_gramatical.json)",
-        expanded=False,
-    ):
-        st.text_input("Nombre", value=gram.get("name", ""), key="ia_gram_name")
-        st.text_input("Rol", value=gram.get("role", ""), key="ia_gram_role")
-        st.text_area(
-            "Instrucciones",
-            value=gram.get("instructions", ""),
-            key="ia_gram_instructions",
-            height=120,
-        )
-        st.text_area(
-            "json_schema (JSON)",
-            value=to_json_text(gram.get("json_schema", {})),
-            key="ia_gram_json_schema",
-            height=120,
-        )
-        st.text_area(
-            "few_shot_examples (JSON)",
-            value=to_json_text(gram.get("few_shot_examples", [])),
-            key="ia_gram_few_shot",
-            height=120,
-        )
-        if st.button("💾 Guardar resumidor", key="ia_gram_save", width="stretch"):
-            _save_grammar_from_widgets()
+    ss = st.session_state
+    all_agents = list_all_agents()
 
-    st.subheader("🤖 Agentes de discurso (ia/analisis_discursivo/discurso_lexico.json)")
-    disc = load_discourse_config()
-    for _name in list(disc.keys()):
-        _agent = disc[_name]
+    view_mode = st.radio(
+        "Vista", ["Agentes", "JSON"], horizontal=True, key="ia_view_mode"
+    )
+
+    if view_mode == "JSON":
+        # Vista JSON: dict completo de todos los agentes, con `_source` por agente.
+        full = {}
+        for _e in all_agents:
+            _a = dict(_e["agent"])
+            _a["_source"] = _e["source"]
+            full[_e["name"]] = _a
+        st.text_area(
+            "JSON de todos los agentes",
+            value=to_json_text(full),
+            key="ia_json_all",
+            height=420,
+        )
+        if st.button("💾 Guardar JSON", key="ia_json_save", width="stretch"):
+            ok, data, err = parse_json_text(ss.get("ia_json_all", "{}"))
+            if not ok:
+                st.error(f"JSON inválido: {err}")
+            else:
+                saved = 0
+                for _name, _agent in data.items():
+                    if not isinstance(_agent, dict):
+                        continue
+                    _source = _agent.pop("_source", None)
+                    if not _source:
+                        continue
+                    save_agent_to_source(
+                        {"name": _name, "source": _source, "agent": _agent}
+                    )
+                    saved += 1
+                st.success(f"Guardados {saved} agente(s).")
+                st.rerun()
+        return
+
+    # ── Vista Agentes ──
+    # Orden de ejecución (drag-drop aproximado): el usuario escribe los nombres
+    # uno por línea y la lista se renderiza en ese orden.
+    st.text_area(
+        "Orden de ejecución (uno por línea)",
+        value="\n".join(_e["name"] for _e in all_agents),
+        key="ia_group_order",
+        height=110,
+    )
+    st.caption("Orden de ejecución (uno por línea)")
+
+    _by_name = {_e["name"]: _e for _e in all_agents}
+    _ordered: List[Dict[str, Any]] = []
+    _seen: Set[str] = set()
+    for _ln in ss.get("ia_group_order", "").splitlines():
+        _n = _ln.strip()
+        if _n and _n in _by_name and _n not in _seen:
+            _ordered.append(_by_name[_n])
+            _seen.add(_n)
+    for _e in all_agents:
+        if _e["name"] not in _seen:
+            _ordered.append(_e)
+            _seen.add(_e["name"])
+
+    _agent_names = [_e["name"] for _e in _ordered]
+
+    # Cabecera: multiselect + ejecutar todos / seleccionados.
+    _h1, _h2, _h3 = st.columns([3, 2, 2])
+    with _h1:
+        st.multiselect("Seleccionar agentes", _agent_names, key="ia_sel_agents")
+    with _h2:
+        if st.button("▶ Ejecutar todos", key="ia_run_all", width="stretch"):
+            _pipeline_start_discourse_agents(
+                _agent_names, store=True, force=False, source="db"
+            )
+    with _h3:
+        _n_sel = len(ss.get("ia_sel_agents", []))
+        if st.button(
+            f"▶ Ejecutar seleccionados ({_n_sel})",
+            key="ia_run_sel",
+            width="stretch",
+            disabled=(_n_sel == 0),
+        ):
+            _pipeline_start_discourse_agents(
+                list(ss.get("ia_sel_agents", [])),
+                store=True,
+                force=False,
+                source="db",
+            )
+
+    for _entry in _ordered:
+        _name = _entry["name"]
+        _source = _entry["source"]
+        _agent = _entry["agent"]
         _k = _sanitize_key(_name)
+        _count = agent_executed_count(_name)
+        _is_grammar = _source == os.path.basename(GRAMMAR_CONFIG_PATH)
         with st.expander(f"🤖 {_name}", expanded=False):
+            if _count > 0:
+                st.markdown(
+                    f"<span style='color:green'>✓ ejecutado · {_count} UCEs</span>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    "<span style='color:gray'>— no ejecutado</span>",
+                    unsafe_allow_html=True,
+                )
+            st.caption(f"Fuente: `{_source}`")
             st.text_input(
                 "Nombre",
                 value=_agent.get("name", _name),
@@ -13962,29 +14065,31 @@ def _render_tab_e_crud():
                 value=to_list_text(_agent.get("disc_cats", [])),
                 key=f"ia_ag_{_k}_disc_cats",
             )
-            _c1, _c2 = st.columns(2)
+            _c1, _c2, _c3 = st.columns(3)
             with _c1:
                 if st.button("💾 Guardar", key=f"ia_ag_{_k}_save", width="stretch"):
-                    _save_agent_from_widgets(_name)
+                    _save_agent_unified(_entry)
             with _c2:
-                if st.button("🗑️ Eliminar", key=f"ia_ag_{_k}_del", width="stretch"):
-                    _delete_agent(_name)
+                _run_label = "▶ Ejecutar" if _count == 0 else "🔄 Re-ejecutar"
+                if st.button(_run_label, key=f"ia_ag_{_k}_run", width="stretch"):
+                    _pipeline_start_discourse_agent(
+                        _name, store=True, force=False, source="db"
+                    )
+            with _c3:
+                if st.button(
+                    "🗑️ Eliminar",
+                    key=f"ia_ag_{_k}_del",
+                    width="stretch",
+                    disabled=_is_grammar,
+                ):
+                    if delete_agent_from_source(_name, _source):
+                        st.success(f"Agente `{_name}` eliminado.")
+                        st.rerun()
 
     st.subheader("➕ Nuevo agente")
     st.text_input("Nombre del nuevo agente", key="ia_new_agent_name")
     if st.button("Crear agente", key="ia_new_agent_create", width="stretch"):
         _create_agent()
-
-    _inactive = list_inactive_agent_files()
-    if _inactive:
-        with st.expander("ℹ️ Workflows no editables aquí", expanded=False):
-            st.caption(
-                "Estos archivos existen en `ia/analisis_discursivo/` y SÍ son "
-                "workflows ejecutables desde arriba, pero este editor solo edita "
-                "`resumidor_gramatical.json` (resumidor gramatical) y "
-                "`discurso_lexico.json` (agentes de discurso)."
-            )
-            st.code(", ".join(_inactive))
 
 
 # ── [pipeline-patch] Pestaña E: Pipelines y configuración ─────────────────────────────

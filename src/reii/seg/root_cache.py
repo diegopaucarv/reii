@@ -98,8 +98,15 @@ class StanzaRootExtractor:
         except TypeError as e:
             if not kw:
                 raise
+            # Visible en consola: si esto ocurre, el coref se ejecuta de más y
+            # cada raíz pasa a tardar ~7s en vez de ~0.4s.
+            print(
+                f"   [COREF] ⚠ Stanza no admite `processors=` ({e}); "
+                "sujetos raíz con el pipeline COMPLETO (coref incluido)."
+            )
             logger.warning(
-                "Stanza no admite `processors=` (%s): sujetos raíz con el pipeline completo", e
+                "Stanza no admite `processors=` (%s): sujetos raíz con el pipeline completo",
+                e,
             )
             self.skip_coref = False
             return fn(inp)
@@ -129,7 +136,9 @@ class StanzaRootExtractor:
             return out
         docs = self._run(pipe, [texts[i] for i in idx], bulk=True)
         if len(docs) != len(idx):
-            raise ValueError(f"bulk_process devolvió {len(docs)} documentos para {len(idx)} textos")
+            raise ValueError(
+                f"bulk_process devolvió {len(docs)} documentos para {len(idx)} textos"
+            )
         for i, d in zip(idx, docs):
             out[i] = subjects_from_doc(d)
         return out
@@ -158,6 +167,9 @@ class RootSubjectCache:
         self._store: Dict[str, frozenset] = {}
         self.hits = 0
         self.misses = 0  # extracciones reales (llamadas a Stanza)
+        # Instrumentación B1: cuántos textos se resolvieron por lote vs individual.
+        self.batch_texts = 0
+        self.single_texts = 0
 
     def __len__(self) -> int:
         return len(self._store)
@@ -189,7 +201,11 @@ class RootSubjectCache:
         t0, done = time.time(), 0
 
         def _report() -> None:
-            if progress_every and done and (done % progress_every == 0 or done == len(pending)):
+            if (
+                progress_every
+                and done
+                and (done % progress_every == 0 or done == len(pending))
+            ):
                 el = time.time() - t0
                 print(
                     f"   [COREF] raíces {label}{done}/{len(pending)} "
@@ -198,7 +214,9 @@ class RootSubjectCache:
 
         i = 0
         while i < len(pending):
-            chunk = pending[i : i + self._batch_size] if self._batch else pending[i : i + 1]
+            chunk = (
+                pending[i : i + self._batch_size] if self._batch else pending[i : i + 1]
+            )
             if self._batch and len(chunk) > 1:
                 try:
                     out = self._batch(chunk)
@@ -207,6 +225,7 @@ class RootSubjectCache:
                     for text, subj in zip(chunk, out):
                         self._store[text] = frozenset(subj)
                         self.misses += 1
+                    self.batch_texts += len(chunk)
                     self._batch_failures = 0
                     i += len(chunk)
                     done += len(chunk)
@@ -216,16 +235,43 @@ class RootSubjectCache:
                     # Un texto problemático no debe apagar el batching: este lote va uno a
                     # uno y solo se desactiva tras ``max_batch_failures`` fallos seguidos.
                     self._batch_failures += 1
+                    # Visible en consola: si esto se repite, el batching está cayendo
+                    # a llamadas individuales (cada una ~7s en vez de ~0.4s).
+                    print(
+                        f"   [COREF] ⚠ lote de raíces falló ({e}); "
+                        f"se procesa una a una (fallo {self._batch_failures}/"
+                        f"{self._max_batch_failures})."
+                    )
                     logger.warning("raíces: lote falló (%s); se procesa una a una", e)
                     if self._batch_failures >= self._max_batch_failures:
-                        logger.warning("raíces: batching desactivado tras %d fallos", self._batch_failures)
+                        print(
+                            "   [COREF] ⚠ batching de raíces DESACTIVADO tras "
+                            f"{self._batch_failures} fallos seguidos."
+                        )
+                        logger.warning(
+                            "raíces: batching desactivado tras %d fallos",
+                            self._batch_failures,
+                        )
                         self._batch = None
             for text in chunk:
                 self.get(text)
+            self.single_texts += len(chunk)
             i += len(chunk)
             done += len(chunk)
             _report()
+        # Resumen B1: ratio lote vs individual, para diagnosticar la lentitud.
+        if self.batch_texts or self.single_texts:
+            print(
+                f"   [COREF] raíces {label}resumen: {self.batch_texts} por lote, "
+                f"{self.single_texts} individuales."
+            )
         return len(pending)
 
     def stats(self) -> Dict[str, int]:
-        return {"stanza_calls": self.misses, "cache_hits": self.hits, "cached": len(self._store)}
+        return {
+            "stanza_calls": self.misses,
+            "cache_hits": self.hits,
+            "cached": len(self._store),
+            "batch_texts": self.batch_texts,
+            "single_texts": self.single_texts,
+        }

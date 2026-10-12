@@ -201,8 +201,8 @@ def _config_widget(key: str, value: Any, origin: str, prefix: str):
     return st.text_input(label, value="" if value is None else str(value), key=wkey)
 
 
-def _tab_workflow(ctx: HubContext) -> None:
-    _how_it_works("workflow")
+def _tab_procesar_datos(ctx: HubContext) -> None:
+    _how_it_works("batch")
     if ctx.render_transcripciones is not None:
         with st.expander(
             "📥 Transcripciones y exportación al workflow", expanded=False
@@ -215,6 +215,11 @@ def _tab_workflow(ctx: HubContext) -> None:
                 ctx.render_transcripciones()
             except Exception as e:
                 st.error(f"⚠️ No se pudo cargar el gestor de transcripciones: {e}")
+    _run_panel(ctx, "batch")
+
+
+def _tab_workflow(ctx: HubContext) -> None:
+    _how_it_works("workflow")
     eff = ctx.get_effective_config()
     mode = st.radio(
         "Modo de procesamiento",
@@ -294,40 +299,10 @@ def _tab_discourse(ctx: HubContext) -> None:
     st.caption(
         "Al terminar, las anotaciones se sincronizan con la base de datos y aparecen en la última sección de la pestaña C."
     )
-    wfs = ctx.list_workflows()
-    if not wfs:
-        st.warning("No se encontraron workflows en `ia/` (archivos JSON de agentes).")
-    running = _running(ctx, "discourse")
-    for w in wfs:
-        with st.container(border=True):
-            c1, c2, c3 = st.columns([3, 2, 1])
-            new_name = c1.text_input(
-                "Nombre del workflow", value=w["name"], key=f"hub_wfname_{w['file']}"
-            )
-            c1.caption(f"{len(w['agents'])} agentes: {', '.join(w['agents'])}")
-            c2.progress(min(1.0, max(0.0, float(w.get("progress", 0.0)))))
-            c2.caption(
-                f"{float(w.get('progress', 0.0)) * 100:.0f}% procesado"
-                if w.get("progress")
-                else "Sin datos todavía"
-            )
-            if c3.button(
-                "▶ Ejecutar",
-                key=f"hub_wfrun_{w['file']}",
-                disabled=running,
-                use_container_width=True,
-            ):
-                if new_name != w["name"]:
-                    ctx.rename_workflow(w["file"], new_name)
-                ctx.start_discourse(w["file"], store, label, force, source)
-                st.rerun()
     _run_panel(ctx, "discourse")
     if ctx.render_agents_crud:
         with st.expander("Agentes y prompts (ia/*.json)", expanded=False):
-            if not running:
-                ctx.render_agents_crud()
-            else:
-                st.caption("Disponible cuando termine la ejecución.")
+            ctx.render_agents_crud()
 
 
 def render_pipeline_hub(ctx: HubContext) -> None:
@@ -335,10 +310,18 @@ def render_pipeline_hub(ctx: HubContext) -> None:
     status = ctx.get_status()
     _system_map(ctx, status)
     _checks(ctx, status)
-    t1, t2 = st.tabs(["2 · Clasificación", "3 · Análisis del discurso (IA)"])
+    t1, t2, t3 = st.tabs(
+        [
+            "1 · Procesar datos",
+            "2 · Clasificación",
+            "3 · Análisis del discurso (IA)",
+        ]
+    )
     with t1:
-        _tab_workflow(ctx)
+        _tab_procesar_datos(ctx)
     with t2:
+        _tab_workflow(ctx)
+    with t3:
         _tab_discourse(ctx)
     if ctx.render_entrevistas is not None:
         st.divider()
