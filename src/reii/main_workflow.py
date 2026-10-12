@@ -65,6 +65,7 @@ from reii.gram.gramatical_analyzer import (
     WordEmbeddingsAnalyzer,
     train_adverb_classifier,
 )
+from reii.gramatica import load_gramatica
 
 # Contrato dinámico de UCE para la fase abductiva.
 # NUNCA modificar uce.cluster_id desde _project_liminal_uces().
@@ -497,6 +498,24 @@ class Config:
     db_dsn: Optional[str] = DATABASE_URL
     # Escribir también el JSON de compatibilidad durante la transición.
     dual_write_json: bool = True
+
+    # ── Gramática personalizable (capa de personalización léxica) ──────────
+    # content_pos: POS que se consideran "activas" (entran al vocabulario).
+    content_pos: List[str] = field(
+        default_factory=lambda: ["NOUN", "VERB", "ADJ", "ADV"]
+    )
+    # stopwords_extra: palabras tratadas como suplementarias (además de is_stop).
+    stopwords_extra: List[str] = field(default_factory=list)
+    # expresiones: frases multi-palabra (separadas por espacio) unidas con '_'.
+    expresiones: List[str] = field(default_factory=list)
+    # palabras_activas: palabra -> POS forzado (fuerza a activa).
+    palabras_activas: Dict[str, str] = field(default_factory=dict)
+    # palabras_suplementarias: palabras forzadas a suplementarias/marcadores.
+    palabras_suplementarias: List[str] = field(default_factory=list)
+    # palabras_excluir: palabras eliminadas por completo.
+    palabras_excluir: List[str] = field(default_factory=list)
+    # sinonimos: variante -> raíz canónica (agrupa variantes bajo una raíz).
+    sinonimos: Dict[str, str] = field(default_factory=dict)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1394,7 +1413,31 @@ class SegmentadorALCESTE:
     def __init__(self, config: Config):
         self.config = config
         self.nlp = spacy.load(config.spacy_model)
-        self.content_pos = {"NOUN", "VERB", "ADJ", "ADV"}
+
+        # ── Gramática personalizable (capa de personalización léxica) ──────
+        # Carga el JSON (por defecto ia/gramatica.json) y sobreescribe los
+        # campos de Config con los valores resueltos. Los valores también se
+        # guardan como atributos de instancia para que lematizar_uces los use.
+        gramatica = load_gramatica()
+        self.config.content_pos = list(gramatica.get("content_pos", config.content_pos))
+        self.config.stopwords_extra = list(gramatica.get("stopwords_extra", []))
+        self.config.expresiones = list(gramatica.get("expresiones", []))
+        self.config.palabras_activas = dict(gramatica.get("palabras_activas", {}))
+        self.config.palabras_suplementarias = list(
+            gramatica.get("palabras_suplementarias", [])
+        )
+        self.config.palabras_excluir = list(gramatica.get("palabras_excluir", []))
+        self.config.sinonimos = dict(gramatica.get("sinonimos", {}))
+
+        # Valores resueltos (sets/dicts) para uso directo en lematizar_uces.
+        self.content_pos = set(self.config.content_pos)
+        self.stopwords_extra = set(self.config.stopwords_extra)
+        self.expresiones = list(self.config.expresiones)
+        self.palabras_activas = dict(self.config.palabras_activas)
+        self.palabras_suplementarias = set(self.config.palabras_suplementarias)
+        self.palabras_excluir = set(self.config.palabras_excluir)
+        self.sinonimos = dict(self.config.sinonimos)
+
         self.stemmer = (
             SnowballStemmer("spanish") if config.stem_backend == "snowball" else None
         )
@@ -1551,31 +1594,126 @@ class SegmentadorALCESTE:
             marcadores = []
             bigrams, bigram_stems = [], []
             trigrams, trigram_stems = [], []
-            all_tokens = []  # ← ADD THIS
+            all_tokens = []
 
+            # ── 1. Expresiones (frases multi-palabra) ─────────────────────
+            # Detecta frases del usuario en el texto y las une con '_' para
+            # que entren al vocabulario como una sola unidad (misma convención
+            # que bigramas/trigramas). Los tokens consumidos se excluyen del
+            # bucle individual para no duplicarlos. Se permiten nombres propios.
+            consumed_indices = set()
+            for expr in self.expresiones:
+                expr_words = expr.lower().split()
+                if not expr_words:
+                    continue
+                n = len(expr_words)
+                for start in range(len(tokens_raw) - n + 1):
+                    window = tokens_raw[start : start + n]
+                    if all(
+                        (w[2] == ew) or (w[1].lower() == ew)
+                        for w, ew in zip(window, expr_words)
+                    ):
+                        joined_lemma = "_".join(w[2] for w in window)
+                        joined_stem = "_".join(
+                            (stemmer.stem(w[2]) if stemmer else w[2]) for w in window
+                        )
+                        lemmas.append(joined_lemma)
+                        stems.append(joined_stem)
+                        pos_tags.append("PROPN")
+                        formas_tokens.append(
+                            {
+                                "forma": " ".join(w[1] for w in window),
+                                "lemma": joined_lemma,
+                                "stem": joined_stem,
+                                "pos": "PROPN",
+                                "pos_idx": window[0][0],
+                            }
+                        )
+                        for w in window:
+                            consumed_indices.add(w[0])
+                        break
+
+            # ── 2-5. Clasificación individual + reasignación + sinonimia ──
             for i, text, lemma, pos, is_stop, is_alpha in tokens_raw:
-                if is_alpha and pos != "PUNCT":  # ← ADD THIS
-                    all_tokens.append(text)  # ← ADD THIS
-                if pos in self.content_pos and not is_stop and is_alpha:
-                    stem = stemmer.stem(lemma) if stemmer else lemma
-                    lemmas.append(lemma)
+                if i in consumed_indices:
+                    continue
+
+                text_lower = text.lower()
+                lemma_lower = lemma.lower()
+
+                # 2. palabras_excluir: eliminar por completo.
+                if (
+                    text_lower in self.palabras_excluir
+                    or lemma_lower in self.palabras_excluir
+                ):
+                    continue
+
+                if is_alpha and pos != "PUNCT":
+                    all_tokens.append(text)
+
+                # 2. Reasignación individual.
+                forced_pos = self.palabras_activas.get(
+                    text_lower, self.palabras_activas.get(lemma_lower)
+                )
+                is_forced_supp = (
+                    text_lower in self.palabras_suplementarias
+                    or lemma_lower in self.palabras_suplementarias
+                )
+
+                # 3. stopwords_extra: tratar como suplementaria.
+                is_extra_stop = (
+                    text_lower in self.stopwords_extra
+                    or lemma_lower in self.stopwords_extra
+                )
+
+                # 5. Sinonimia: variante -> raíz canónica.
+                resolved_lemma = self.sinonimos.get(
+                    lemma_lower, self.sinonimos.get(text_lower, lemma)
+                )
+
+                # 4. Clasificación activa/suplementaria.
+                if forced_pos is not None:
+                    stem = stemmer.stem(resolved_lemma) if stemmer else resolved_lemma
+                    lemmas.append(resolved_lemma)
+                    stems.append(stem)
+                    pos_tags.append(forced_pos)
+                    formas_tokens.append(
+                        {
+                            "forma": text,
+                            "lemma": resolved_lemma,
+                            "stem": stem,
+                            "pos": forced_pos,
+                            "pos_idx": i,
+                        }
+                    )
+                elif (
+                    is_forced_supp
+                    or is_extra_stop
+                    or (
+                        is_alpha
+                        and (
+                            is_stop
+                            or pos
+                            in {"PRON", "SCONJ", "CCONJ", "DET", "AUX", "ADP", "INTJ"}
+                        )
+                    )
+                ):
+                    marcadores.append(
+                        {"forma": text.lower(), "lemma": resolved_lemma, "pos": pos}
+                    )
+                elif pos in self.content_pos and not is_stop and is_alpha:
+                    stem = stemmer.stem(resolved_lemma) if stemmer else resolved_lemma
+                    lemmas.append(resolved_lemma)
                     stems.append(stem)
                     pos_tags.append(pos)
                     formas_tokens.append(
                         {
                             "forma": text,
-                            "lemma": lemma,
+                            "lemma": resolved_lemma,
                             "stem": stem,
                             "pos": pos,
                             "pos_idx": i,
                         }
-                    )
-                elif is_alpha and (
-                    is_stop
-                    or pos in {"PRON", "SCONJ", "CCONJ", "DET", "AUX", "ADP", "INTJ"}
-                ):
-                    marcadores.append(
-                        {"forma": text.lower(), "lemma": lemma, "pos": pos}
                     )
             if self.config.use_bigrams:
                 for j in range(len(tokens_raw) - 1):
@@ -3326,7 +3464,8 @@ class DoubleClassifier:
             ucs = self.segmentador.generar_embeddings_ucs(ucs)
 
         builder = MatrizBuilder(self.config)
-        voc = builder.construir_vocabulario(ucs)
+        uces_flat = [uce for doc_uces in uces_por_doc_local for uce in doc_uces]
+        voc = builder.construir_vocabulario(uces_flat)
         if not voc:
             return None
 
@@ -3405,7 +3544,8 @@ class DoubleClassifier:
             ucs = self.segmentador.generar_embeddings_ucs(ucs)
 
         builder = MatrizBuilder(self.config)
-        voc = builder.construir_vocabulario(ucs)
+        uces_flat = [uce for doc_uces in uces_por_doc_local for uce in doc_uces]
+        voc = builder.construir_vocabulario(uces_flat)
         if not voc:
             return None
 
@@ -3745,7 +3885,8 @@ class DoubleClassifier:
             ucs = self.segmentador.generar_embeddings_ucs(ucs)
 
         builder = MatrizBuilder(self.config)
-        voc = builder.construir_vocabulario(ucs)
+        uces_flat = [uce for doc_uces in uces_por_doc_local for uce in doc_uces]
+        voc = builder.construir_vocabulario(uces_flat)
         if not voc:
             print(f"   [COREF context={context_units}] Empty vocabulary — skipping.")
             return None

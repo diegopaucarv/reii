@@ -39,7 +39,6 @@ ESSENTIAL_KEYS = [
 class HubContext:
     get_status: Callable[[], Dict[str, Any]]
     session: Any
-    batch_open: Callable[[], None]
     get_effective_config: Callable[[], Dict[str, Any]]  # {clave: (valor, origen)}
     config_categories: Dict[str, List[str]]
     save_config: Callable[[Dict[str, Any]], Dict[str, Any]]
@@ -50,8 +49,11 @@ class HubContext:
     start_discourse: Callable[..., None]  # (file, store, label, force, source)
     run_fix: Callable[[str], str]
     render_agents_crud: Optional[Callable[[], None]] = None
-    render_batch: Optional[Callable[[], None]] = (
-        None  # ventana de procesamiento por lotes embebida
+    render_transcripciones: Optional[Callable[[], None]] = (
+        None  # gestión de transcripciones (subida/cola/log/exportación)
+    )
+    render_entrevistas: Optional[Callable[[], None]] = (
+        None  # editores de entrevistas (guía, prompts, localismos)
     )
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -151,26 +153,27 @@ def _run_panel(ctx: HubContext, pid: str) -> None:
             st.code("\n".join(log[-300:]))
 
 
-def _tab_batch(ctx: HubContext) -> None:
-    _how_it_works("batch")
-    if ctx.render_batch is not None:
-        # La primera sub-pestaña de la E es la propia ventana de procesamiento
-        # por lotes, embebida en lugar de abrirse como página completa.
-        try:
-            ctx.render_batch()
-        except Exception as e:
-            st.error(f"⚠️ No se pudo cargar el gestor de transcripciones: {e}")
-            _batch_open_button(ctx)
-    else:
-        _batch_open_button(ctx)
+# ── Design tokens (paleta consistente con el resto del dashboard) ──────
+_ACC = "#7c8cff"
+_MINT = "#50fa7b"
+_AMBER = "#ffb86c"
+_CORAL = "#f97b6b"
+_VIO = "#bd93f9"
 
 
-def _batch_open_button(ctx: HubContext) -> None:
+def _section_header(icon: str, title: str, sub: str = "") -> None:
+    """Cabecera de sección con acento de color, estilo 'app'."""
     st.markdown(
-        "La carga, la cola y el registro de transcripciones viven en el gestor de transcripciones."
+        f"<div style='display:flex;align-items:center;gap:10px;margin:6px 0 2px;'>"
+        f"<span style='font-size:20px'>{icon}</span>"
+        f"<div><div style='font-size:16px;font-weight:700;color:var(--text-hi);"
+        f"letter-spacing:.01em'>{title}</div>"
+        f"<div style='font-size:11px;color:var(--text-low);letter-spacing:.03em'>"
+        f"{sub}</div></div></div>"
+        f"<div style='height:2px;background:linear-gradient(90deg,{_ACC},transparent);"
+        f"border-radius:2px;margin:2px 0 10px;'></div>",
+        unsafe_allow_html=True,
     )
-    if st.button("Abrir gestor de transcripciones", key="hub_open_batch"):
-        ctx.batch_open()
 
 
 def _config_widget(key: str, value: Any, origin: str, prefix: str):
@@ -200,6 +203,18 @@ def _config_widget(key: str, value: Any, origin: str, prefix: str):
 
 def _tab_workflow(ctx: HubContext) -> None:
     _how_it_works("workflow")
+    if ctx.render_transcripciones is not None:
+        with st.expander(
+            "📥 Transcripciones y exportación al workflow", expanded=False
+        ):
+            st.caption(
+                "Sube transcripciones, revisa su estado, procesa la cola y exporta "
+                "al workflow principal. Los parámetros del análisis se aplican al exportar."
+            )
+            try:
+                ctx.render_transcripciones()
+            except Exception as e:
+                st.error(f"⚠️ No se pudo cargar el gestor de transcripciones: {e}")
     eff = ctx.get_effective_config()
     mode = st.radio(
         "Modo de procesamiento",
@@ -316,15 +331,22 @@ def _tab_discourse(ctx: HubContext) -> None:
 
 
 def render_pipeline_hub(ctx: HubContext) -> None:
-    st.subheader("Pipelines y configuración")
-    st.caption(HEADLINE)
+    _section_header("⚙️", "Pipelines y configuración", HEADLINE)
     status = ctx.get_status()
     _system_map(ctx, status)
     _checks(ctx, status)
-    t1, t2, t3 = st.tabs([f"{p.number} · {p.title}" for p in PIPELINES])
+    t1, t2 = st.tabs(["2 · Clasificación", "3 · Análisis del discurso (IA)"])
     with t1:
-        _tab_batch(ctx)
-    with t2:
         _tab_workflow(ctx)
-    with t3:
+    with t2:
         _tab_discourse(ctx)
+    if ctx.render_entrevistas is not None:
+        st.divider()
+        _section_header(
+            "📝", "Entrevistas y prompts", "Guía de preguntas, prompts y localismos"
+        )
+        with st.expander("Editores de entrevistas y prompts", expanded=False):
+            try:
+                ctx.render_entrevistas()
+            except Exception as e:
+                st.error(f"⚠️ No se pudieron cargar los editores de entrevistas: {e}")

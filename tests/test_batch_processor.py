@@ -76,15 +76,15 @@ def test_archivo_config_prompt_existe_y_tiene_claves(ruta):
 
 
 def test_build_prompt_segmentacion_incluye_localismos():
-    localismos = {"glosario": {"chamba": "trabajo"}, "preservar": []}
+    localismos = ["chamba", "táper"]
     mensajes = bp.build_prompt_segmentacion("transcripción de prueba", localismos)
     assert "chamba" in mensajes[0]["content"]
 
 
 def test_build_prompt_segmentacion_sin_localismos_no_incluye_bloque():
-    # Se pasa {} explícitamente: con None se cargaría ia/localismos.json,
-    # cuyo glosario ya contiene "chamba" y haría el test dependiente del archivo.
-    mensajes = bp.build_prompt_segmentacion("transcripción de prueba", {})
+    # Se pasa [] explícitamente: con None se cargaría ia/localismos.json,
+    # cuyo contenido haría el test dependiente del archivo.
+    mensajes = bp.build_prompt_segmentacion("transcripción de prueba", [])
     assert "chamba" not in mensajes[0]["content"]
 
 
@@ -97,7 +97,7 @@ def test_build_prompt_segmentacion_sin_localismos_no_incluye_bloque():
 )
 def test_prompt_estructura_dos_mensajes_y_transcripcion(builder):
     transcripcion = "Entrevista de prueba con contenido único."
-    mensajes = builder(transcripcion, {})
+    mensajes = builder(transcripcion, [])
 
     assert isinstance(mensajes, list)
     assert len(mensajes) == 2

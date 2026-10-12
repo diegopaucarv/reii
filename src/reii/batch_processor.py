@@ -210,6 +210,14 @@ SCHEMA_EXTRACCION: Dict = {
     ],
 }
 
+# Esquema para el agente de corrección (Paso 0): devuelve el texto corregido
+# en texto plano dentro de un objeto JSON mínimo.
+SCHEMA_CORRECCION: Dict = {
+    "type": "object",
+    "properties": {"texto_corregido": {"type": "string"}},
+    "required": ["texto_corregido"],
+}
+
 # ---------------------------------------------------------------------------
 # Prompts de sistema (Ruta 1 y Ruta 2)
 # ---------------------------------------------------------------------------
@@ -223,7 +231,7 @@ Reglas estrictas:
 - Extrae el texto LITERAL de la entrevista. No resumas, no parafrasees, no clasifiques y no omitas contenido del entrevistado.
 - ELIMINA las preguntas de la guía que el entrevistador lee en voz alta (al inicio o en cualquier punto de la entrevista): no las incluyas como contenido del entrevistado.
 - Corrige únicamente errores ortográficos y de puntuación evidentes del software de transcripción, pero NO cambies las palabras ni el tono del entrevistado.
-- Preserva los localismos y términos regionales/dialectales tal como los usa el entrevistado: NO los "corrijas" a su equivalente estándar. Son vocabulario válido.
+- Corrige las palabras mal transcritas (incluidos localismos) según el contexto, sin alterar el significado ni el tono del entrevistado.
 - Si una palabra fue mal transcrita de forma evidente, sustitúyela por la opción contextualmente correcta.
 - Si el entrevistador interrumpe en medio de una respuesta (comentario, aclaración, pregunta o cualquier intervención), coloca TODO el texto del entrevistador entre paréntesis ( ) dentro del mismo bloque. No uses etiquetas "Entrevistado:" ni "Entrevistador:".
 - Si una pregunta de la guía no fue formulada o está ausente, IGNÓRALA: no generes un segmento vacío.
@@ -237,7 +245,7 @@ Tu tarea es extraer y mapear las respuestas de la entrevista a las categorías d
 
 Reglas estrictas:
 - Limpia los errores de transcripción sobre la marcha (ortografía, palabras mal transcritas según el contexto, puntuación) sin alterar el significado.
-- Preserva los localismos y términos regionales/dialectales tal como los usa el entrevistado: NO los "corrijas" a su equivalente estándar. Son vocabulario válido.
+- Corrige las palabras mal transcritas (incluidos localismos) según el contexto, sin alterar el significado.
 - ELIMINA las preguntas de la guía que el entrevistador lee en voz alta: no las trates como respuestas del entrevistado.
 - Si el entrevistador interrumpe en medio de una respuesta, coloca TODO su texto entre paréntesis ( ) y no lo confundas con la respuesta del entrevistado.
 - Mapea de forma inteligente las respuestas a las categorías, sin importar en qué parte del texto aparezcan.
@@ -279,56 +287,76 @@ _PROMPT_EXTRACCION: Dict = load_prompt_config(EXTRACCION_CONFIG_PATH)
 # ---------------------------------------------------------------------------
 
 
-def load_localismos(path: str = None) -> Dict:
-    """Carga el archivo de localismos (términos regionales a preservar).
+def load_localismos(path: str = None) -> List[str]:
+    """Carga la lista de localismos (palabras que pudieron mal transcribirse).
 
-    Formato esperado: ``{"glosario": {término: glosa}, "preservar": [términos]}``.
-    Devuelve un dict normalizado con las claves ``glosario`` y ``preservar``;
-    si el archivo no existe o es inválido, devuelve ambos vacíos.
+    Acepta:
+    - Una lista JSON de strings (``["chamba", "táper"]``).
+    - Texto plano separado por comas, espacios o saltos de línea.
+    - El formato JSON antiguo ``{"glosario": {...}, "preservar": [...]}``
+      (se extraen las claves de ``glosario`` y los términos de ``preservar``).
+
+    Devuelve una lista de palabras en minúsculas, sin duplicados y sin vacíos.
+    Devuelve ``[]`` ante cualquier error o archivo inexistente.
     """
     ruta = Path(path) if path else Path(LOCALISMOS_PATH)
     if not ruta.exists():
-        return {"glosario": {}, "preservar": []}
+        return []
     try:
         with open(ruta, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {"glosario": {}, "preservar": []}
-    if not isinstance(data, dict):
-        return {"glosario": {}, "preservar": []}
-    glosario = data.get("glosario", {})
-    preservar = data.get("preservar", [])
-    if not isinstance(glosario, dict):
-        glosario = {}
-    if not isinstance(preservar, list):
-        preservar = []
-    return {"glosario": glosario, "preservar": preservar}
+            raw = f.read()
+    except OSError:
+        return []
+
+    palabras: List[str] = []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = None
+
+    if isinstance(data, list):
+        # Lista JSON de strings.
+        for item in data:
+            if isinstance(item, str):
+                palabras.append(item)
+    elif isinstance(data, dict):
+        # Formato antiguo {glosario, preservar}.
+        glosario = data.get("glosario", {})
+        preservar = data.get("preservar", [])
+        if isinstance(glosario, dict):
+            palabras.extend(str(k) for k in glosario.keys())
+        if isinstance(preservar, list):
+            palabras.extend(str(t) for t in preservar if isinstance(t, str))
+    else:
+        # Texto plano: separar por comas, espacios y saltos de línea.
+        palabras = re.split(r"[,\s]+", raw)
+
+    # Normaliza: minúsculas, sin espacios, sin duplicados, sin vacíos.
+    resultado: List[str] = []
+    vistos = set()
+    for p in palabras:
+        p = str(p).strip().lower()
+        if p and p not in vistos:
+            vistos.add(p)
+            resultado.append(p)
+    return resultado
 
 
-def _bloque_localismos(localismos: Dict) -> str:
-    """Construye el bloque de instrucciones para preservar localismos.
+def _bloque_localismos(localismos: List[str]) -> str:
+    """Construye el bloque de instrucciones para corregir localismos.
 
-    Devuelve una cadena vacía si no hay localismos definidos.
+    Devuelve una cadena vacía si la lista está vacía.
     """
-    glosario = localismos.get("glosario", {})
-    preservar = localismos.get("preservar", [])
-    if not glosario and not preservar:
+    if not localismos:
         return ""
-    lineas = []
-    if preservar:
-        lineas.append(
-            "Términos a preservar tal cual (no corregir): "
-            + ", ".join(str(t) for t in preservar)
-        )
-    if glosario:
-        lineas.append("Glosario de localismos (término → significado):")
-        for term, gloss in glosario.items():
-            lineas.append(f"- {term}: {gloss}")
-    return "\n".join(lineas)
+    return (
+        "Palabras que pudieron mal transcribirse (corrígelas según contexto, "
+        "incluyendo localismos): " + ", ".join(str(t) for t in localismos)
+    )
 
 
 def build_prompt_segmentacion(
-    transcripcion: str, localismos: Optional[Dict] = None
+    transcripcion: str, localismos: Optional[List[str]] = None
 ) -> List[Dict[str, str]]:
     """Construye los mensajes (system + user) para la Ruta 1 (segmentación)."""
     if localismos is None:
@@ -351,7 +379,7 @@ def build_prompt_segmentacion(
 
 
 def build_prompt_extraccion(
-    transcripcion: str, localismos: Optional[Dict] = None
+    transcripcion: str, localismos: Optional[List[str]] = None
 ) -> List[Dict[str, str]]:
     """Construye los mensajes (system + user) para la Ruta 2 (extracción)."""
     if localismos is None:
@@ -368,6 +396,38 @@ def build_prompt_extraccion(
                 f"Guía de entrevista:\n{guia_como_texto()}\n\n"
                 f"Entrevista actual:\n{transcripcion}\n\n"
                 "Devuelve únicamente el objeto JSON válido según el esquema."
+            ),
+        },
+    ]
+
+
+def build_prompt_correccion(
+    transcripcion: str, localismos: Optional[List[str]] = None
+) -> List[Dict[str, str]]:
+    """Construye los mensajes (system + user) para el agente de corrección.
+
+    Pide revisar la transcripción cruda, identificar palabras mal transcritas
+    (usando la lista de localismos como pistas) y devolver el texto corregido
+    en texto plano (no JSON).
+    """
+    if localismos is None:
+        localismos = load_localismos()
+    system = (
+        "Eres un asistente de corrección de transcripciones de entrevistas.\n\n"
+        "Corrige errores de transcripción evidentes y palabras mal transcritas "
+        "(incluidos localismos) usando el contexto. Devuelve únicamente el "
+        "texto corregido."
+    )
+    bloque = _bloque_localismos(localismos)
+    if bloque:
+        system = system + "\n\n" + bloque
+    return [
+        {"role": "system", "content": system},
+        {
+            "role": "user",
+            "content": (
+                f"Transcripción original:\n{transcripcion}\n\n"
+                "Devuelve únicamente el texto corregido."
             ),
         },
     ]
@@ -430,12 +490,12 @@ class BatchProcessor:
         db_path: str = BATCH_DB_PATH,
         max_retries: int = 3,
         temperature: float = 0.2,
-        localismos: Optional[Dict] = None,
+        localismos: Optional[List[str]] = None,
     ) -> None:
         self.db_path: str = db_path
         self.max_retries: int = max_retries
         self.temperature: float = temperature
-        self.localismos: Dict = (
+        self.localismos: List[str] = (
             localismos if localismos is not None else load_localismos()
         )
         self._ensure_db()
@@ -563,15 +623,33 @@ class BatchProcessor:
             # El texto original se conserva intacto en el registro.
             transcripcion = colapsar_repeticiones(transcripcion)
 
+            # Paso 0 — Corrección: un agente revisa la transcripción cruda y
+            # devuelve una versión corregida (errores evidentes y localismos)
+            # antes de segmentar y extraer. Si falla, se usa el original.
+            transcripcion_corregida = transcripcion
+            try:
+                correccion = call_deepseek_structured(
+                    build_prompt_correccion(transcripcion, self.localismos),
+                    SCHEMA_CORRECCION,
+                    max_retries=self.max_retries,
+                    temperature=self.temperature,
+                    log_cb=_cb,
+                )
+                texto = correccion.get("texto_corregido")
+                if isinstance(texto, str) and texto.strip():
+                    transcripcion_corregida = texto.strip()
+            except Exception as e:
+                _cb(f"⚠️ Corrección fallida, usando transcripción original: {e}")
+
             segmentos = call_deepseek_structured(
-                build_prompt_segmentacion(transcripcion, self.localismos),
+                build_prompt_segmentacion(transcripcion_corregida, self.localismos),
                 _PROMPT_SEGMENTACION.get("json_schema") or SCHEMA_SEGMENTACION,
                 max_retries=self.max_retries,
                 temperature=self.temperature,
                 log_cb=_cb,
             )
             extraccion = call_deepseek_structured(
-                build_prompt_extraccion(transcripcion, self.localismos),
+                build_prompt_extraccion(transcripcion_corregida, self.localismos),
                 _PROMPT_EXTRACCION.get("json_schema") or SCHEMA_EXTRACCION,
                 max_retries=self.max_retries,
                 temperature=self.temperature,

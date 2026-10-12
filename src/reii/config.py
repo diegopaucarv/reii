@@ -116,6 +116,9 @@ GRAMMAR_CONFIG_PATH: str = str(
         "REII_GRAMMAR_CONFIG_PATH", "ia/analisis_discursivo/resumidor_gramatical.json"
     )
 )
+GRAMATICA_PATH: str = str(
+    ROOT_DIR / os.environ.get("REII_GRAMATICA_PATH", "ia/gramatica.json")
+)
 DISCOURSE_CONFIG_PATH: str = str(
     ROOT_DIR
     / os.environ.get(
@@ -124,6 +127,10 @@ DISCOURSE_CONFIG_PATH: str = str(
 )
 LOCALISMOS_PATH: str = str(
     ROOT_DIR / os.environ.get("REII_LOCALISMOS_PATH", "ia/localismos.json")
+)
+ENTREVISTAS_DIR = IA_DIR / "entrevistas"
+GUIA_ENTREVISTA_PATH: str = str(
+    ROOT_DIR / os.environ.get("REII_GUIA_ENTREVISTA_PATH", "ia/entrevistas/guia.json")
 )
 SEGMENTACION_CONFIG_PATH: str = str(
     ROOT_DIR
