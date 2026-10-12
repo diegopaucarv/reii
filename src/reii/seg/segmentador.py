@@ -24,6 +24,7 @@ from reii.config import (
     ROOTS_SKIP_COREF,
     SEGMENTER_EMBEDDING_MODEL,
     SPACY_MODEL,
+    STANZA_USE_GPU,
 )
 from reii.seg.root_cache import RootSubjectCache, StanzaRootExtractor
 
@@ -74,6 +75,18 @@ def conversational_sbd(doc):
 
 
 device = 0 if torch.cuda.is_available() else -1
+
+
+# ── Filtro rápido de candidatos a correferencia (B2) ─────────────────────────
+# Si la ventana no contiene pronombres personales ni nombres propios con
+# mayúscula inicial, se salta la llamada a Stanza coref. Chequeo conservador:
+# ante la duda (falso positivo) se procesa la ventana.
+_COREF_CANDIDATE_RE = re.compile(
+    r"(?i:\b(?:él|ella|ellos|ellas|lo|la|le|les|los|las|se|su|sus|me|te|nos|os|mí|mi|ti|sí|conmigo|contigo|consigo)\b)"
+    r"|\b[A-ZÁÉÍÓÚÑ][a-záéíóúñü]{1,}\b"
+    r"|\b[A-ZÁÉÍÓÚÑ]{2,}\b",
+    re.UNICODE,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -291,9 +304,11 @@ class ProgressiveSegmenter:
         self.hnsw_ef = hnsw_ef
         self.hnsw_m = hnsw_m
         self.stanza_lang = stanza_lang
-        # Antes: ``device is not None`` -> Stanza siempre en CPU cuando no se pasaba device
-        # (el caso habitual), aunque SentenceTransformer sí usara CUDA.
-        self.stanza_use_gpu = str(self.device).startswith("cuda")
+        # Stanza se mantiene en CPU por defecto (config/env REII_STANZA_USE_GPU,
+        # default false) para no desplazar presión de RAM a VRAM. Antes se derivaba
+        # de self.device, que ahora es CUDA cuando hay GPU, lo que forzaba Stanza a
+        # GPU casi siempre y podía provocar OOM de VRAM en inferencia.
+        self.stanza_use_gpu = STANZA_USE_GPU
         self.debug_coref = debug_coref  # toggle for coref debug prints
 
         self.model = SentenceTransformer(model_name).to(self.device)
@@ -311,7 +326,9 @@ class ProgressiveSegmenter:
         # y, opcionalmente, por lotes. La caché (últimos 500 chars) la comparten B1 y B2.
         self._roots = StanzaRootExtractor(
             self.get_stanza,
-            skip_coref=ROOTS_SKIP_COREF if roots_skip_coref is None else roots_skip_coref,
+            skip_coref=ROOTS_SKIP_COREF
+            if roots_skip_coref is None
+            else roots_skip_coref,
         )
         _bs = ROOTS_BATCH_SIZE if roots_batch_size is None else int(roots_batch_size)
         self.root_cache = RootSubjectCache(
@@ -326,6 +343,17 @@ class ProgressiveSegmenter:
         """Print only when debug_coref is True."""
         if self.debug_coref:
             print(f"[COREF] {msg}")
+
+    def _empty_cuda_cache(self):
+        """Free fragmented VRAM after a Stanza window failure (guarded)."""
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        # CPU-only: empty_cache() es un no-op; gc.collect() libera los tensores
+        # de PyTorch retenidos por los Document de Stanza.
+        gc.collect()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Stanza lazy-load  FIX: was writing self.stanza_pipeline (no underscore)
@@ -354,7 +382,9 @@ class ProgressiveSegmenter:
                     except Exception as gpu_err:
                         if not use_gpu:
                             raise
-                        print(f"[COREF] ✗ Stanza en GPU falló ({gpu_err}); reintentando en CPU.")
+                        print(
+                            f"[COREF] ✗ Stanza en GPU falló ({gpu_err}); reintentando en CPU."
+                        )
                 print(
                     f"[COREF] ✓ Stanza coref pipeline cargado ({'GPU' if use_gpu else 'CPU'})."
                 )
@@ -728,137 +758,165 @@ class ProgressiveSegmenter:
             )
 
             MAX_WINDOW_CHARS = 4000
+            CHUNK_OVERLAP = 500
 
-            if window_char_len > MAX_WINDOW_CHARS and len(buffer) > 1:
-                # Try shrinking the buffer by 1 from the left until it fits
-                shrunk_buffer = buffer[1:]
-                while (
-                    shrunk_buffer
-                    and len(full_doc_text[shrunk_buffer[0][0] : shrunk_buffer[-1][1]])
-                    > MAX_WINDOW_CHARS
-                ):
-                    shrunk_buffer = shrunk_buffer[1:]
-
-                if shrunk_buffer:
-                    effective_start = shrunk_buffer[0][0]
-                    effective_end = shrunk_buffer[-1][1]
-                    window_text = full_doc_text[effective_start:effective_end]
-                    self._dprint(
-                        f"    Ventana reducida ({window_char_len} → {len(window_text)} chars, "
-                        f"buffer {len(buffer)} → {len(shrunk_buffer)})"
-                    )
-                else:
-                    # Nothing fits — hard truncate as last resort
-                    window_text = window_text[:MAX_WINDOW_CHARS]
-                    self._dprint(
-                        f"    Ventana truncada a {MAX_WINDOW_CHARS} chars (fallback)."
-                    )
-
-            try:
-                doc = stanza_pipe(window_text)
-                n_chains_raw = len(doc.coref) if doc.coref else 0
+            # ── Troceo con solape (reemplaza el truncado duro) ──
+            # Si la ventana supera MAX_WINDOW_CHARS se divide en sub-ventanas de
+            # ~4000 chars con ~500 chars de solape entre trozos consecutivos.
+            # El solape es crítico: una cadena que cruza la frontera entre dos
+            # trozos debe aparecer en ambos; el dedup por fingerprint (más abajo)
+            # evita contarla dos veces. Esto cubre también el caso
+            # len(buffer) == 1 (UCE gigante) que antes procesaba el documento
+            # entero de una vez → OOM.
+            if window_char_len > MAX_WINDOW_CHARS:
+                step = MAX_WINDOW_CHARS - CHUNK_OVERLAP
+                sub_windows = []
+                pos = 0
+                while pos < window_char_len:
+                    end = min(pos + MAX_WINDOW_CHARS, window_char_len)
+                    sub_windows.append((window_text[pos:end], window_start + pos))
+                    if end == window_char_len:
+                        break
+                    pos += step
                 self._dprint(
-                    f"    Stanza OK → {n_chains_raw} cadenas en ventana bruta."
+                    f"    Ventana grande ({window_char_len} chars) troceada en "
+                    f"{len(sub_windows)} sub-ventanas de ~{MAX_WINDOW_CHARS} chars "
+                    f"con solape de ~{CHUNK_OVERLAP} chars."
                 )
-            except MemoryError:
-                self._dprint(
-                    f"    MemoryError en ventana UCE {uce_idx + 1} — saltando."
-                )
-                gc.collect()
-                continue
-            except Exception as e:
-                logging.error(
-                    f"[COREF] Stanza window error [{window_start}:{window_end}]: {e}"
-                )
-                self._dprint(f"    ✗ Stanza falló en ventana UCE {uce_idx + 1}: {e}")
-                continue
+            else:
+                sub_windows = [(window_text, window_start)]
 
-            mapper = self.OffsetMapper(window_start)
-            new_chains_this_window = 0
-            skipped_dupes = 0
-
-            skipped_mentions = 0
-            for chain_idx, chain in enumerate(doc.coref):
-                mentions = []
-
-                for mention in chain.mentions:
-                    # Defensive index extraction (MWT / Spanish contraction guard)
-                    s_idx = (
-                        mention.sentence[0]
-                        if isinstance(mention.sentence, (tuple, list))
-                        else mention.sentence
+            for sub_idx, (sub_text, sub_start) in enumerate(sub_windows):
+                # ── Filtro rápido de candidatos a correferencia (B2) ──
+                # Sin pronombres personales ni nombres propios (mayúscula
+                # inicial) no puede haber cadenas de coref: se salta Stanza.
+                # Chequeo conservador: ante la duda, se procesa la ventana.
+                if not _COREF_CANDIDATE_RE.search(sub_text):
+                    self._dprint(
+                        f"    Sub-ventana {sub_idx + 1}/{len(sub_windows)} sin "
+                        f"candidatos de correferencia — saltando Stanza."
                     )
-                    sw_idx = (
-                        mention.start_word[0]
-                        if isinstance(mention.start_word, (tuple, list))
-                        else mention.start_word
+                    continue
+
+                try:
+                    doc = stanza_pipe(sub_text)
+                    n_chains_raw = len(doc.coref) if doc.coref else 0
+                    self._dprint(
+                        f"    Stanza OK → {n_chains_raw} cadenas en sub-ventana "
+                        f"{sub_idx + 1}/{len(sub_windows)}."
                     )
-                    ew_idx = (
-                        mention.end_word[-1]
-                        if isinstance(mention.end_word, (tuple, list))
-                        else mention.end_word
+                except MemoryError:
+                    self._dprint(
+                        f"    MemoryError en ventana UCE {uce_idx + 1} "
+                        f"(sub-ventana {sub_idx + 1}) — saltando."
                     )
+                    gc.collect()
+                    self._empty_cuda_cache()
+                    continue
+                except Exception as e:
+                    logging.error(
+                        f"[COREF] Stanza window error "
+                        f"[{sub_start}:{sub_start + len(sub_text)}]: {e}"
+                    )
+                    self._dprint(
+                        f"    ✗ Stanza falló en ventana UCE {uce_idx + 1}: {e}"
+                    )
+                    self._empty_cuda_cache()
+                    continue
 
-                    sent = doc.sentences[s_idx]
-                    first_word = sent.words[sw_idx]
-                    last_word = sent.words[ew_idx - 1]
+                mapper = self.OffsetMapper(sub_start)
+                new_chains_this_window = 0
+                skipped_dupes = 0
 
-                    m_start_local = first_word.start_char
-                    if m_start_local is None and getattr(first_word, "parent", None):
-                        m_start_local = first_word.parent.start_char
+                skipped_mentions = 0
+                for chain_idx, chain in enumerate(doc.coref):
+                    mentions = []
 
-                    m_end_local = last_word.end_char
-                    if m_end_local is None and getattr(last_word, "parent", None):
-                        m_end_local = last_word.parent.end_char
-
-                    if m_start_local is None or m_end_local is None:
-                        skipped_mentions += 1
-                        self._dprint(
-                            f"      Mención saltada (offset None): "
-                            f"cadena {chain_idx}, palabra '{first_word.text}'"
+                    for mention in chain.mentions:
+                        # Defensive index extraction (MWT / Spanish contraction guard)
+                        s_idx = (
+                            mention.sentence[0]
+                            if isinstance(mention.sentence, (tuple, list))
+                            else mention.sentence
                         )
+                        sw_idx = (
+                            mention.start_word[0]
+                            if isinstance(mention.start_word, (tuple, list))
+                            else mention.start_word
+                        )
+                        ew_idx = (
+                            mention.end_word[-1]
+                            if isinstance(mention.end_word, (tuple, list))
+                            else mention.end_word
+                        )
+
+                        sent = doc.sentences[s_idx]
+                        first_word = sent.words[sw_idx]
+                        last_word = sent.words[ew_idx - 1]
+
+                        m_start_local = first_word.start_char
+                        if m_start_local is None and getattr(
+                            first_word, "parent", None
+                        ):
+                            m_start_local = first_word.parent.start_char
+
+                        m_end_local = last_word.end_char
+                        if m_end_local is None and getattr(last_word, "parent", None):
+                            m_end_local = last_word.parent.end_char
+
+                        if m_start_local is None or m_end_local is None:
+                            skipped_mentions += 1
+                            self._dprint(
+                                f"      Mención saltada (offset None): "
+                                f"cadena {chain_idx}, palabra '{first_word.text}'"
+                            )
+                            continue
+
+                        m_start_global, m_end_global = mapper.to_global(
+                            m_start_local, m_end_local
+                        )
+                        mentions.append(
+                            {
+                                "text": sub_text[m_start_local:m_end_local],
+                                "start_char": m_start_global,
+                                "end_char": m_end_global,
+                            }
+                        )
+
+                    if not mentions:
                         continue
 
-                    m_start_global, m_end_global = mapper.to_global(
-                        m_start_local, m_end_local
+                    # ── FIX: deduplicate chains by their global mention span fingerprint ──
+                    chain_key = tuple(
+                        sorted((m["start_char"], m["end_char"]) for m in mentions)
                     )
-                    mentions.append(
-                        {
-                            "text": window_text[m_start_local:m_end_local],
-                            "start_char": m_start_global,
-                            "end_char": m_end_global,
-                        }
-                    )
+                    if chain_key in seen_chain_keys:
+                        skipped_dupes += 1
+                        continue
+                    seen_chain_keys.add(chain_key)
 
-                if not mentions:
-                    continue
+                    global_chains.append({"mentions": mentions})
+                    new_chains_this_window += 1
 
-                # ── FIX: deduplicate chains by their global mention span fingerprint ──
-                chain_key = tuple(
-                    sorted((m["start_char"], m["end_char"]) for m in mentions)
+                    if self.debug_coref:
+                        mention_texts = [m["text"] for m in mentions]
+                        self._dprint(
+                            f"      ✓ Cadena #{len(global_chains)} añadida | "
+                            f"{len(mentions)} menciones: {mention_texts}"
+                        )
+
+                self._dprint(
+                    f"    Ventana {uce_idx + 1} (sub-ventana "
+                    f"{sub_idx + 1}/{len(sub_windows)}) resumen: "
+                    f"+{new_chains_this_window} nuevas, "
+                    f"{skipped_dupes} dupes saltados, "
+                    f"{skipped_mentions} menciones None-offset saltadas. "
+                    f"Total acumulado: {len(global_chains)} cadenas."
                 )
-                if chain_key in seen_chain_keys:
-                    skipped_dupes += 1
-                    continue
-                seen_chain_keys.add(chain_key)
 
-                global_chains.append({"mentions": mentions})
-                new_chains_this_window += 1
-
-                if self.debug_coref:
-                    mention_texts = [m["text"] for m in mentions]
-                    self._dprint(
-                        f"      ✓ Cadena #{len(global_chains)} añadida | "
-                        f"{len(mentions)} menciones: {mention_texts}"
-                    )
-
-            self._dprint(
-                f"    Ventana {uce_idx + 1} resumen: "
-                f"+{new_chains_this_window} nuevas, "
-                f"{skipped_dupes} dupes saltados, "
-                f"{skipped_mentions} menciones None-offset saltadas. "
-                f"Total acumulado: {len(global_chains)} cadenas."
-            )
+                # ── Liberar memoria: el Document de Stanza retiene tensores ──
+                del doc
+                gc.collect()
 
         self._dprint(
             f"Extracción global completada: {len(global_chains)} cadenas únicas "

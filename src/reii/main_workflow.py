@@ -19,7 +19,7 @@ from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import nltk
 import numpy as np
@@ -3377,6 +3377,47 @@ def _remap_uces_to_segments(
     return groups
 
 
+def _cargar_checkpoint_coref(checkpoint_path: str) -> Optional[Dict]:
+    """Carga un checkpoint de _clasificar_umbral_coref.
+
+    Devuelve None si el archivo no existe, está corrupto o tiene una versión
+    desconocida (en ese caso se empieza de cero, sin abortar el pipeline).
+    """
+    if not os.path.exists(checkpoint_path):
+        return None
+    try:
+        with open(checkpoint_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if data.get("version") != 1:
+            logger.warning(
+                "Checkpoint con versión desconocida (%s) — ignorado.",
+                checkpoint_path,
+            )
+            return None
+        return data
+    except Exception as e:
+        logger.warning("No se pudo cargar el checkpoint %s: %s", checkpoint_path, e)
+        return None
+
+
+def _guardar_checkpoint_coref(checkpoint_path: str, state: Dict) -> None:
+    """Escribe el checkpoint de forma atómica (tmp + os.replace).
+
+    Un fallo de escritura solo se registra en el log: nunca debe romper el
+    pipeline de clasificación.
+    """
+    try:
+        d = os.path.dirname(checkpoint_path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp_path = f"{checkpoint_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False, cls=_NumpyEncoder)
+        os.replace(tmp_path, checkpoint_path)
+    except Exception as e:
+        logger.warning("No se pudo escribir el checkpoint %s: %s", checkpoint_path, e)
+
+
 # ══════════════════════════════════════════════════════════════════════
 # T3 — DOBLE CLASIFICACIÓN (refactorizado para CDH)
 # ══════════════════════════════════════════════════════════════════════
@@ -3598,6 +3639,7 @@ class DoubleClassifier:
         min_forms: int,
         context_units: int,
         retrofitted_vectors: Optional[Dict[str, np.ndarray]] = None,
+        checkpoint_path: Optional[str] = None,
     ) -> Optional[Dict]:
         """
         Builds UCs by dissolving UCE boundaries that are bridged by a
@@ -3640,6 +3682,14 @@ class DoubleClassifier:
           • Zero UCs produced after min_forms floor
           • Empty vocabulary after UC construction
         Callers (run()) treat None as "Method B unavailable for this pass."
+
+        Checkpointing (opcional)
+        ────────────────────────
+        checkpoint_path : si se pasa, tras cada documento se escribe un JSON con
+          los UCs ya construidos, el mapeo uce→uc, los acumuladores de calidad y
+          el root_cache. Si el proceso muere (OOM, corte de energía), una
+          re-ejecución con el mismo checkpoint_path reanuda saltando los
+          documentos ya completados. Con None (default) no hay checkpointing.
         """
         # ── 0. Guard: hard fail, no silent fallback ───────────────────────────
         ps = self.progressive_segmenter
@@ -3684,8 +3734,41 @@ class DoubleClassifier:
 
         doc_metadata_map = self.segmentador.doc_metadata_map
 
+        # ── 3'. Checkpointing: reanudar desde un checkpoint previo ──────────
+        processed_doc_ids: List[str] = []
+        processed_doc_set: Set[str] = set()
+        if checkpoint_path:
+            ckpt = _cargar_checkpoint_coref(checkpoint_path)
+            if ckpt is not None:
+                processed_doc_ids = ckpt["processed_doc_ids"]
+                processed_doc_set = set(processed_doc_ids)
+                ucs = [UC.from_dict(d) for d in ckpt["ucs"]]
+                uce_to_uc = dict(ckpt["uce_to_uc"])
+                global_uc_counter = ckpt["global_uc_counter"]
+                total_boundaries = ckpt["total_boundaries"]
+                coref_merges = ckpt["coref_merges"]
+                covered_boundaries = ckpt["covered_boundaries"]
+                total_chains = ckpt["total_chains"]
+                for ctx, subjects in ckpt["root_cache"].items():
+                    rcache._store[ctx] = frozenset(subjects)
+                print(
+                    f"   [COREF] Checkpoint cargado ({checkpoint_path}): "
+                    f"{len(processed_doc_ids)} docs ya procesados, "
+                    f"{len(ucs)} UCs — reanudando."
+                )
+            else:
+                print(
+                    f"   [COREF] No hay checkpoint válido en {checkpoint_path} — "
+                    "empezando de cero."
+                )
+
         for doc_uces in uces_por_doc_local:
             if not doc_uces:
+                continue
+            doc_id = doc_uces[0].doc_id
+
+            # Reanudar: saltar documentos ya completados (checkpointing)
+            if doc_id in processed_doc_set:
                 continue
 
             # ── 3a. Pre-merge UCEs via recursive + progressive segmentation ──
@@ -3712,6 +3795,17 @@ class DoubleClassifier:
                     premerged_groups = [[u] for u in doc_uces]
             else:
                 premerged_groups = [doc_uces]
+
+            # ── 3a''. Guard: pre-merge colapsado a 1 grupo ──
+            #       Un documento entero en un solo grupo hace que
+            #       _extract_global_chains procese todo el documento de una vez
+            #       (OOM de RAM). Con muchas UCEs se cae a grupos individuales.
+            if len(premerged_groups) == 1 and len(doc_uces) > 50:
+                print(
+                    f"   [COREF] Pre-merge colapsó a 1 grupo ({len(doc_uces)} UCEs) — "
+                    "usando UCEs individuales."
+                )
+                premerged_groups = [[u] for u in doc_uces]
 
             # ── 3a'. Root subjects for the tails of the pre-merged groups only ──
             _tails = boundary_tails(premerged_groups)
@@ -3804,7 +3898,6 @@ class DoubleClassifier:
             uc_groups = _merge_small_uc_groups(uc_groups, min_forms)
 
             # 3f. Build UC objects
-            doc_id = doc_uces[0].doc_id
             shared_meta = (doc_metadata_map or {}).get(doc_id, {})
 
             for group_uces in uc_groups:
@@ -3848,6 +3941,33 @@ class DoubleClassifier:
                         if u.id == uid:
                             u.uc_id = uc.id
                 global_uc_counter += 1
+
+            # ── 3g. Checkpoint: persistir progreso tras cada documento ──
+            if checkpoint_path:
+                processed_doc_ids.append(doc_id)
+                processed_doc_set.add(doc_id)
+                _guardar_checkpoint_coref(
+                    checkpoint_path,
+                    {
+                        "version": 1,
+                        "processed_doc_ids": processed_doc_ids,
+                        "ucs": [uc.to_dict() for uc in ucs],
+                        "uce_to_uc": uce_to_uc,
+                        "global_uc_counter": global_uc_counter,
+                        "total_boundaries": total_boundaries,
+                        "coref_merges": coref_merges,
+                        "covered_boundaries": covered_boundaries,
+                        "total_chains": total_chains,
+                        "root_cache": {
+                            ctx: list(subjects)
+                            for ctx, subjects in rcache._store.items()
+                        },
+                    },
+                )
+                print(
+                    f"   [COREF] Checkpoint guardado ({checkpoint_path}): "
+                    f"{len(processed_doc_ids)} docs, {len(ucs)} UCs."
+                )
 
         print(
             f"   [COREF context={context_units}] roots: "

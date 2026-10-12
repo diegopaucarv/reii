@@ -33,6 +33,33 @@ def _num(x: Any) -> Optional[float]:
     return None if x is None or (isinstance(x, float) and np.isnan(x)) else x
 
 
+def _silhouette_source(sil: Dict[str, Any]) -> str:
+    """Origen del Silhouette: "hook" (pipeline) vs "recomputed" (lazy) vs "none"."""
+    if not sil or sil.get("status") != "ok":
+        return "none"
+    return {"pipeline": "hook", "lazy": "recomputed"}.get(
+        sil.get("origin"), sil.get("origin") or "unknown"
+    )
+
+
+def _vocab_source(sil: Dict[str, Any]) -> Optional[str]:
+    """Vocabulario del Silhouette: "cdh" (hook, con PPMI) vs "derived_tsj" (lazy)."""
+    if not sil or sil.get("status") != "ok":
+        return None
+    return sil.get("vocab_source")
+
+
+def _ari_source(extras: Dict[str, Any]) -> str:
+    """Modo cuyo ARI se usó en ``extras["ari"]`` (wc/coref/emb/none)."""
+    if extras.get("ari_wc"):
+        return "wc"
+    if extras.get("ari_coref"):
+        return "coref"
+    if extras.get("ari_emb"):
+        return "emb"
+    return "none"
+
+
 def build_tables(
     store: QualityStore,
     run_ids: List[str],
@@ -44,14 +71,17 @@ def build_tables(
     """(tabla por corrida, tabla por par de corridas)."""
     profile = profile or cal.default_profile()
     rows = []
+    sil_by_run: Dict[str, Dict[str, Any]] = {}
     for rid in run_ids:
         if compute_silhouette:
             service.ensure_silhouette(store, rid)
         res = service.evaluate_run(store, rid, profile, persist=False)
         run, t, sm = res["run"], res["tiers"][tier_id], res["summary"]
-        sil = (run["summary"].get("extras") or {}).get("silhouette") or {}
+        extras = run["summary"].get("extras") or {}
+        sil = extras.get("silhouette") or {}
         if compute_silhouette and sil.get("status") != "ok":
             sil = {}
+        sil_by_run[rid] = sil if sil.get("status") == "ok" else {}
         cx = t.get("c_ext") or {}
         rows.append(
             {
@@ -65,11 +95,14 @@ def build_tables(
                 "retention": t["retention"],
                 "n_clusters": t["n_clusters"],
                 "ari": _num(sm.get("ari")),
+                "ari_source": _ari_source(extras),
                 "jaccard_mean": _num(sm.get("jaccard_mean")),
                 "cov_types_active": _num(sm.get("cov_types_active")),
                 "silhouette_chi2": sil.get("chi2"),
                 "silhouette_binary_cosine": sil.get("binary_cosine"),
                 "silhouette_ppmi_cosine": sil.get("ppmi_cosine"),
+                "silhouette_source": _silhouette_source(sil),
+                "vocab_source": _vocab_source(sil),
                 "precision": _num(t.get("precision")),
                 "recall": _num(t.get("recall")),
                 "c_ext_n": t.get("c_ext_n"),
@@ -87,28 +120,53 @@ def build_tables(
         jac = list(c["per_class_jaccard"].values())
         pairs.append(
             {
-                "run_a": a, "run_b": b, "label_a": labels[a], "label_b": labels[b],
-                "tier": tier_id, "n_a": c["n_a"], "n_b": c["n_b"], "n_common": c["n_common"],
+                "run_a": a,
+                "run_b": b,
+                "label_a": labels[a],
+                "label_b": labels[b],
+                "tier": tier_id,
+                "n_a": c["n_a"],
+                "n_b": c["n_b"],
+                "n_common": c["n_common"],
                 "same_corpus": c["same_corpus"],
-                "fmi": _num(c["fmi"]), "nmi": _num(c["nmi"]), "ari": _num(c["ari"]),
+                "fmi": _num(c["fmi"]),
+                "nmi": _num(c["nmi"]),
+                "ari": _num(c["ari"]),
                 "jaccard_matched_mean": float(np.mean(jac)) if jac else None,
-                f"silhouette_{space}_a": c["silhouette_a"], f"silhouette_{space}_b": c["silhouette_b"],
+                f"silhouette_{space}_a": c["silhouette_a"],
+                f"silhouette_{space}_b": c["silhouette_b"],
+                "silhouette_source_a": _silhouette_source(sil_by_run.get(a, {})),
+                "silhouette_source_b": _silhouette_source(sil_by_run.get(b, {})),
+                "vocab_source_a": _vocab_source(sil_by_run.get(a, {})),
+                "vocab_source_b": _vocab_source(sil_by_run.get(b, {})),
             }
         )
     return per_run, pd.DataFrame(pairs)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    ap = argparse.ArgumentParser(prog="reii.quality.compare_modes", description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--runs", required=True, help="run_id separados por coma (mínimo 1)")
+    ap = argparse.ArgumentParser(
+        prog="reii.quality.compare_modes",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument(
+        "--runs", required=True, help="run_id separados por coma (mínimo 1)"
+    )
     ap.add_argument("--tier", default="estricto")
     ap.add_argument("--out", default="comparison_table.csv")
     ap.add_argument("--dsn", default=None, help="PostgreSQL o sqlite:///archivo.db")
-    ap.add_argument("--space", default="chi2", choices=list(service.SIL_SPACES),
-                    help="espacio del Silhouette en la tabla de pares")
-    ap.add_argument("--compute-silhouette", action="store_true",
-                    help="recalcula y guarda el Silhouette de las corridas que no lo tengan")
+    ap.add_argument(
+        "--space",
+        default="chi2",
+        choices=list(service.SIL_SPACES),
+        help="espacio del Silhouette en la tabla de pares",
+    )
+    ap.add_argument(
+        "--compute-silhouette",
+        action="store_true",
+        help="recalcula y guarda el Silhouette de las corridas que no lo tengan",
+    )
     a = ap.parse_args(argv)
 
     run_ids = [r.strip() for r in a.runs.split(",") if r.strip()]
@@ -119,8 +177,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         missing = [r for r in run_ids if r not in known]
         if missing:
             raise SystemExit(f"corridas inexistentes: {', '.join(missing)}")
-        per_run, pairs = build_tables(store, run_ids, a.tier, space=a.space,
-                                      compute_silhouette=a.compute_silhouette)
+        per_run, pairs = build_tables(
+            store,
+            run_ids,
+            a.tier,
+            space=a.space,
+            compute_silhouette=a.compute_silhouette,
+        )
     finally:
         store.close()
     per_run.to_csv(a.out, index=False)

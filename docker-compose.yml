@@ -38,6 +38,7 @@ services:
       - REII_LLM_MAX_RETRIES=${REII_LLM_MAX_RETRIES:-5}
       - REII_LLM_TIMEOUT=${REII_LLM_TIMEOUT:-300}
       - HF_TOKEN=${HF_TOKEN:-}
+      - REII_CODE_VERSION=${REII_CODE_VERSION:-}
     restart: unless-stopped
     depends_on:
       reii-db:
@@ -88,6 +89,7 @@ services:
       - REII_WORD_EMBEDDINGS_PATH=/d/cc.es.300.bin
       - REII_USE_GENSIM_EMBEDDINGS=false
       - HF_TOKEN=${HF_TOKEN:-}
+      - REII_CODE_VERSION=${REII_CODE_VERSION:-}
     profiles: ["batch"]
     depends_on:
       reii-db:

@@ -9,6 +9,11 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     REII_ROOT_DIR=/app
 
+# Code version for reproducibility: bake the git commit into the image.
+# Overridable at build time with: docker build --build-arg GIT_COMMIT=<sha>
+ARG GIT_COMMIT=unknown
+ENV REII_CODE_VERSION=$GIT_COMMIT
+
 WORKDIR /app
 
 # System deps for compiling C-extensions

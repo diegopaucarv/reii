@@ -379,3 +379,108 @@ def load_discourse_state_progress(
         for agent in agents:
             by_agent[agent] = by_agent.get(agent, 0) + 1
     return total_uces, by_agent
+
+
+# ─────────────────────────────────────────────
+# Carga/guardado unificado de todos los agentes IA
+# ─────────────────────────────────────────────
+
+
+def load_workflow_config(filename: str) -> Dict[str, Dict[str, Any]]:
+    """Carga el dict de agentes de un workflow desde ``DISCOURSE_DIR / filename``.
+
+    Devuelve ``{k: v for k, v in data.items() if isinstance(v, dict)}`` si
+    ``data`` es un dict; en caso contrario ``{}``.
+    """
+    data = _read_json(str(DISCOURSE_DIR / filename))
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, dict)}
+
+
+def save_workflow_config(filename: str, data: Dict[str, Dict[str, Any]]) -> None:
+    """Escribe atómicamente ``data`` en ``DISCOURSE_DIR / filename``."""
+    _atomic_write_json(str(DISCOURSE_DIR / filename), data)
+
+
+def list_all_agents() -> List[Dict[str, Any]]:
+    """Devuelve una lista unificada de TODOS los agentes IA.
+
+    Cada elemento es ``{"name": ..., "source": ..., "agent": {...}}``. El
+    agente gramatical aparece primero (fuente = basename de
+    ``GRAMMAR_CONFIG_PATH``); después, en orden, los agentes de cada workflow
+    de ``list_workflow_files()``.
+    """
+    out: List[Dict[str, Any]] = []
+
+    grammar = load_grammar_config()
+    grammar_basename = os.path.basename(GRAMMAR_CONFIG_PATH)
+    grammar_name = grammar.get("name") or grammar_basename
+    out.append({"name": grammar_name, "source": grammar_basename, "agent": grammar})
+
+    for file in list_workflow_files():
+        data = load_workflow_config(file)
+        for name in get_workflow_agents(file):
+            out.append({"name": name, "source": file, "agent": data[name]})
+    return out
+
+
+def save_agent_to_source(entry: Dict[str, Any]) -> None:
+    """Guarda un agente ``{"name", "source", "agent"}`` en su archivo de origen.
+
+    Si ``source`` es el basename de ``GRAMMAR_CONFIG_PATH``, guarda el dict
+    completo vía ``save_grammar_config``; en caso contrario lo escribe en el
+    workflow correspondiente.
+    """
+    name = entry.get("name")
+    source = entry.get("source")
+    agent = entry.get("agent")
+    if source == os.path.basename(GRAMMAR_CONFIG_PATH):
+        save_grammar_config(agent if isinstance(agent, dict) else {})
+        return
+    data = load_workflow_config(source)
+    data[name] = agent
+    save_workflow_config(source, data)
+
+
+def delete_agent_from_source(name: str, source: str) -> bool:
+    """Elimina el agente ``name`` de su archivo de origen.
+
+    Devuelve ``True`` si se eliminó. El archivo gramatical es un dict único y
+    no puede borrarse por clave, así que no hace nada y devuelve ``False``.
+    """
+    if source == os.path.basename(GRAMMAR_CONFIG_PATH):
+        return False
+    data = load_workflow_config(source)
+    if name in data:
+        del data[name]
+        save_workflow_config(source, data)
+        return True
+    return False
+
+
+def rename_agent_in_source(old_name: str, new_name: str, source: str) -> None:
+    """Renombra la clave del agente en su archivo de origen.
+
+    En el archivo gramatical (dict único) solo actualiza el campo ``name``
+    interno; en un workflow mueve ``data[old_name]`` a ``data[new_name]``.
+    """
+    if source == os.path.basename(GRAMMAR_CONFIG_PATH):
+        grammar = load_grammar_config()
+        grammar["name"] = new_name
+        save_grammar_config(grammar)
+        return
+    data = load_workflow_config(source)
+    if old_name in data:
+        data[new_name] = data.pop(old_name)
+        save_workflow_config(source, data)
+
+
+def agent_executed_count(agent_name: str, state_path: str = "") -> int:
+    """Cuenta cuántas UCEs tienen una anotación de ``agent_name`` en el estado.
+
+    Reutiliza la lógica de ``load_discourse_state_summary``. Si ``state_path``
+    está vacío usa ``DISCOURSE_STATE_PATH``. Devuelve 0 si no hay coincidencias.
+    """
+    summary = load_discourse_state_summary(state_path)
+    return summary.get(agent_name, 0)

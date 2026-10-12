@@ -46,17 +46,24 @@ from reii.config import (
 )
 from reii.ia_config_editor import (
     AGENT_TEMPLATE,
+    agent_executed_count,
+    delete_agent_from_source,
     get_workflow_agents,
+    list_all_agents,
     list_inactive_agent_files,
     list_workflow_files,
     load_discourse_config,
     load_discourse_state_progress,
     load_grammar_config,
+    load_workflow_config,
     load_workflow_names,
     parse_json_text,
     parse_list_text,
+    rename_agent_in_source,
+    save_agent_to_source,
     save_discourse_config,
     save_grammar_config,
+    save_workflow_config,
     save_workflow_names,
     to_json_text,
     to_list_text,
@@ -98,6 +105,7 @@ def _discourse_runner(
     workflow: Optional[str],
     force: bool = False,
     source: str = "db",  # [pipeline-patch] d2
+    agents: Optional[List[str]] = None,
 ) -> None:
     """Ejecuta un workflow de análisis de discurso en un hilo en segundo plano.
 
@@ -105,6 +113,10 @@ def _discourse_runner(
     construye el resumen gramatical), así que se corre en un hilo para no
     bloquear la UI. La salida ``print`` del agente se captura línea a línea
     en ``log`` para mostrarla en vivo.
+
+    Si ``agents`` se proporciona, ejecuta únicamente esos agentes (uno por
+    uno) vía ``run_discourse_agent``; en caso contrario ejecuta el workflow
+    completo ``workflow_file`` con ``run_workflow``.
     """
     import contextlib
 
@@ -148,7 +160,16 @@ def _discourse_runner(
                 workflow_data_path=_q_input,
                 state_path=DISCOURSE_STATE_PATH,
             )
-            mon.run_workflow(workflow_file, store=store, workflow=workflow, force=force)
+            if agents:
+                for _agent_name in agents:
+                    log.append(f"▶ Ejecutando agente: {_agent_name}")
+                    mon.run_discourse_agent(
+                        _agent_name, store=store, workflow=workflow, force=force
+                    )
+            else:
+                mon.run_workflow(
+                    workflow_file, store=store, workflow=workflow, force=force
+                )
             try:
                 sync_after_run(DISCOURSE_STATE_PATH)
             except Exception as _qe:
@@ -258,6 +279,48 @@ def _create_agent() -> None:
     st.rerun()
 
 
+def _save_agent_unified(entry: Dict[str, Any]) -> None:
+    """Guarda un agente (gramatical o de cualquier workflow) desde los widgets.
+
+    ``entry`` es ``{"name", "source", "agent"}`` tal como lo devuelve
+    ``list_all_agents()``. Lee los campos editados de ``st.session_state``,
+    renombra la clave si cambió el nombre y persiste vía ``save_agent_to_source``.
+    """
+    name = entry["name"]
+    source = entry["source"]
+    k = _sanitize_key(name)
+    ok_schema, schema, err_schema = parse_json_text(
+        st.session_state.get(f"ia_ag_{k}_json_schema", "{}")
+    )
+    ok_fs, fs, err_fs = parse_json_text(
+        st.session_state.get(f"ia_ag_{k}_few_shot", "[]")
+    )
+    if not ok_schema:
+        st.error(f"json_schema: {err_schema}")
+        return
+    if not ok_fs:
+        st.error(f"few_shot_examples: {err_fs}")
+        return
+    new_name = st.session_state.get(f"ia_ag_{k}_name", "").strip()
+    if not new_name:
+        st.error("El nombre no puede estar vacío.")
+        return
+    agent = {
+        "name": new_name,
+        "role": st.session_state.get(f"ia_ag_{k}_role", ""),
+        "instructions": st.session_state.get(f"ia_ag_{k}_instructions", ""),
+        "json_schema": schema,
+        "few_shot_examples": fs,
+        "gram_cats": parse_list_text(st.session_state.get(f"ia_ag_{k}_gram_cats", "")),
+        "disc_cats": parse_list_text(st.session_state.get(f"ia_ag_{k}_disc_cats", "")),
+    }
+    if new_name != name:
+        rename_agent_in_source(name, new_name, source)
+    save_agent_to_source({"name": new_name, "source": source, "agent": agent})
+    st.success(f"Agente `{new_name}` guardado.")
+    st.rerun()
+
+
 # ─────────────────────────────────────────────────────────────
 # PUENTE JAVASCRIPT -> PYTHON (Decláralo a nivel global)
 # ─────────────────────────────────────────────────────────────
@@ -270,6 +333,7 @@ def _set_multiple_filters(tab_name: str, filters_dict: dict):
     """
     clean_filters = {k: str(v) for k, v in filters_dict.items() if v}
     st.session_state[SUBCAT_FILTER_KEY] = clean_filters
+    st.session_state["_pending_tab_a"] = tab_name
 
     st.rerun()
 
@@ -1699,40 +1763,91 @@ with toggle_col:
         st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
+
 # ─────────────────────────────────────────────────────────────
 # MÉTRICAS
 # ─────────────────────────────────────────────────────────────
-cols_stat = st.columns(12)
+def _section_header(text: str) -> None:
+    st.markdown(
+        "<div style='font-family:var(--font-mono);font-size:10px;letter-spacing:.14em;"
+        "color:var(--accent);text-transform:uppercase;margin:6px 0 2px'>"
+        f"{text}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _silhouette_value() -> str:
+    """Silhouette medio (espacio χ²) de las clases sobre las UCEs estables.
+
+    Se calcula sobre la marcha desde las UCEs clasificadas (cluster_id >= 0)
+    reutilizando la misma construcción del pipeline de calidad. Si no se puede
+    calcular, devuelve "—".
+    """
+    try:
+        from reii.quality import service as _qservice
+
+        stable = [
+            u
+            for u in uces
+            if u.get("cluster_id") is not None and u.get("cluster_id") >= 0
+        ]
+        if len(stable) < 10:
+            return "—"
+        term_lists = [u.get("lemmas", []) or [] for u in stable]
+        labels = [int(u["cluster_id"]) for u in stable]
+        vocab = sorted({t for tl in term_lists for t in tl})
+        if len(set(labels)) < 2 or not vocab:
+            return "—"
+        rep = _qservice.silhouette_report(
+            term_lists, labels, vocab, vocab_source="dashboard"
+        )
+        if rep.get("status") != "ok":
+            return "—"
+        chi2 = rep.get("chi2")
+        return "—" if chi2 is None else f"{chi2:.3f}"
+    except Exception:
+        return "—"
+
+
+_silhouette = _silhouette_value()
+
+# ── Grupo 1 · Corpus ────────────────────────────────────────────────
+_section_header("Corpus")
+cols_stat = st.columns(6)
 STATS = [
     (str(n_documentos), "Entrevistas (UCI)"),
+    (f"{len(uces):,}", "UCEs"),
     (f"{raw_tokens:,}", "Formas totales (tokens crudos)"),
     (f"{total_forms:,}", "Lemas de contenido"),
     (f"{unique_forms:,}", "Formas distintas (types)"),
-    (f"{hapax:,}", "Hápax (número)"),
-    (str(analyzed_forms), "Formas analizadas (tras reducción)"),
-    (str(formas_suplementarias), "Formas suplementarias"),
-    (f"{len(uces):,}", "UCEs"),
-    (f"{vocabulary_richness:.1f}%", "Riqueza por types"),
-    (f"{token_richness:.1f}%", "Riqueza por tokens"),
-    (str(config.get("tsj", 3)), "Frecuencia mínima (TSJ)"),
-    (str(len(class_sizes)), "Clases estables"),
+    (f"{hapax:,}", "Hápax"),
 ]
 for col, (val, lbl) in zip(cols_stat, STATS):
     with col:
         st.metric(label=lbl, value=val)
 
-# ── Indicadores léxicos de Reinert ─────────────────────────────────────
-st.markdown(
-    "<div style='font-family:var(--font-mono);font-size:10px;letter-spacing:.14em;"
-    "color:var(--accent);text-transform:uppercase;margin:6px 0 2px'>"
-    "Indicadores léxicos (Reinert)</div>",
-    unsafe_allow_html=True,
-)
-cols_lex = st.columns(7)
+# ── Grupo 2 · Análisis ──────────────────────────────────────────────
+_section_header("Análisis")
+cols_ana = st.columns(7)
+ANALYSIS_STATS = [
+    (str(analyzed_forms), "Formas analizadas (tras reducción)"),
+    (str(formas_suplementarias), "Formas suplementarias"),
+    (f"{vocabulary_richness:.1f}%", "Riqueza por types"),
+    (f"{token_richness:.1f}%", "Riqueza por tokens"),
+    (str(config.get("tsj", 3)), "Frecuencia mínima (TSJ)"),
+    (str(len(class_sizes)), "Clases estables"),
+    (_silhouette, "Silhouette (χ²)"),
+]
+for col, (val, lbl) in zip(cols_ana, ANALYSIS_STATS):
+    with col:
+        st.metric(label=lbl, value=val)
+
+# ── Grupo 3 · Indicadores léxicos (Reinert) ─────────────────────────
+_section_header("Indicadores léxicos (Reinert)")
+cols_lex = st.columns(6)
 LEX_STATS = [
     (f"{ttr:.1f}%", "TTR (9–20%)"),
     (f"{guiraud:.2f}", "Guiraud"),
-    (f"{hapax_pct:.1f}%", "hápax % (≥50%)"),
     (f"{zipf_slope:.2f}", "pendiente Zipf (a)"),
     (str(ctest), "CTEST"),
     ("activo" if use_ctest else "inactivo", "CTEST aplicado"),
@@ -7818,6 +7933,7 @@ def _set_multiple_filters(tab_name: str, filters_dict: dict):
     """
     clean_filters = {k: str(v) for k, v in filters_dict.items() if v}
     st.session_state[SUBCAT_FILTER_KEY] = clean_filters
+    st.session_state["_pending_tab_a"] = tab_name
 
     st.rerun()
 
@@ -10770,7 +10886,10 @@ def _render_tab_a():
             "Coref",
             "Predicados",
         ]
-        if "radio_tabs_a" not in st.session_state:
+        pending = st.session_state.pop("_pending_tab_a", None)
+        if pending in opciones_tabs:
+            st.session_state.radio_tabs_a = pending
+        elif "radio_tabs_a" not in st.session_state:
             st.session_state.radio_tabs_a = "Global"
         active_tab = st.radio(
             "Pestañas A",
@@ -13956,6 +14075,62 @@ def _pipeline_start_discourse(wf_file, store, workflow, force, source):
             force,
             source,
         ),
+        daemon=True,
+    ).start()
+
+
+def _pipeline_start_discourse_agent(agent_name, store, force, source):
+    """Inicia la ejecución de UN solo agente en un hilo en segundo plano."""
+    ss = st.session_state
+    ss.setdefault(
+        "discourse_state",
+        {"running": False, "finished": False, "exit_code": None, "refreshed": False},
+    )
+    ss.discourse_log = []
+    ss.discourse_state.update(
+        running=True, finished=False, exit_code=None, refreshed=False
+    )
+    _pipeline_status_cached.clear()
+    threading.Thread(
+        target=_discourse_runner,
+        args=(
+            ss.discourse_log,
+            ss.discourse_state,
+            None,
+            store,
+            None,
+            force,
+            source,
+        ),
+        kwargs={"agents": [agent_name]},
+        daemon=True,
+    ).start()
+
+
+def _pipeline_start_discourse_agents(agent_names, store, force, source):
+    """Inicia la ejecución de una lista de agentes en un hilo en segundo plano."""
+    ss = st.session_state
+    ss.setdefault(
+        "discourse_state",
+        {"running": False, "finished": False, "exit_code": None, "refreshed": False},
+    )
+    ss.discourse_log = []
+    ss.discourse_state.update(
+        running=True, finished=False, exit_code=None, refreshed=False
+    )
+    _pipeline_status_cached.clear()
+    threading.Thread(
+        target=_discourse_runner,
+        args=(
+            ss.discourse_log,
+            ss.discourse_state,
+            None,
+            store,
+            None,
+            force,
+            source,
+        ),
+        kwargs={"agents": list(agent_names)},
         daemon=True,
     ).start()
 
