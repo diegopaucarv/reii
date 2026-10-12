@@ -35,9 +35,11 @@ from reii.config import (
     BATCH_DB_PATH,
     CORPUS_NAME,
     DISCOURSE_CONFIG_PATH,
+    DISCOURSE_DIR,
     DISCOURSE_STATE_PATH,
     GRAMMAR_CONFIG_PATH,
     IA_DIR,
+    LOCALISMOS_PATH,
     TRANSCRIPTS_DIR,
     WORKFLOW_CONFIG_PATH,
     WORKFLOW_DB_PATH,
@@ -259,7 +261,7 @@ def _discourse_runner(
     stream = _LogStream(log)
     try:
         with contextlib.redirect_stdout(stream):
-            workflow_paths = [str(IA_DIR / f) for f in list_workflow_files()]
+            workflow_paths = [str(DISCOURSE_DIR / f) for f in list_workflow_files()]
             from reii.pipelines.runtime import prepare_discourse_input, sync_after_run
 
             _q_input = prepare_discourse_input(source, WORKFLOW_DB_PATH)
@@ -379,15 +381,21 @@ def _create_agent() -> None:
     st.rerun()
 
 
-def render_batch_tab():
+def render_batch_tab(embedded: bool = False):
     """Interfaz de procesamiento por lotes de transcripciones de entrevistas.
 
     Incluye: subida de archivos, selección de transcripciones, ejecución del
     pipeline de dos etapas (segmentación + extracción) con cola pausable,
     log de errores en vivo y gestión de los documentos procesados
     persistidos en la base JSON.
+
+    ``embedded=True`` se usa cuando se renderiza dentro de la sub-pestaña 1 de
+    la pestaña E (en lugar de como página completa), y degrada el título.
     """
-    st.title("Procesamiento por lotes (entrevistas)")
+    if embedded:
+        st.subheader("Procesamiento por lotes (entrevistas)")
+    else:
+        st.title("Procesamiento por lotes (entrevistas)")
     st.caption(
         "Pipeline de dos etapas: segmentación estructural (Ruta 1) y "
         "extracción/mapeo de respuestas (Ruta 2) sobre la guía de 32 preguntas."
@@ -398,9 +406,54 @@ def render_batch_tab():
             st.session_state.show_batch_view = False
             st.rerun()
 
-    from reii.batch_processor import BatchProcessor
+    from reii.batch_processor import BatchProcessor, load_localismos
 
-    bp = BatchProcessor(db_path=BATCH_DB_PATH)
+    # ── 0. Localismos (términos regionales a preservar) ──────────────
+    st.subheader("🌎 Localismos")
+    with st.expander("🌎 Localismos (términos regionales a preservar)", expanded=False):
+        st.caption(
+            "Define términos locales/dialectales para que el modelo NO los "
+            "'corrija' a su equivalente estándar. Formato JSON: "
+            '`{"glosario": {"táper": "tupperware"}, '
+            '"preservar": ["chamba"]}`.'
+        )
+        texto_localismos = st.text_area(
+            "Localismos (JSON)",
+            value=json.dumps(load_localismos(), ensure_ascii=False, indent=2),
+            height=200,
+            key="reii_localismos_editor",
+        )
+        if st.button("💾 Guardar localismos", key="reii_localismos_save"):
+            try:
+                data = json.loads(texto_localismos)
+                if not isinstance(data, dict):
+                    raise ValueError("El JSON debe ser un objeto.")
+                glosario = data.get("glosario", {})
+                preservar = data.get("preservar", [])
+                if not isinstance(glosario, dict):
+                    raise ValueError("'glosario' debe ser un objeto.")
+                if not isinstance(preservar, list):
+                    raise ValueError("'preservar' debe ser una lista.")
+                # Normaliza los términos a minúsculas.
+                glosario = {
+                    str(k).strip().lower(): str(v).strip()
+                    for k, v in glosario.items()
+                    if str(k).strip()
+                }
+                preservar = [
+                    str(t).strip().lower() for t in preservar if str(t).strip()
+                ]
+                data = {"glosario": glosario, "preservar": preservar}
+                os.makedirs(os.path.dirname(LOCALISMOS_PATH), exist_ok=True)
+                with open(LOCALISMOS_PATH, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                st.success(f"Localismos guardados en `{LOCALISMOS_PATH}`.")
+                st.rerun()
+            except (json.JSONDecodeError, ValueError) as e:
+                st.error(f"❌ JSON inválido: {e}")
+
+    localismos_actuales = load_localismos()
+    bp = BatchProcessor(db_path=BATCH_DB_PATH, localismos=localismos_actuales)
 
     # ── Estado de la cola (persistente entre reruns) ─────────────────
     if "batch_queue" not in st.session_state:
@@ -14417,7 +14470,10 @@ def _render_tab_e_crud():
     st.subheader("⚙️ Configuración de agentes IA")
 
     gram = load_grammar_config()
-    with st.expander("📝 Resumidor gramatical (ia/0.json)", expanded=False):
+    with st.expander(
+        "📝 Resumidor gramatical (ia/analisis_discursivo/resumidor_gramatical.json)",
+        expanded=False,
+    ):
         st.text_input("Nombre", value=gram.get("name", ""), key="ia_gram_name")
         st.text_input("Rol", value=gram.get("role", ""), key="ia_gram_role")
         st.text_area(
@@ -14441,7 +14497,7 @@ def _render_tab_e_crud():
         if st.button("💾 Guardar resumidor", key="ia_gram_save", width="stretch"):
             _save_grammar_from_widgets()
 
-    st.subheader("🤖 Agentes de discurso (ia/1.json)")
+    st.subheader("🤖 Agentes de discurso (ia/analisis_discursivo/discurso_lexico.json)")
     disc = load_discourse_config()
     for _name in list(disc.keys()):
         _agent = disc[_name]
@@ -14498,9 +14554,10 @@ def _render_tab_e_crud():
     if _inactive:
         with st.expander("ℹ️ Workflows no editables aquí", expanded=False):
             st.caption(
-                "Estos archivos existen en `ia/` y SÍ son workflows ejecutables "
-                "desde arriba, pero este editor solo edita `0.json` (resumidor "
-                "gramatical) y `1.json` (agentes de discurso)."
+                "Estos archivos existen en `ia/analisis_discursivo/` y SÍ son "
+                "workflows ejecutables desde arriba, pero este editor solo edita "
+                "`resumidor_gramatical.json` (resumidor gramatical) y "
+                "`discurso_lexico.json` (agentes de discurso)."
             )
             st.code(", ".join(_inactive))
 
@@ -14677,6 +14734,7 @@ def _render_pipeline_hub():
             start_discourse=_pipeline_start_discourse,
             run_fix=_pipeline_run_fix,
             render_agents_crud=_render_tab_e_crud,
+            render_batch=lambda: render_batch_tab(embedded=True),
         )
     )
 

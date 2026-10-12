@@ -22,8 +22,16 @@ STATE_LABEL = {
 }
 LEVEL_ICON = {"ok": "✅", "warn": "⚠️", "error": "❌", "info": "ℹ️"}
 ESSENTIAL_KEYS = [
-    "classification_mode", "use_bigrams", "use_trigrams", "stem_backend", "min_uce_words",
-    "uce_target_size", "tsj", "use_rf_shap", "multivariate_metadata", "random_state",
+    "classification_mode",
+    "use_bigrams",
+    "use_trigrams",
+    "stem_backend",
+    "min_uce_words",
+    "uce_target_size",
+    "tsj",
+    "use_rf_shap",
+    "multivariate_metadata",
+    "random_state",
 ]
 
 
@@ -32,22 +40,27 @@ class HubContext:
     get_status: Callable[[], Dict[str, Any]]
     session: Any
     batch_open: Callable[[], None]
-    get_effective_config: Callable[[], Dict[str, Any]]          # {clave: (valor, origen)}
+    get_effective_config: Callable[[], Dict[str, Any]]  # {clave: (valor, origen)}
     config_categories: Dict[str, List[str]]
     save_config: Callable[[Dict[str, Any]], Dict[str, Any]]
     reset_config: Optional[Callable[[], None]]
     start_workflow: Callable[[Dict[str, Any]], None]
-    list_workflows: Callable[[], List[Dict[str, Any]]]          # [{file,name,agents,progress}]
+    list_workflows: Callable[[], List[Dict[str, Any]]]  # [{file,name,agents,progress}]
     rename_workflow: Callable[[str, str], None]
-    start_discourse: Callable[..., None]                        # (file, store, label, force, source)
+    start_discourse: Callable[..., None]  # (file, store, label, force, source)
     run_fix: Callable[[str], str]
     render_agents_crud: Optional[Callable[[], None]] = None
+    render_batch: Optional[Callable[[], None]] = (
+        None  # ventana de procesamiento por lotes embebida
+    )
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
 def _pill(text: str, color: str) -> str:
-    return (f"<span style='background:{color};color:#fff;padding:2px 9px;border-radius:10px;"
-            f"font-size:11px'>{text}</span>")
+    return (
+        f"<span style='background:{color};color:#fff;padding:2px 9px;border-radius:10px;"
+        f"font-size:11px'>{text}</span>"
+    )
 
 
 def _running(ctx: HubContext, pid: str) -> bool:
@@ -65,22 +78,35 @@ def _system_map(ctx: HubContext, status: Dict[str, Any]) -> None:
             st.markdown(_pill(label, color), unsafe_allow_html=True)
             st.caption(p.summary)
             for name, val in info.get("metrics", []):
-                st.markdown(f"<span style='font-size:12px'>{name}: <b>{val}</b></span>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<span style='font-size:12px'>{name}: <b>{val}</b></span>",
+                    unsafe_allow_html=True,
+                )
             st.caption(f"Se ve en: {p.shown_in}")
-    st.caption("Flujo: 1 · Transcripciones → 2 · Clasificación → 3 · Discurso (IA) → resultados en las pestañas A–D y C.")
+    st.caption(
+        "Flujo: 1 · Transcripciones → 2 · Clasificación → 3 · Discurso (IA) → resultados en las pestañas A–D y C."
+    )
 
 
 def _checks(ctx: HubContext, status: Dict[str, Any]) -> None:
     checks = status.get("checks", [])
     bad = [c for c in checks if c["level"] in ("warn", "error")]
-    title = f"Coherencia entre lo que corre y lo que se muestra ({len(bad)} aviso{'s' if len(bad) != 1 else ''})" if bad \
+    title = (
+        f"Coherencia entre lo que corre y lo que se muestra ({len(bad)} aviso{'s' if len(bad) != 1 else ''})"
+        if bad
         else "Coherencia entre lo que corre y lo que se muestra (todo en orden)"
+    )
     with st.expander(title, expanded=bool(bad)):
         for c in checks:
             c1, c2 = st.columns([5, 1])
-            c1.markdown(f"{LEVEL_ICON.get(c['level'], '•')} **{c['label']}** — {c['detail']}")
+            c1.markdown(
+                f"{LEVEL_ICON.get(c['level'], '•')} **{c['label']}** — {c['detail']}"
+            )
             if c.get("fix"):
-                if c2.button(_FIX_LABEL.get(c["fix"], "Arreglar"), key=f"hub_fix_{c['id']}_{c['fix']}"):
+                if c2.button(
+                    _FIX_LABEL.get(c["fix"], "Arreglar"),
+                    key=f"hub_fix_{c['id']}_{c['fix']}",
+                ):
                     st.success(ctx.run_fix(c["fix"]))
                     st.rerun()
 
@@ -111,17 +137,38 @@ def _run_panel(ctx: HubContext, pid: str) -> None:
         st.info(f"⏳ {p.title}: en ejecución…")
     elif state.get("finished"):
         if state.get("exit_code") == 0:
-            st.success(f"✅ {p.title} terminó sin errores. Resultados en: {p.shown_in}.")
+            st.success(
+                f"✅ {p.title} terminó sin errores. Resultados en: {p.shown_in}."
+            )
         else:
-            st.error(f"❌ {p.title} terminó con error (código {state.get('exit_code')}). Revisa el registro.")
+            st.error(
+                f"❌ {p.title} terminó con error (código {state.get('exit_code')}). Revisa el registro."
+            )
     if log:
-        with st.expander(f"Registro ({len(log)} líneas)", expanded=bool(state.get("running"))):
+        with st.expander(
+            f"Registro ({len(log)} líneas)", expanded=bool(state.get("running"))
+        ):
             st.code("\n".join(log[-300:]))
 
 
 def _tab_batch(ctx: HubContext) -> None:
     _how_it_works("batch")
-    st.markdown("La carga, la cola y el registro de transcripciones viven en el gestor de transcripciones.")
+    if ctx.render_batch is not None:
+        # La primera sub-pestaña de la E es la propia ventana de procesamiento
+        # por lotes, embebida en lugar de abrirse como página completa.
+        try:
+            ctx.render_batch()
+        except Exception as e:
+            st.error(f"⚠️ No se pudo cargar el gestor de transcripciones: {e}")
+            _batch_open_button(ctx)
+    else:
+        _batch_open_button(ctx)
+
+
+def _batch_open_button(ctx: HubContext) -> None:
+    st.markdown(
+        "La carga, la cola y el registro de transcripciones viven en el gestor de transcripciones."
+    )
     if st.button("Abrir gestor de transcripciones", key="hub_open_batch"):
         ctx.batch_open()
 
@@ -130,7 +177,9 @@ def _config_widget(key: str, value: Any, origin: str, prefix: str):
     label = f"{key} {'✎' if origin == 'override' else ''}".strip()
     wkey = f"{prefix}_{key}"
     if isinstance(value, bool):
-        return st.radio(label, [True, False], index=0 if value else 1, horizontal=True, key=wkey)
+        return st.radio(
+            label, [True, False], index=0 if value else 1, horizontal=True, key=wkey
+        )
     if isinstance(value, int):
         return st.number_input(label, value=value, step=1, key=wkey)
     if isinstance(value, float):
@@ -138,7 +187,9 @@ def _config_widget(key: str, value: Any, origin: str, prefix: str):
     if isinstance(value, (list, tuple)):
         import json
 
-        raw = st.text_area(label, value=json.dumps(list(value), ensure_ascii=False), key=wkey)
+        raw = st.text_area(
+            label, value=json.dumps(list(value), ensure_ascii=False), key=wkey
+        )
         try:
             return json.loads(raw)
         except ValueError:
@@ -151,8 +202,15 @@ def _tab_workflow(ctx: HubContext) -> None:
     _how_it_works("workflow")
     eff = ctx.get_effective_config()
     mode = st.radio(
-        "Modo de procesamiento", ["classic", "transformer"], horizontal=True, key="hub_wf_mode",
-        format_func=lambda v: {"classic": "📊 Classic (rápido, sin GPU)", "transformer": "🧠 Transformer (requiere GPU)"}[v])
+        "Modo de procesamiento",
+        ["classic", "transformer"],
+        horizontal=True,
+        key="hub_wf_mode",
+        format_func=lambda v: {
+            "classic": "📊 Classic (rápido, sin GPU)",
+            "transformer": "🧠 Transformer (requiere GPU)",
+        }[v],
+    )
     updates: Dict[str, Any] = {}
     ess = [k for k in ESSENTIAL_KEYS if k in eff]
     with st.expander("Parámetros esenciales", expanded=True):
@@ -172,14 +230,25 @@ def _tab_workflow(ctx: HubContext) -> None:
                     if new != v:
                         updates[k] = new
     b1, b2 = st.columns([1, 1])
-    if b1.button(f"💾 Guardar {len(updates)} cambio(s)" if updates else "💾 Guardar", key="hub_cfg_save", disabled=not updates):
+    if b1.button(
+        f"💾 Guardar {len(updates)} cambio(s)" if updates else "💾 Guardar",
+        key="hub_cfg_save",
+        disabled=not updates,
+    ):
         rep = ctx.save_config(updates)
-        st.success(f"Guardado en ambos canales ({len(rep.get('pushed', []))} claves en la BD).")
+        st.success(
+            f"Guardado en ambos canales ({len(rep.get('pushed', []))} claves en la BD)."
+        )
     if ctx.reset_config and b2.button("↩ Restaurar defaults", key="hub_cfg_reset"):
         ctx.reset_config()
         st.rerun()
     st.divider()
-    if st.button("▶ Ejecutar clasificación", key="hub_run_workflow", type="primary", disabled=_running(ctx, "workflow")):
+    if st.button(
+        "▶ Ejecutar clasificación",
+        key="hub_run_workflow",
+        type="primary",
+        disabled=_running(ctx, "workflow"),
+    ):
         ctx.start_workflow({"workflow_mode": mode, **updates})
         st.rerun()
     _run_panel(ctx, "workflow")
@@ -188,16 +257,28 @@ def _tab_workflow(ctx: HubContext) -> None:
 def _tab_discourse(ctx: HubContext) -> None:
     _how_it_works("discourse")
     source = st.radio(
-        "Fuente de las UCEs", ["db", "json"], horizontal=True, key="hub_dc_source",
-        format_func=lambda v: {"db": "Base de datos (recomendado: lo que se anota es lo que se muestra)",
-                               "json": "workflow_data.json (comportamiento anterior)"}[v])
+        "Fuente de las UCEs",
+        ["db", "json"],
+        horizontal=True,
+        key="hub_dc_source",
+        format_func=lambda v: {
+            "db": "Base de datos (recomendado: lo que se anota es lo que se muestra)",
+            "json": "workflow_data.json (comportamiento anterior)",
+        }[v],
+    )
     with st.expander("Opciones de ejecución", expanded=False):
         c1, c2, c3 = st.columns(3)
         store = c1.checkbox("Guardar estado", value=True, key="hub_dc_store")
-        force = c2.checkbox("Re-procesar todo", value=False, key="hub_dc_force",
-                            help="Ignora lo ya procesado y vuelve a analizar todas las UCEs.")
+        force = c2.checkbox(
+            "Re-procesar todo",
+            value=False,
+            key="hub_dc_force",
+            help="Ignora lo ya procesado y vuelve a analizar todas las UCEs.",
+        )
         label = c3.text_input("Etiqueta (opcional)", key="hub_dc_label") or None
-    st.caption("Al terminar, las anotaciones se sincronizan con la base de datos y aparecen en la última sección de la pestaña C.")
+    st.caption(
+        "Al terminar, las anotaciones se sincronizan con la base de datos y aparecen en la última sección de la pestaña C."
+    )
     wfs = ctx.list_workflows()
     if not wfs:
         st.warning("No se encontraron workflows en `ia/` (archivos JSON de agentes).")
@@ -205,11 +286,22 @@ def _tab_discourse(ctx: HubContext) -> None:
     for w in wfs:
         with st.container(border=True):
             c1, c2, c3 = st.columns([3, 2, 1])
-            new_name = c1.text_input("Nombre del workflow", value=w["name"], key=f"hub_wfname_{w['file']}")
+            new_name = c1.text_input(
+                "Nombre del workflow", value=w["name"], key=f"hub_wfname_{w['file']}"
+            )
             c1.caption(f"{len(w['agents'])} agentes: {', '.join(w['agents'])}")
             c2.progress(min(1.0, max(0.0, float(w.get("progress", 0.0)))))
-            c2.caption(f"{float(w.get('progress', 0.0)) * 100:.0f}% procesado" if w.get("progress") else "Sin datos todavía")
-            if c3.button("▶ Ejecutar", key=f"hub_wfrun_{w['file']}", disabled=running, use_container_width=True):
+            c2.caption(
+                f"{float(w.get('progress', 0.0)) * 100:.0f}% procesado"
+                if w.get("progress")
+                else "Sin datos todavía"
+            )
+            if c3.button(
+                "▶ Ejecutar",
+                key=f"hub_wfrun_{w['file']}",
+                disabled=running,
+                use_container_width=True,
+            ):
                 if new_name != w["name"]:
                     ctx.rename_workflow(w["file"], new_name)
                 ctx.start_discourse(w["file"], store, label, force, source)

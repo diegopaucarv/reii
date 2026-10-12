@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Tuple
 
 from reii.config import (
     DISCOURSE_CONFIG_PATH,
+    DISCOURSE_DIR,
     GRAMMAR_CONFIG_PATH,
     IA_DIR,
 )
@@ -59,8 +60,8 @@ def list_inactive_agent_files() -> List[str]:
         os.path.basename(DISCOURSE_CONFIG_PATH),
     }
     out: List[str] = []
-    if IA_DIR.is_dir():
-        for p in sorted(IA_DIR.glob("*.json")):
+    if DISCOURSE_DIR.is_dir():
+        for p in sorted(DISCOURSE_DIR.glob("*.json")):
             if p.name not in wired:
                 out.append(p.name)
     return out
@@ -140,21 +141,21 @@ def load_discourse_state_summary(
 # ─────────────────────────────────────────────
 # Workflows (one per discourse JSON in ia/)
 # ─────────────────────────────────────────────
-WORKFLOW_NAMES_PATH = str(IA_DIR / "_workflow_names.json")
+WORKFLOW_NAMES_PATH = str(DISCOURSE_DIR / "_workflow_names.json")
 
 
 def list_workflow_files() -> List[str]:
-    """Return sorted filenames of discourse workflow JSONs in ``ia/``.
+    """Return sorted filenames of discourse workflow JSONs in ``analisis_discursivo/``.
 
     A workflow is a dict-of-agents JSON file. The grammar summarizer
-    (``GRAMMAR_CONFIG_PATH``, e.g. ``0.json``) and any ``_``-prefixed
-    metadata files are excluded.
+    (``GRAMMAR_CONFIG_PATH``, e.g. ``resumidor_gramatical.json``) and any
+    ``_``-prefixed metadata files are excluded.
     """
     grammar_basename = os.path.basename(GRAMMAR_CONFIG_PATH)
     out: List[str] = []
-    if not IA_DIR.is_dir():
+    if not DISCOURSE_DIR.is_dir():
         return out
-    for p in sorted(IA_DIR.glob("*.json")):
+    for p in sorted(DISCOURSE_DIR.glob("*.json")):
         if p.name.startswith("_") or p.name == grammar_basename:
             continue
         data = _read_json(str(p))
@@ -165,7 +166,7 @@ def list_workflow_files() -> List[str]:
 
 def get_workflow_agents(filename: str) -> List[str]:
     """Return the agent names inside a workflow JSON file."""
-    data = _read_json(str(IA_DIR / filename))
+    data = _read_json(str(DISCOURSE_DIR / filename))
     if not isinstance(data, dict):
         return []
     return sorted(data.keys())

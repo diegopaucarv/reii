@@ -26,8 +26,8 @@ services:
       - REII_WORKFLOW_DB_PATH=data/workflow_data.json
       - REII_BEST_PARAMS_PATH=data/best_params.json
       - REII_DISCOURSE_STATE_PATH=data/discourse_state.json
-      - REII_GRAMMAR_CONFIG_PATH=ia/0.json
-      - REII_DISCOURSE_CONFIG_PATH=ia/1.json
+      - REII_GRAMMAR_CONFIG_PATH=ia/analisis_discursivo/resumidor_gramatical.json
+      - REII_DISCOURSE_CONFIG_PATH=ia/analisis_discursivo/discurso_lexico.json
       - REII_BATCH_DB_PATH=data/entrevistas.json
       - REII_TRANSCRIPTS_DIR=data/entrevistas
       - REII_DATABASE_URL=postgresql://reii:reii@reii-db:5432/reii
@@ -73,8 +73,8 @@ services:
       - REII_WORKFLOW_DB_PATH=data/workflow_data.json
       - REII_BEST_PARAMS_PATH=data/best_params.json
       - REII_DISCOURSE_STATE_PATH=data/discourse_state.json
-      - REII_GRAMMAR_CONFIG_PATH=ia/0.json
-      - REII_DISCOURSE_CONFIG_PATH=ia/1.json
+      - REII_GRAMMAR_CONFIG_PATH=ia/analisis_discursivo/resumidor_gramatical.json
+      - REII_DISCOURSE_CONFIG_PATH=ia/analisis_discursivo/discurso_lexico.json
       - REII_BATCH_DB_PATH=data/entrevistas.json
       - REII_TRANSCRIPTS_DIR=data/entrevistas
       - REII_DATABASE_URL=postgresql://reii:reii@reii-db:5432/reii

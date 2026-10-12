@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-from reii.config import BATCH_DB_PATH, DATA_DIR, TRANSCRIPTS_DIR
+from reii.config import BATCH_DB_PATH, DATA_DIR, LOCALISMOS_PATH, TRANSCRIPTS_DIR
 from reii.guia_entrevista import guia_como_texto
 from reii.ia_discursiva import call_deepseek_structured
 
@@ -213,10 +213,12 @@ Eres un asistente de investigación cualitativa especializado en segmentación e
 Tu tarea es segmentar la transcripción de una entrevista en bloques secuenciales siguiendo la guía de 32 preguntas que se te proporciona.
 
 Reglas estrictas:
-- Extrae el texto LITERAL de la entrevista. No resumas, no parafrasees, no clasifiques y no omitas contenido.
+- Extrae el texto LITERAL de la entrevista. No resumas, no parafrasees, no clasifiques y no omitas contenido del entrevistado.
+- ELIMINA las preguntas de la guía que el entrevistador lee en voz alta (al inicio o en cualquier punto de la entrevista): no las incluyas como contenido del entrevistado.
 - Corrige únicamente errores ortográficos y de puntuación evidentes del software de transcripción, pero NO cambies las palabras ni el tono del entrevistado.
+- Preserva los localismos y términos regionales/dialectales tal como los usa el entrevistado: NO los "corrijas" a su equivalente estándar. Son vocabulario válido.
 - Si una palabra fue mal transcrita de forma evidente, sustitúyela por la opción contextualmente correcta.
-- Si el entrevistador interrumpe con un comentario menor en medio de una respuesta, coloca el texto del entrevistador entre paréntesis ( ) dentro del mismo bloque. No uses etiquetas "Entrevistado:" ni "Entrevistador:".
+- Si el entrevistador interrumpe en medio de una respuesta (comentario, aclaración, pregunta o cualquier intervención), coloca TODO el texto del entrevistador entre paréntesis ( ) dentro del mismo bloque. No uses etiquetas "Entrevistado:" ni "Entrevistador:".
 - Si una pregunta de la guía no fue formulada o está ausente, IGNÓRALA: no generes un segmento vacío.
 - El texto huérfano al inicio o al final que no corresponda a ninguna pregunta debe asignarse con numero_pregunta: 0 y seccion_entrevista: "TEXTO_NO_ASIGNADO".
 - Devuelve ÚNICAMENTE un objeto JSON válido que cumpla el esquema. Cero texto plano antes o después del JSON."""
@@ -228,6 +230,9 @@ Tu tarea es extraer y mapear las respuestas de la entrevista a las categorías d
 
 Reglas estrictas:
 - Limpia los errores de transcripción sobre la marcha (ortografía, palabras mal transcritas según el contexto, puntuación) sin alterar el significado.
+- Preserva los localismos y términos regionales/dialectales tal como los usa el entrevistado: NO los "corrijas" a su equivalente estándar. Son vocabulario válido.
+- ELIMINA las preguntas de la guía que el entrevistador lee en voz alta: no las trates como respuestas del entrevistado.
+- Si el entrevistador interrumpe en medio de una respuesta, coloca TODO su texto entre paréntesis ( ) y no lo confundas con la respuesta del entrevistado.
 - Mapea de forma inteligente las respuestas a las categorías, sin importar en qué parte del texto aparezcan.
 - CERO alucinaciones: si una pregunta de la guía no fue respondida o no se aborda en la entrevista, escribe exactamente "NO ESTÁ PRESENTE" para los campos de texto y [] para los campos de lista.
 - Devuelve ÚNICAMENTE un objeto JSON válido según el esquema. Sin saludos, explicaciones ni etiquetas."""
@@ -237,10 +242,66 @@ Reglas estrictas:
 # ---------------------------------------------------------------------------
 
 
-def build_prompt_segmentacion(transcripcion: str) -> List[Dict[str, str]]:
+def load_localismos(path: str = None) -> Dict:
+    """Carga el archivo de localismos (términos regionales a preservar).
+
+    Formato esperado: ``{"glosario": {término: glosa}, "preservar": [términos]}``.
+    Devuelve un dict normalizado con las claves ``glosario`` y ``preservar``;
+    si el archivo no existe o es inválido, devuelve ambos vacíos.
+    """
+    ruta = Path(path) if path else Path(LOCALISMOS_PATH)
+    if not ruta.exists():
+        return {"glosario": {}, "preservar": []}
+    try:
+        with open(ruta, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"glosario": {}, "preservar": []}
+    if not isinstance(data, dict):
+        return {"glosario": {}, "preservar": []}
+    glosario = data.get("glosario", {})
+    preservar = data.get("preservar", [])
+    if not isinstance(glosario, dict):
+        glosario = {}
+    if not isinstance(preservar, list):
+        preservar = []
+    return {"glosario": glosario, "preservar": preservar}
+
+
+def _bloque_localismos(localismos: Dict) -> str:
+    """Construye el bloque de instrucciones para preservar localismos.
+
+    Devuelve una cadena vacía si no hay localismos definidos.
+    """
+    glosario = localismos.get("glosario", {})
+    preservar = localismos.get("preservar", [])
+    if not glosario and not preservar:
+        return ""
+    lineas = []
+    if preservar:
+        lineas.append(
+            "Términos a preservar tal cual (no corregir): "
+            + ", ".join(str(t) for t in preservar)
+        )
+    if glosario:
+        lineas.append("Glosario de localismos (término → significado):")
+        for term, gloss in glosario.items():
+            lineas.append(f"- {term}: {gloss}")
+    return "\n".join(lineas)
+
+
+def build_prompt_segmentacion(
+    transcripcion: str, localismos: Optional[Dict] = None
+) -> List[Dict[str, str]]:
     """Construye los mensajes (system + user) para la Ruta 1 (segmentación)."""
+    if localismos is None:
+        localismos = load_localismos()
+    system = SYSTEM_PROMPT_SEGMENTACION
+    bloque = _bloque_localismos(localismos)
+    if bloque:
+        system = system + "\n\n" + bloque
     return [
-        {"role": "system", "content": SYSTEM_PROMPT_SEGMENTACION},
+        {"role": "system", "content": system},
         {
             "role": "user",
             "content": (
@@ -252,10 +313,18 @@ def build_prompt_segmentacion(transcripcion: str) -> List[Dict[str, str]]:
     ]
 
 
-def build_prompt_extraccion(transcripcion: str) -> List[Dict[str, str]]:
+def build_prompt_extraccion(
+    transcripcion: str, localismos: Optional[Dict] = None
+) -> List[Dict[str, str]]:
     """Construye los mensajes (system + user) para la Ruta 2 (extracción)."""
+    if localismos is None:
+        localismos = load_localismos()
+    system = SYSTEM_PROMPT_EXTRACCION
+    bloque = _bloque_localismos(localismos)
+    if bloque:
+        system = system + "\n\n" + bloque
     return [
-        {"role": "system", "content": SYSTEM_PROMPT_EXTRACCION},
+        {"role": "system", "content": system},
         {
             "role": "user",
             "content": (
@@ -324,10 +393,14 @@ class BatchProcessor:
         db_path: str = BATCH_DB_PATH,
         max_retries: int = 3,
         temperature: float = 0.2,
+        localismos: Optional[Dict] = None,
     ) -> None:
         self.db_path: str = db_path
         self.max_retries: int = max_retries
         self.temperature: float = temperature
+        self.localismos: Dict = (
+            localismos if localismos is not None else load_localismos()
+        )
         self._ensure_db()
 
     # ── Persistencia ──────────────────────────────────────────────────
@@ -454,14 +527,14 @@ class BatchProcessor:
             transcripcion = colapsar_repeticiones(transcripcion)
 
             segmentos = call_deepseek_structured(
-                build_prompt_segmentacion(transcripcion),
+                build_prompt_segmentacion(transcripcion, self.localismos),
                 SCHEMA_SEGMENTACION,
                 max_retries=self.max_retries,
                 temperature=self.temperature,
                 log_cb=_cb,
             )
             extraccion = call_deepseek_structured(
-                build_prompt_extraccion(transcripcion),
+                build_prompt_extraccion(transcripcion, self.localismos),
                 SCHEMA_EXTRACCION,
                 max_retries=self.max_retries,
                 temperature=self.temperature,

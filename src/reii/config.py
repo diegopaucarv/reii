@@ -109,11 +109,21 @@ DISCOURSE_STATE_PATH: str = str(
 # IA agent config paths
 # ---------------------------------------------------------------------------
 IA_DIR = ROOT_DIR / "ia"
+DISCOURSE_DIR = IA_DIR / "analisis_discursivo"
 GRAMMAR_CONFIG_PATH: str = str(
-    ROOT_DIR / os.environ.get("REII_GRAMMAR_CONFIG_PATH", "ia/0.json")
+    ROOT_DIR
+    / os.environ.get(
+        "REII_GRAMMAR_CONFIG_PATH", "ia/analisis_discursivo/resumidor_gramatical.json"
+    )
 )
 DISCOURSE_CONFIG_PATH: str = str(
-    ROOT_DIR / os.environ.get("REII_DISCOURSE_CONFIG_PATH", "ia/1.json")
+    ROOT_DIR
+    / os.environ.get(
+        "REII_DISCOURSE_CONFIG_PATH", "ia/analisis_discursivo/discurso_lexico.json"
+    )
+)
+LOCALISMOS_PATH: str = str(
+    ROOT_DIR / os.environ.get("REII_LOCALISMOS_PATH", "ia/localismos.json")
 )
 
 # ---------------------------------------------------------------------------
@@ -144,7 +154,9 @@ USE_GENSIM_EMBEDDINGS: bool = (
 ROOTS_SKIP_COREF: bool = (
     os.environ.get("REII_ROOTS_SKIP_COREF", "true").lower() == "true"
 )
-ROOTS_BATCH_SIZE: int = int(os.environ.get("REII_ROOTS_BATCH_SIZE", "32"))  # <=1: sin lotes
+ROOTS_BATCH_SIZE: int = int(
+    os.environ.get("REII_ROOTS_BATCH_SIZE", "32")
+)  # <=1: sin lotes
 
 # ---------------------------------------------------------------------------
 # API keys / tokens
