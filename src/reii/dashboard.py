@@ -1208,6 +1208,7 @@ def _build_termino_index(_version: str):
     return index
 
 
+@st.cache_data(show_spinner=False)
 def _build_term_color_map_cached(
     _version: str, terms_key: tuple, classes_key: tuple
 ) -> dict:
@@ -1856,47 +1857,159 @@ _silhouette = _silhouette_value()
 _section_header("Corpus")
 cols_stat = st.columns(6)
 STATS = [
-    (str(n_documentos), "Entrevistas (UCI)"),
-    (f"{len(uces):,}", "UCEs"),
-    (f"{raw_tokens:,}", "Formas totales (tokens crudos)"),
-    (f"{total_forms:,}", "Lemas de contenido"),
-    (f"{unique_forms:,}", "Formas distintas (types)"),
-    (f"{hapax:,}", "Hápax"),
+    (
+        str(n_documentos),
+        "Entrevistas (UCI)",
+        (
+            "Número de entrevistas (documentos) del corpus. Cada entrevista es una "
+            "Unidad de Contexto Inicial (UCI)."
+        ),
+    ),
+    (
+        f"{len(uces):,}",
+        "UCEs",
+        (
+            "Número de Unidades de Contexto Elemental: los segmentos de texto en que "
+            "se divide el corpus para el análisis."
+        ),
+    ),
+    (
+        f"{raw_tokens:,}",
+        "Formas totales (tokens crudos)",
+        (
+            "Todas las palabras del corpus, incluidas las palabras de función "
+            "(artículos, preposiciones, etc.)."
+        ),
+    ),
+    (
+        f"{total_forms:,}",
+        "Lemas de contenido",
+        (
+            "Ocurrencias totales de lemas de contenido (sustantivos, verbos, "
+            "adjetivos y adverbios de modo)."
+        ),
+    ),
+    (
+        f"{unique_forms:,}",
+        "Formas distintas (types)",
+        "Número de lemas únicos (sin repetir) que aparecen en el corpus.",
+    ),
+    (
+        f"{hapax:,}",
+        "Hápax",
+        "Lemas que aparecen exactamente una vez en todo el corpus.",
+    ),
 ]
-for col, (val, lbl) in zip(cols_stat, STATS):
+for col, (val, lbl, help_txt) in zip(cols_stat, STATS):
     with col:
-        st.metric(label=lbl, value=val)
+        st.metric(label=lbl, value=val, help=help_txt)
 
 # ── Grupo 2 · Análisis ──────────────────────────────────────────────
 _section_header("Análisis")
 cols_ana = st.columns(7)
 ANALYSIS_STATS = [
-    (str(analyzed_forms), "Formas analizadas (tras reducción)"),
-    (str(formas_suplementarias), "Formas suplementarias"),
-    (f"{vocabulary_richness:.1f}%", "Riqueza por types"),
-    (f"{token_richness:.1f}%", "Riqueza por tokens"),
-    (str(config.get("tsj", 3)), "Frecuencia mínima (TSJ)"),
-    (str(len(class_sizes)), "Clases estables"),
-    (_silhouette, "Silhouette (χ²)"),
+    (
+        str(analyzed_forms),
+        "Formas analizadas (tras reducción)",
+        (
+            "Términos del vocabulario que quedan tras aplicar la reducción "
+            "(frecuencia mínima TSJ, filtrado de hápax, etc.)."
+        ),
+    ),
+    (
+        str(formas_suplementarias),
+        "Formas suplementarias",
+        (
+            "Marcadores discursivos y formas suplementarias. No entran a la "
+            "clasificación, solo describen el corpus."
+        ),
+    ),
+    (
+        f"{vocabulary_richness:.1f}%",
+        "Riqueza por types",
+        (
+            "Porcentaje de formas distintas (types) cubiertas por el vocabulario "
+            "analizado."
+        ),
+    ),
+    (
+        f"{token_richness:.1f}%",
+        "Riqueza por tokens",
+        "Porcentaje de ocurrencias (tokens) cubiertas por las formas analizadas.",
+    ),
+    (
+        str(config.get("tsj", 3)),
+        "Frecuencia mínima (TSJ)",
+        (
+            "Umbral de frecuencia mínima: un término debe aparecer al menos este "
+            "número de veces para entrar al análisis."
+        ),
+    ),
+    (
+        str(len(class_sizes)),
+        "Clases estables",
+        "Número de clases (mundos léxicos) estables resultantes de la clasificación.",
+    ),
+    (
+        _silhouette,
+        "Silhouette (χ²)",
+        (
+            "Coeficiente de silueta medio en espacio χ²: mide cuán cohesionadas y "
+            "separadas están las clases (cercano a 1 = mejor separación)."
+        ),
+    ),
 ]
-for col, (val, lbl) in zip(cols_ana, ANALYSIS_STATS):
+for col, (val, lbl, help_txt) in zip(cols_ana, ANALYSIS_STATS):
     with col:
-        st.metric(label=lbl, value=val)
+        st.metric(label=lbl, value=val, help=help_txt)
 
 # ── Grupo 3 · Indicadores léxicos (Reinert) ─────────────────────────
 _section_header("Indicadores léxicos (Reinert)")
 cols_lex = st.columns(6)
 LEX_STATS = [
-    (f"{ttr:.1f}%", "TTR (9–20%)"),
-    (f"{guiraud:.2f}", "Guiraud"),
-    (f"{zipf_slope:.2f}", "pendiente Zipf (a)"),
-    (str(ctest), "CTEST"),
-    ("activo" if use_ctest else "inactivo", "CTEST aplicado"),
-    (f"{classification_rate:.1f}%", "cobertura UCEs"),
+    (
+        f"{ttr:.1f}%",
+        "TTR (9–20%)",
+        (
+            "Type-Token Ratio: proporción de formas distintas sobre ocurrencias "
+            "totales. Reinert considera aceptable ~9%–20%."
+        ),
+    ),
+    (
+        f"{guiraud:.2f}",
+        "Guiraud",
+        (
+            "Índice de Guiraud: formas distintas divididas por la raíz cuadrada de "
+            "las ocurrencias. Menos sensible a la longitud del texto que el TTR."
+        ),
+    ),
+    (
+        f"{zipf_slope:.2f}",
+        "pendiente Zipf (a)",
+        (
+            "Pendiente del ajuste lineal de log(frecuencia) vs log(rango) (ley de "
+            "Zipf). Valores típicos cercanos a -1."
+        ),
+    ),
+    (
+        str(ctest),
+        "CTEST",
+        "Coeficiente de contingencia de solapamiento de Reinert (umbral configurado).",
+    ),
+    (
+        "activo" if use_ctest else "inactivo",
+        "CTEST aplicado",
+        "Indica si el filtro CTEST está activo o inactivo.",
+    ),
+    (
+        f"{classification_rate:.1f}%",
+        "cobertura UCEs",
+        "Porcentaje de UCEs que fueron clasificadas en alguna clase.",
+    ),
 ]
-for col, (val, lbl) in zip(cols_lex, LEX_STATS):
+for col, (val, lbl, help_txt) in zip(cols_lex, LEX_STATS):
     with col:
-        st.metric(label=lbl, value=val)
+        st.metric(label=lbl, value=val, help=help_txt)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -8105,13 +8218,13 @@ def tab_global(stats: Dict, uces_all: List[Dict]):
     st.markdown(
         f"""
     <div class="kpi-row">
-      <div class="kpi-card" title="Unidades de Contexto Elemental analizadas">
+      <div class="kpi-card" title="Unidades de Contexto Elemental (segmentos de texto) analizadas">
         <div class="kpi-value">{n_uces}</div><div class="kpi-label">UCEs</div></div>
-      <div class="kpi-card" title="Total de palabras en el corpus filtrado">
+      <div class="kpi-card" title="Total de palabras (tokens) en el corpus filtrado">
         <div class="kpi-value">{n_tokens:,}</div><div class="kpi-label">Tokens</div></div>
-      <div class="kpi-card" title="Type-Token Ratio: proporción de palabras únicas.">
+      <div class="kpi-card" title="Type-Token Ratio: proporción de palabras únicas sobre el total de palabras.">
         <div class="kpi-value">{fmt(ttr_mean)}</div><div class="kpi-label">Riqueza léxica</div></div>
-      <div class="kpi-card" title="Cambio temático promedio entre UCEs consecutivas">
+      <div class="kpi-card" title="Cambio temático promedio entre UCEs consecutivas (cuánto cambia el tema de un segmento al siguiente)">
         <div class="kpi-value">{fmt(ts_mean)}</div><div class="kpi-label">Cambio temático</div></div>
     </div>""",
         unsafe_allow_html=True,
@@ -9537,9 +9650,11 @@ def render_annotated_uce(
                     (
                         s,
                         e,
-                        f'<span class="ann-pred-subj clickable-token" '
-                        f'style="border-bottom:2.5px solid {col};padding-bottom:1px;" '
-                        f'title="nsubj · {tip_base}" {onclick}>',
+                        (
+                            f'<span class="ann-pred-subj clickable-token" '
+                            f'style="border-bottom:2.5px solid {col};padding-bottom:1px;" '
+                            f'title="nsubj · {tip_base}" {onclick}>'
+                        ),
                         "</span>",
                         9,
                     )
@@ -9552,9 +9667,11 @@ def render_annotated_uce(
                     (
                         vs,
                         ve,
-                        f'<span class="ann-pred-verb clickable-token" '
-                        f'style="background:{col}22;border-radius:3px;font-weight:600;" '
-                        f'title="verbo · {tip_base}" {onclick}>',
+                        (
+                            f'<span class="ann-pred-verb clickable-token" '
+                            f'style="background:{col}22;border-radius:3px;font-weight:600;" '
+                            f'title="verbo · {tip_base}" {onclick}>'
+                        ),
                         "</span>",
                         8,
                     )
@@ -9567,9 +9684,11 @@ def render_annotated_uce(
                     (
                         os_,
                         oe,
-                        f'<span class="ann-pred-obj clickable-token" '
-                        f'style="border-bottom:2px dotted {col};padding-bottom:1px;" '
-                        f'title="dobj · {tip_base}" {onclick}>',
+                        (
+                            f'<span class="ann-pred-obj clickable-token" '
+                            f'style="border-bottom:2px dotted {col};padding-bottom:1px;" '
+                            f'title="dobj · {tip_base}" {onclick}>'
+                        ),
                         "</span>",
                         7,
                     )
@@ -10017,17 +10136,31 @@ def _build_cooc(
     return cooc
 
 
+@st.cache_data(show_spinner=False)
+def _build_cooc_cached(
+    uces_clase_json: str,
+    annotations_json: str,
+    traits_key: tuple,
+) -> pd.DataFrame:
+    """Cached wrapper for _build_cooc using hashable JSON keys."""
+    uces_clase = json.loads(uces_clase_json)
+    annotations_by_uce = json.loads(annotations_json)
+    return _build_cooc(uces_clase, annotations_by_uce, list(traits_key))
+
+
 # ══════════════════════════════════════════════════════════════
 # DEPENDENCY GRAPH SVG
 # ══════════════════════════════════════════════════════════════
 
 
-def _dep_graph_html(active_trait: Optional[str], present_traits: Set[str]) -> str:
+@st.cache_data(show_spinner=False)
+def _dep_graph_html(active_trait: Optional[str], present_traits_key: tuple) -> str:
     """
     Renders the schema dependency graph as static HTML+SVG.
     Nodes present in the corpus are bright; absent ones are dimmed.
     The active_trait node is highlighted.
     """
+    present_traits = set(present_traits_key)
     # Fixed positions (x,y) inside a 320×220 canvas
     NODE_POS: Dict[str, Tuple[int, int]] = {
         "ideacion": (130, 30),
@@ -10312,6 +10445,25 @@ def _compute_trayectoria_matrix(
     return result
 
 
+@st.cache_data(show_spinner=False)
+def _compute_trayectoria_matrix_cached(
+    df_json: str,
+    uce_order_key: tuple,
+    active_traits_key: tuple,
+    active_classes_key: tuple,
+    window: int = 5,
+) -> Dict[Any, pd.DataFrame]:
+    """Cached wrapper for _compute_trayectoria_matrix using hashable keys."""
+    df = pd.read_json(df_json, orient="records")
+    return _compute_trayectoria_matrix(
+        df,
+        list(uce_order_key),
+        list(active_traits_key),
+        list(active_classes_key),
+        window=window,
+    )
+
+
 def _chart_heatmap_trayectoria(
     df: pd.DataFrame,
     uce_order: List[str],
@@ -10441,6 +10593,29 @@ def _chart_heatmap_trayectoria(
         ann.font = dict(size=9, color=T["text_dim"], family="IBM Plex Mono, monospace")
 
     return fig
+
+
+@st.cache_data(show_spinner=False)
+def _chart_heatmap_trayectoria_cached(
+    df_json: str,
+    uce_order_key: tuple,
+    traits_key: tuple,
+    classes_key: tuple,
+    window: int = 5,
+) -> go.Figure:
+    """Cached wrapper for _chart_heatmap_trayectoria using hashable keys.
+
+    class_colors is a module-level global, so it is not part of the cache key.
+    """
+    df = pd.read_json(df_json, orient="records")
+    return _chart_heatmap_trayectoria(
+        df,
+        list(uce_order_key),
+        list(traits_key),
+        list(classes_key),
+        class_colors,
+        window=window,
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -13337,12 +13512,13 @@ def _render_tab_e():
     # ════════════════════════════════════════════════════════════════════════
     # STATS BANNER
     # ════════════════════════════════════════════════════════════════════════
-    def _badge(lbl, val, col=_E_ACC):
+    def _badge(lbl, val, col=_E_ACC, title=None):
         # width adapts to content via min-width + padding only
+        _title = f' title="{title}"' if title else ""
         return (
             f'<div style="display:inline-flex;flex-direction:column;'
             f"align-items:center;padding:6px 10px;background:{_E_SURF};"
-            f'border:1px solid {_E_BORD};border-radius:6px;white-space:nowrap;">'
+            f'border:1px solid {_E_BORD};border-radius:6px;white-space:nowrap;"{_title}>'
             f'<span style="font-size:15px;font-weight:700;color:{col};'
             f'font-family:IBM Plex Mono,monospace;">{val}</span>'
             f'<span style="font-size:8px;color:{_E_DIM};text-transform:uppercase;'
@@ -13367,13 +13543,38 @@ def _render_tab_e():
 
     st.html(
         f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 10px;">'
-        + _badge("spans cls", _n_cls_total, _acc_col)
-        + _badge(_sel_trait or "trait", _n_trait, _ec(_sel_trait or ""))
-        + _badge("UCEs", _n_uces_tr, _acc_col)
-        + _badge("% total", f"{_pct_trait}%", _E_VIO)
-        + _badge("alta conf.", _n_alta, _E_MINT)
+        + _badge(
+            "spans cls",
+            _n_cls_total,
+            _acc_col,
+            "Número total de clases (spans) en el corpus",
+        )
+        + _badge(
+            _sel_trait or "trait",
+            _n_trait,
+            _ec(_sel_trait or ""),
+            "Número de UCEs con el rasgo seleccionado",
+        )
+        + _badge(
+            "UCEs",
+            _n_uces_tr,
+            _acc_col,
+            "Unidades de Contexto Elemental en la selección",
+        )
+        + _badge(
+            "% total",
+            f"{_pct_trait}%",
+            _E_VIO,
+            "Porcentaje de UCEs con el rasgo sobre el total",
+        )
+        + _badge("alta conf.", _n_alta, _E_MINT, "UCEs con confianza alta")
         + (
-            _badge("subtipo top", _top_meta_str, _E_AMBER)  # Updated label
+            _badge(
+                "subtipo top",
+                _top_meta_str,
+                _E_AMBER,
+                "Valor más frecuente del subtipo",
+            )  # Updated label
             if _top_meta_str
             else ""
         )
@@ -13960,6 +14161,83 @@ def _render_tab_e():
 
             st.caption(f"Presencia de rasgo. {_N_BINS} divisiones. Clic → ir al texto.")
 
+    # ════════════════════════════════════════════════════════════════════════
+    # DEPENDENCY GRAPH
+    # ════════════════════════════════════════════════════════════════════════
+    _sec_rule("Grafo de dependencias entre rasgos")
+    _present_traits = set(_df_all["trait"].unique())
+    st.html(_dep_graph_html(_sel_trait, tuple(sorted(_present_traits))))
+
+    # ════════════════════════════════════════════════════════════════════════
+    # MULTI-CLASS TRAJECTORY HEATMAP
+    # ════════════════════════════════════════════════════════════════════════
+    with st.expander("Trayectoria multi-clase", expanded=False):
+        _fig_multi = _chart_heatmap_trayectoria_cached(
+            _df_all.to_json(orient="records"),
+            tuple(_uce_order),
+            tuple(_all_traits),
+            tuple(class_list),
+            window=5,
+        )
+        st.plotly_chart(
+            _fig_multi,
+            width="stretch",
+            config={"displayModeBar": False},
+        )
+
+    # ════════════════════════════════════════════════════════════════════════
+    # CO-OCCURRENCE MATRIX (raw counts)
+    # ════════════════════════════════════════════════════════════════════════
+    with st.expander("Matriz de co-ocurrencia (conteos)", expanded=False):
+        _cooc_raw = _build_cooc_cached(
+            json.dumps(_uces_active, ensure_ascii=False),
+            json.dumps(annotations_by_uce, ensure_ascii=False),
+            tuple(_all_traits),
+        )
+        if _cooc_raw.empty:
+            st.info("Sin datos de co-ocurrencia.")
+        else:
+            _fig_cooc_raw = go.Figure(
+                go.Heatmap(
+                    z=_cooc_raw.values,
+                    x=list(_cooc_raw.columns),
+                    y=list(_cooc_raw.index),
+                    colorscale=[[0, _E_SURF], [0.5, _E_BORD], [1, _acc_col]],
+                    showscale=True,
+                    xgap=1,
+                    ygap=1,
+                    hovertemplate="%{y} ∩ %{x}: %{z}<extra></extra>",
+                )
+            )
+            _fig_cooc_raw.update_layout(
+                _ply(
+                    height=max(180, 36 * len(_all_traits)),
+                    margin=dict(t=10, b=10, l=4, r=4),
+                    xaxis=dict(tickfont=dict(size=8, color=_E_DIM), linecolor=_E_BORD),
+                    yaxis=dict(
+                        tickfont=dict(size=8, color=_E_DIM),
+                        linecolor=_E_BORD,
+                        autorange="reversed",
+                    ),
+                )
+            )
+            st.plotly_chart(
+                _fig_cooc_raw,
+                width="stretch",
+                config={"displayModeBar": False},
+            )
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SUBTYPE ANALYSIS
+    # ════════════════════════════════════════════════════════════════════════
+    with st.expander("Análisis de subtipos", expanded=False):
+        _render_subtype_tab(
+            _df_cls,
+            set(_all_traits),
+            [_active_cls],
+            class_colors,
+        )
+
 
 @st.fragment
 def _discourse_run_opts() -> Dict[str, Any]:
@@ -14102,7 +14380,7 @@ def _render_tab_e_crud():
             _r1, _r2, _r3, _r4, _r5 = st.columns([1, 3, 2, 2, 1])
             with _r1:
                 st.checkbox(
-                    "",
+                    f"Seleccionar {_name}",
                     key=f"ia_sel_{_k}",
                     label_visibility="collapsed",
                     help=f"Incluir `{_name}` en la selección",
