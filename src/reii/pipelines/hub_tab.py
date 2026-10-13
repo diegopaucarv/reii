@@ -44,9 +44,6 @@ class HubContext:
     save_config: Callable[[Dict[str, Any]], Dict[str, Any]]
     reset_config: Optional[Callable[[], None]]
     start_workflow: Callable[[Dict[str, Any]], None]
-    list_workflows: Callable[[], List[Dict[str, Any]]]  # [{file,name,agents,progress}]
-    rename_workflow: Callable[[str, str], None]
-    start_discourse: Callable[..., None]  # (file, store, label, force, source)
     run_fix: Callable[[str], str]
     render_agents_crud: Optional[Callable[[], None]] = None
     render_transcripciones: Optional[Callable[[], None]] = (
@@ -274,16 +271,65 @@ def _tab_workflow(ctx: HubContext) -> None:
     _run_panel(ctx, "workflow")
 
 
+def _checkpoints_section() -> None:
+    """Checkpoints del estado del discurso (guardar / listar / restaurar / eliminar).
+
+    Usa ``discourse_store`` (PostgreSQL) de forma perezosa y defensiva: si la
+    base de datos no está disponible, la sección se muestra con un aviso en vez
+    de romper la pestaña.
+    """
+    with st.expander("💾 Checkpoints del estado", expanded=False):
+        try:
+            from reii.pipelines import discourse_store
+
+            _cp_name = st.text_input("Nombre del checkpoint", key="hub_cp_name").strip()
+            if st.button(
+                "💾 Guardar checkpoint",
+                key="hub_cp_save",
+                disabled=not _cp_name,
+            ):
+                discourse_store.save_checkpoint(_cp_name, discourse_store.load_state())
+                st.success(f"Checkpoint `{_cp_name}` guardado.")
+                st.rerun()
+            _cps = discourse_store.list_checkpoints()
+            if not _cps:
+                st.caption("No hay checkpoints guardados.")
+            for _cp in _cps:
+                _cc1, _cc2, _cc3 = st.columns([4, 1, 1])
+                _cc1.markdown(
+                    f"**{_cp.get('name', '?')}** · {_cp.get('created_at', '')} · "
+                    f"{_cp.get('n_uces', 0)} UCEs anotadas"
+                )
+                if _cc2.button(
+                    "↩ Restaurar",
+                    key=f"hub_cp_restore_{_cp['checkpoint_id']}",
+                    width="stretch",
+                ):
+                    _restored = discourse_store.restore_checkpoint(_cp["checkpoint_id"])
+                    discourse_store.save_state(_restored)
+                    st.success("Checkpoint restaurado.")
+                    st.rerun()
+                if _cc3.button(
+                    "🗑️ Eliminar",
+                    key=f"hub_cp_del_{_cp['checkpoint_id']}",
+                    width="stretch",
+                ):
+                    discourse_store.delete_checkpoint(_cp["checkpoint_id"])
+                    st.success("Checkpoint eliminado.")
+                    st.rerun()
+        except Exception as _cpe:
+            st.warning(f"No se pudo acceder a los checkpoints: {_cpe}")
+
+
 def _tab_discourse(ctx: HubContext) -> None:
     _how_it_works("discourse")
     source = st.radio(
         "Fuente de las UCEs",
-        ["db", "json"],
+        ["db"],
         horizontal=True,
         key="hub_dc_source",
         format_func=lambda v: {
             "db": "Base de datos (recomendado: lo que se anota es lo que se muestra)",
-            "json": "workflow_data.json (comportamiento anterior)",
         }[v],
     )
     with st.expander("Opciones de ejecución", expanded=False):
@@ -296,12 +342,27 @@ def _tab_discourse(ctx: HubContext) -> None:
             help="Ignora lo ya procesado y vuelve a analizar todas las UCEs.",
         )
         label = c3.text_input("Etiqueta (opcional)", key="hub_dc_label") or None
+    # Estas opciones gobiernan TODA ejecución del discurso en esta pestaña — los
+    # agentes individuales dentro del expander "Agentes y prompts"
+    # (ctx.render_agents_crud), que antes las ignoraba y corría siempre con
+    # force=False/source="db" sin importar lo elegido aquí.
+    ctx.session["hub_discourse_options"] = {
+        "store": store,
+        "force": force,
+        "label": label,
+        "source": source,
+    }
     st.caption(
         "Al terminar, las anotaciones se sincronizan con la base de datos y aparecen en la última sección de la pestaña C."
     )
+    _checkpoints_section()
     _run_panel(ctx, "discourse")
     if ctx.render_agents_crud:
         with st.expander("Agentes y prompts (ia/*.json)", expanded=False):
+            st.caption(
+                "Ejecución agente por agente, con las mismas opciones de arriba "
+                "(fuente, guardar estado, re-procesar, etiqueta)."
+            )
             ctx.render_agents_crud()
 
 

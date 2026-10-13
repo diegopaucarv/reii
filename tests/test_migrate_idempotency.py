@@ -34,7 +34,7 @@ EXPECTED = {
     "terms": 7968,
     "annotations": 0,
     "network_edges": 3179,
-    "kv_store": 23,
+    "kv_store": 32,
 }
 
 

@@ -1,0 +1,217 @@
+{
+  "name": "extraccion_respuestas",
+  "role": "Extracción y mapeo de respuestas de entrevistas",
+  "instructions": "Eres un asistente de investigación cualitativa especializado en el análisis de entrevistas semiestructuradas.\n\nTu tarea es extraer y mapear las respuestas de la entrevista a las categorías del esquema de salida, usando la guía de 32 preguntas como referencia.\n\nReglas estrictas:\n- Limpia los errores de transcripción sobre la marcha (ortografía, palabras mal transcritas según el contexto, puntuación) sin alterar el significado.\n- Preserva los localismos y términos regionales/dialectales tal como los usa el entrevistado: NO los \"corrijas\" a su equivalente estándar. Son vocabulario válido.\n- ELIMINA las preguntas de la guía que el entrevistador lee en voz alta: no las trates como respuestas del entrevistado.\n- Si el entrevistador interrumpe en medio de una respuesta, coloca TODO su texto entre paréntesis ( ) y no lo confundas con la respuesta del entrevistado.\n- Mapea de forma inteligente las respuestas a las categorías, sin importar en qué parte del texto aparezcan.\n- CERO alucinaciones: si una pregunta de la guía no fue respondida o no se aborda en la entrevista, escribe exactamente \"NO ESTÁ PRESENTE\" para los campos de texto y [] para los campos de lista.\n- Devuelve ÚNICAMENTE un objeto JSON válido según el esquema. Sin saludos, explicaciones ni etiquetas.",
+  "json_schema": {
+    "type": "object",
+    "properties": {
+      "datos_sociodemograficos": {
+        "type": "object",
+        "properties": {
+          "Alias": {
+            "type": "string"
+          },
+          "sexo": {
+            "type": "string"
+          },
+          "edad": {
+            "type": "string"
+          },
+          "dependientes_economicos": {
+            "type": "string"
+          },
+          "ocupacion": {
+            "type": "string"
+          },
+          "lugar_procedencia": {
+            "type": "string"
+          },
+          "distrito_residencia": {
+            "type": "string"
+          },
+          "carrera_especialidad": {
+            "type": "string"
+          },
+          "formacion_adicional": {
+            "type": "string"
+          },
+          "motivo_eleccion_carrera": {
+            "type": "string"
+          },
+          "proyeccion_5_anos": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "Alias",
+          "sexo",
+          "edad",
+          "dependientes_economicos",
+          "ocupacion",
+          "lugar_procedencia",
+          "distrito_residencia",
+          "carrera_especialidad",
+          "formacion_adicional",
+          "motivo_eleccion_carrera",
+          "proyeccion_5_anos"
+        ]
+      },
+      "concepciones_cambio_climatico": {
+        "type": "object",
+        "properties": {
+          "pensamiento_inicial": {
+            "type": "string"
+          },
+          "causas_mencionadas": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "medios_informacion_recibida": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "medios_mas_importantes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "materiales_consultados": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "pensamiento_inicial",
+          "causas_mencionadas",
+          "medios_informacion_recibida",
+          "medios_mas_importantes",
+          "materiales_consultados"
+        ]
+      },
+      "percepciones_entorno": {
+        "type": "object",
+        "properties": {
+          "diferencias_clima_percibidas": {
+            "type": "string"
+          },
+          "tiempo_estimado_cambios": {
+            "type": "string"
+          },
+          "significado_y_causas_atribuidas": {
+            "type": "string"
+          },
+          "influencia_vida_personas": {
+            "type": "string"
+          },
+          "grupos_vulnerables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "afectacion_salud": {
+            "type": "string"
+          },
+          "experiencia_personal_familiar": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "diferencias_clima_percibidas",
+          "tiempo_estimado_cambios",
+          "significado_y_causas_atribuidas",
+          "influencia_vida_personas",
+          "grupos_vulnerables",
+          "afectacion_salud",
+          "experiencia_personal_familiar"
+        ]
+      },
+      "rol_educacion_universitaria": {
+        "type": "object",
+        "properties": {
+          "conocimientos_suficientes_universidad": {
+            "type": "string"
+          },
+          "temas_desarrollados_asignaturas": {
+            "type": "string"
+          },
+          "importancia_abordar_tema": {
+            "type": "string"
+          },
+          "cambios_propuestos_plan_estudios": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "conocimientos_suficientes_universidad",
+          "temas_desarrollados_asignaturas",
+          "importancia_abordar_tema",
+          "cambios_propuestos_plan_estudios"
+        ]
+      },
+      "acciones_mitigacion": {
+        "type": "object",
+        "properties": {
+          "acciones_conocidas_entorno": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "acciones_sostenibles_personales": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "interes_ensenanza_futuro_docente": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "acciones_conocidas_entorno",
+          "acciones_sostenibles_personales",
+          "interes_ensenanza_futuro_docente"
+        ]
+      },
+      "perspectiva_futura": {
+        "type": "object",
+        "properties": {
+          "proyeccion_futura_cambios": {
+            "type": "string"
+          },
+          "percepcion_accion_pais_region": {
+            "type": "string"
+          },
+          "acciones_necesarias_sociedad": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "proyeccion_futura_cambios",
+          "percepcion_accion_pais_region",
+          "acciones_necesarias_sociedad"
+        ]
+      }
+    },
+    "required": [
+      "datos_sociodemograficos",
+      "concepciones_cambio_climatico",
+      "percepciones_entorno",
+      "rol_educacion_universitaria",
+      "acciones_mitigacion",
+      "perspectiva_futura"
+    ]
+  },
+  "few_shot_examples": []
+}

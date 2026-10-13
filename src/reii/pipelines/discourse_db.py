@@ -26,7 +26,9 @@ def strip_mf(raw_id: Any) -> str:
     return _MF.sub("", str(raw_id))
 
 
-def build_id_resolver(uce_rows: Iterable[Dict[str, Any]]) -> Callable[[Any], Optional[str]]:
+def build_id_resolver(
+    uce_rows: Iterable[Dict[str, Any]],
+) -> Callable[[Any], Optional[str]]:
     """Devuelve ``resolve(raw_id) -> uce_id | None``.
 
     Acepta: el id tal cual, sin sufijo ``__mfN``, ``{doc}_{sección}_{idx}`` y
@@ -54,7 +56,12 @@ def build_id_resolver(uce_rows: Iterable[Dict[str, Any]]) -> Callable[[Any], Opt
 
 
 def _fetch_uce_rows(conn) -> List[Dict[str, Any]]:
-    return [dict(r) for r in conn.execute("SELECT uce_id, doc_id, local_idx, section_id FROM uces").fetchall()]
+    return [
+        dict(r)
+        for r in conn.execute(
+            "SELECT uce_id, doc_id, local_idx, section_id FROM uces"
+        ).fetchall()
+    ]
 
 
 def _flatten(state: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -75,7 +82,9 @@ def _first_quote(a: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def sync_state_to_db(conn, state: Dict[str, Any], replace: str = "agents", tx=None) -> Dict[str, Any]:
+def sync_state_to_db(
+    conn, state: Dict[str, Any], replace: str = "agents", tx=None
+) -> Dict[str, Any]:
     """Escribe las anotaciones del estado en ``annotations`` resolviendo los ids.
 
     replace="agents": borra solo las filas de los agentes presentes en el estado.
@@ -93,24 +102,45 @@ def sync_state_to_db(conn, state: Dict[str, Any], replace: str = "agents", tx=No
         payload = {k: v for k, v in a.items() if k != "_raw_id"}
         payload["uce_id"] = uid
         payload["source_uce_id"] = a["_raw_id"]
-        key = (uid, payload.get("agent"), payload.get("trait"), json.dumps(payload.get("spans"), sort_keys=True, default=str), payload.get("quote"))
+        key = (
+            uid,
+            payload.get("agent"),
+            payload.get("trait"),
+            json.dumps(payload.get("spans"), sort_keys=True, default=str),
+            payload.get("quote"),
+        )
         if key in seen:
             continue
         seen.add(key)
-        rows.append((uid, payload.get("agent") or payload.get("agent_name") or "unknown", payload.get("trait"),
-                     _first_quote(payload), payload.get("confidence"), payload.get("subtype"),
-                     json.dumps(payload, ensure_ascii=False, default=str)))
-    agents = sorted({r[1] for r in rows} | {(a.get("agent") or "unknown") for a in flat})
+        rows.append(
+            (
+                uid,
+                payload.get("agent") or payload.get("agent_name") or "unknown",
+                payload.get("trait"),
+                _first_quote(payload),
+                payload.get("confidence"),
+                payload.get("subtype"),
+                json.dumps(payload, ensure_ascii=False, default=str),
+            )
+        )
+    agents = sorted(
+        {r[1] for r in rows} | {(a.get("agent") or "unknown") for a in flat}
+    )
 
     def _write():
         if replace == "all":
             conn.execute("DELETE FROM annotations")
         elif agents:
-            conn.execute(f"DELETE FROM annotations WHERE agent_name IN ({','.join(['%s'] * len(agents))})", agents)
+            conn.execute(
+                f"DELETE FROM annotations WHERE agent_name IN ({','.join(['%s'] * len(agents))})",
+                agents,
+            )
         for r in rows:
             conn.execute(
                 "INSERT INTO annotations (uce_id, agent_name, trait, quote, confidence, subtype, payload_json) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s)", r)
+                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                r,
+            )
 
     if hasattr(conn, "transaction"):
         with conn.transaction():
@@ -144,14 +174,21 @@ def load_annotations_by_uce(conn) -> Dict[str, List[Dict[str, Any]]]:
         ann.setdefault("subtype", r["subtype"])
         ann.setdefault("confidence", r["confidence"] or "baja")
         if not ann.get("spans") and r.get("quote"):
-            ann["spans"] = [{"uce_id": r["uce_id"], "quote": r["quote"], "start_char": -1, "end_char": -1}]
+            ann["spans"] = [
+                {
+                    "uce_id": r["uce_id"],
+                    "quote": r["quote"],
+                    "start_char": -1,
+                    "end_char": -1,
+                }
+            ]
         ann["uce_id"] = r["uce_id"]
         out[r["uce_id"]].append(ann)
     return dict(out)
 
 
-def export_discourse_input(adapter, path: str) -> Dict[str, int]:
-    """Escribe desde la BD el JSON que lee el análisis de discurso (``uces`` + anotaciones).
+def build_discourse_input(adapter) -> Dict[str, Any]:
+    """Construye en memoria la entrada del análisis (``uces`` + anotaciones) desde la BD.
 
     Los ids de las UCEs son exactamente ``uces.uce_id``, de modo que lo que se anota es
     lo que se muestra. Los metadatos del documento se fusionan en ``metadata``.
@@ -163,10 +200,21 @@ def export_discourse_input(adapter, path: str) -> Dict[str, int]:
         meta.update(u.get("metadata") or {})
         u["metadata"] = meta
         u.setdefault("id", u.get("uce_id"))
-    payload = {"uces": uces, "annotations_by_uce": adapter_annotations(adapter)}
+    return {"uces": uces, "annotations_by_uce": adapter_annotations(adapter)}
+
+
+def export_discourse_input(adapter, path: str) -> Dict[str, int]:
+    """Escribe desde la BD el JSON que lee el análisis de discurso (``uces`` + anotaciones).
+
+    Envoltorio de ``build_discourse_input`` que además persiste el resultado a disco.
+    """
+    payload = build_discourse_input(adapter)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
-    return {"n_uces": len(uces), "n_uces_con_anotaciones": len(payload["annotations_by_uce"])}
+    return {
+        "n_uces": len(payload["uces"]),
+        "n_uces_con_anotaciones": len(payload["annotations_by_uce"]),
+    }
 
 
 def adapter_annotations(adapter) -> Dict[str, List[Dict[str, Any]]]:

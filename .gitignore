@@ -62,10 +62,6 @@ data/analisis_gramatical.json
 data/discourse_state.json
 data/best_params.json
 
-# ============================================================
-# AI conversation state — runtime agent database
-# ============================================================
-ia/
 
 # ============================================================
 # Logs
@@ -142,6 +138,7 @@ notebooks/.ipynb_checkpoints/
 notebooks/
 data/*.xlsx
 data/*.bin
+data/
 
 # Large pipeline outputs (not source code)
 global_dashboard.json

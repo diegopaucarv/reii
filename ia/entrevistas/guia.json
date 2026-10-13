@@ -1,0 +1,172 @@
+{
+  "secciones": [
+    "I. Datos sociodemográficos y perfil profesional",
+    "II. Concepciones e información general sobre el cambio climático",
+    "III. Percepciones del entorno y efectos directos",
+    "IV. El rol de la educación universitaria",
+    "V. Acciones de mitigación y proyección docente",
+    "VI. Perspectiva futura y responsabilidad social"
+  ],
+  "preguntas": [
+    {
+      "numero": 1,
+      "seccion": "I. Datos sociodemográficos y perfil profesional",
+      "pregunta": "¿Cuál es tu sexo?."
+    },
+    {
+      "numero": 2,
+      "seccion": "I. Datos sociodemográficos y perfil profesional",
+      "pregunta": "¿Edad?."
+    },
+    {
+      "numero": 3,
+      "seccion": "I. Datos sociodemográficos y perfil profesional",
+      "pregunta": "¿Tienes dependientes económicos (personas que dependan de ti)?."
+    },
+    {
+      "numero": 4,
+      "seccion": "I. Datos sociodemográficos y perfil profesional",
+      "pregunta": "¿Cuál es tu ocupación? (si es que trabajas aparte de estudiar)."
+    },
+    {
+      "numero": 5,
+      "seccion": "I. Datos sociodemográficos y perfil profesional",
+      "pregunta": "¿De qué lugar procedes (lugar de nacimiento)?."
+    },
+    {
+      "numero": 6,
+      "seccion": "I. Datos sociodemográficos y perfil profesional",
+      "pregunta": "¿Cuál es tu distrito de residencia actual?."
+    },
+    {
+      "numero": 7,
+      "seccion": "I. Datos sociodemográficos y perfil profesional",
+      "pregunta": "¿Qué carrera y especialidad estudias?."
+    },
+    {
+      "numero": 8,
+      "seccion": "I. Datos sociodemográficos y perfil profesional",
+      "pregunta": "Además de esta formación, ¿cuentas con alguna otra formación adicional?."
+    },
+    {
+      "numero": 9,
+      "seccion": "I. Datos sociodemográficos y perfil profesional",
+      "pregunta": "¿Qué te llevó a decidir por esta profesión?."
+    },
+    {
+      "numero": 10,
+      "seccion": "I. Datos sociodemográficos y perfil profesional",
+      "pregunta": "¿Cómo te ves en los próximos cinco años en tu vida profesional?."
+    },
+    {
+      "numero": 11,
+      "seccion": "II. Concepciones e información general sobre el cambio climático",
+      "pregunta": "Cuando piensas en cambio climático, ¿qué es lo que se te viene a la mente?."
+    },
+    {
+      "numero": 12,
+      "seccion": "II. Concepciones e información general sobre el cambio climático",
+      "pregunta": "¿Puedes profundizar algo más sobre esto? / ¿Podrías dar un ejemplo? / ¿Cuáles serían las causas?."
+    },
+    {
+      "numero": 13,
+      "seccion": "II. Concepciones e información general sobre el cambio climático",
+      "pregunta": "¿A través de qué medios has recibido noticias sobre el cambio climático?."
+    },
+    {
+      "numero": 14,
+      "seccion": "II. Concepciones e información general sobre el cambio climático",
+      "pregunta": "¿Qué medios, para ti, serían los más importantes?."
+    },
+    {
+      "numero": 15,
+      "seccion": "II. Concepciones e información general sobre el cambio climático",
+      "pregunta": "¿Has tenido oportunidad de consultar materiales con respecto al cambio climático?."
+    },
+    {
+      "numero": 16,
+      "seccion": "III. Percepciones del entorno y efectos directos",
+      "pregunta": "¿Percibes diferencias entre cómo es hoy el clima de la región/ciudad y cómo solía ser antes?."
+    },
+    {
+      "numero": 17,
+      "seccion": "III. Percepciones del entorno y efectos directos",
+      "pregunta": "¿Hace cuánto tiempo estamos hablando de estos cambios?."
+    },
+    {
+      "numero": 18,
+      "seccion": "III. Percepciones del entorno y efectos directos",
+      "pregunta": "¿Qué significan para ti esos cambios? / ¿A qué crees que se deberían?."
+    },
+    {
+      "numero": 19,
+      "seccion": "III. Percepciones del entorno y efectos directos",
+      "pregunta": "Para ti, ¿cómo influye el cambio climático en la vida de las personas?."
+    },
+    {
+      "numero": 20,
+      "seccion": "III. Percepciones del entorno y efectos directos",
+      "pregunta": "¿Consideras que hay grupos vulnerables ante este problema?."
+    },
+    {
+      "numero": 21,
+      "seccion": "III. Percepciones del entorno y efectos directos",
+      "pregunta": "¿Cómo crees que el tema climático puede afectar la salud de las personas?."
+    },
+    {
+      "numero": 22,
+      "seccion": "III. Percepciones del entorno y efectos directos",
+      "pregunta": "En tu familia o personas cercanas, ¿de qué manera ha afectado el cambio climático? ¿Tienes alguna experiencia?."
+    },
+    {
+      "numero": 23,
+      "seccion": "IV. El rol de la educación universitaria",
+      "pregunta": "¿Consideras que en la educación universitaria te ofrecen conocimientos suficientes sobre el cambio climático? ¿Por qué?."
+    },
+    {
+      "numero": 24,
+      "seccion": "IV. El rol de la educación universitaria",
+      "pregunta": "En tu plan de estudios como estudiante de educación, ¿se han desarrollado estos temas en alguna asignatura?."
+    },
+    {
+      "numero": 25,
+      "seccion": "IV. El rol de la educación universitaria",
+      "pregunta": "¿Consideras importante abordar los temas del cambio climático en la educación? ¿Por qué?."
+    },
+    {
+      "numero": 26,
+      "seccion": "IV. El rol de la educación universitaria",
+      "pregunta": "Si tuvieses la oportunidad de cambiar o aportar a tu plan de estudios (o a una asignatura que se relacione con el tema), ¿qué cosas cambiarías/incrementarías?."
+    },
+    {
+      "numero": 27,
+      "seccion": "V. Acciones de mitigación y proyección docente",
+      "pregunta": "¿Tú o alguno de tus compañeros o profesores han asumido alguna acción o actividad en particular aportando a la mitigación del cambio climático?."
+    },
+    {
+      "numero": 28,
+      "seccion": "V. Acciones de mitigación y proyección docente",
+      "pregunta": "¿Qué podrías hacer como acción sostenible para el problema del cambio climático? / ¿En qué aportaría?."
+    },
+    {
+      "numero": 29,
+      "seccion": "V. Acciones de mitigación y proyección docente",
+      "pregunta": "Como futuro docente, ¿te interesaría enseñar sobre el tema? ¿A quiénes, qué cosas enseñarías y cómo lo harías?."
+    },
+    {
+      "numero": 30,
+      "seccion": "VI. Perspectiva futura y responsabilidad social",
+      "pregunta": "¿Crees que estos cambios climáticos con el tiempo se incrementarán, se mantendrán igual o van a mejorar? ¿Por qué?."
+    },
+    {
+      "numero": 31,
+      "seccion": "VI. Perspectiva futura y responsabilidad social",
+      "pregunta": "¿Crees que se está haciendo algo en el país o en la región por el cambio climático? ¿Será suficiente?."
+    },
+    {
+      "numero": 32,
+      "seccion": "VI. Perspectiva futura y responsabilidad social",
+      "pregunta": "¿Qué cosas crees que nosotros deberíamos hacer como sociedad para enfrentar el cambio climático?."
+    }
+  ]
+}

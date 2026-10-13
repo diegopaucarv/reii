@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from typing import Any, Dict, Optional
 
@@ -11,15 +10,14 @@ from reii.pipelines import discourse_db as ddb
 INPUT_NAME = "discourse_input.json"
 
 
-def prepare_discourse_input(source: str, workflow_db_path: str, adapter=None, data_dir: Optional[str] = None) -> str:
+def prepare_discourse_input(
+    source: str, workflow_db_path: str, adapter=None, data_dir: Optional[str] = None
+) -> str:
     """Devuelve la ruta del JSON de entrada del análisis.
 
-    source="db": genera ``discourse_input.json`` desde la BD (ids = uces.uce_id), así lo que se
-                 anota coincide con lo que muestra el dashboard.
-    source="json": usa ``workflow_data.json`` tal cual (comportamiento anterior).
+    Genera ``discourse_input.json`` desde la BD (ids = uces.uce_id), así lo que se
+    anota coincide con lo que muestra el dashboard.
     """
-    if source != "db":
-        return workflow_db_path
     if adapter is None:
         from reii.backend.dashboard_adapter import DashboardAdapter
 
@@ -28,20 +26,30 @@ def prepare_discourse_input(source: str, workflow_db_path: str, adapter=None, da
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, INPUT_NAME)
     rep = ddb.export_discourse_input(adapter, path)
-    print(f"📦 Entrada generada desde la BD: {rep['n_uces']} UCEs ({rep['n_uces_con_anotaciones']} con anotaciones previas)")
+    print(
+        f"📦 Entrada generada desde la BD: {rep['n_uces']} UCEs ({rep['n_uces_con_anotaciones']} con anotaciones previas)"
+    )
     return path
 
 
-def sync_after_run(state_path: str, dsn: Optional[str] = None, replace: str = "agents") -> Dict[str, Any]:
-    """Escribe las anotaciones del estado en la tabla ``annotations``."""
-    from reii.backend.sql.db import get_conn
+def sync_after_run(
+    state_path: str, dsn: Optional[str] = None, replace: str = "agents"
+) -> Dict[str, Any]:
+    """Escribe las anotaciones del estado en la tabla ``annotations``.
 
-    with open(state_path, "r", encoding="utf-8") as f:
-        state = json.load(f)
+    El estado se lee de PostgreSQL (``discourse_store``); ``state_path`` se
+    conserva por compatibilidad.
+    """
+    from reii.backend.sql.db import get_conn
+    from reii.pipelines import discourse_store
+
+    state = discourse_store.load_state()
     with get_conn(dsn) as conn:
         rep = ddb.sync_state_to_db(conn, state, replace=replace)
-    print(f"🔗 Anotaciones sincronizadas con la BD: {rep['n_written']}/{rep['n_annotations']} "
-          f"(sin resolver: {rep['n_unmatched']})")
+    print(
+        f"🔗 Anotaciones sincronizadas con la BD: {rep['n_written']}/{rep['n_annotations']} "
+        f"(sin resolver: {rep['n_unmatched']})"
+    )
     return rep
 
 
@@ -53,7 +61,9 @@ def main(argv=None) -> int:
 
     ap = argparse.ArgumentParser(prog="reii.pipelines.runtime")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("sync", help="sincroniza discourse_state.json con la tabla annotations")
+    s = sub.add_parser(
+        "sync", help="sincroniza discourse_state.json con la tabla annotations"
+    )
     s.add_argument("--state", default=DISCOURSE_STATE_PATH)
     s.add_argument("--dsn", default=None)
     s.add_argument("--replace", choices=["agents", "all"], default="agents")

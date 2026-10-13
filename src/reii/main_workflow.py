@@ -497,7 +497,7 @@ class Config:
     # DSN de la base de datos (PostgreSQL). Si None, se deriva de db_local_path.
     db_dsn: Optional[str] = DATABASE_URL
     # Escribir también el JSON de compatibilidad durante la transición.
-    dual_write_json: bool = True
+    dual_write_json: bool = False
 
     # ── Gramática personalizable (capa de personalización léxica) ──────────
     # content_pos: POS que se consideran "activas" (entran al vocabulario).
@@ -1189,6 +1189,21 @@ class UCBuilder:
         return ucs, uce_to_uc
 
 
+def _as_int(v: Any) -> Any:
+    """Convierte a int si es posible; si no, devuelve el valor original.
+
+    En PostgreSQL doc_id se guarda como TEXT, pero en el JSON histórico era
+    numérico. Al reconstruir desde la BD intentamos recuperar el int para
+    mantener la misma estructura que el JSON.
+    """
+    if v is None or v == "":
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return v
+
+
 class Database:
     """
     Persistencia híbrida: SQLite (primaria) + JSON (export opcional).
@@ -1209,14 +1224,15 @@ class Database:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
 
         # Buffer en memoria: replicamos la interfaz dict anterior
-        self.data = self._load_json_dict()
+        if os.path.exists(self.path):
+            self.data = self._load_json_dict()
+        else:
+            self.data = self._load_from_db()
         self.doc_metadata = self.data.get("doc_metadata", {})
 
     # ── Carga inicial ─────────────────────────────────────────────────────
-    def _load_json_dict(self) -> Dict[str, Any]:
-        if os.path.exists(self.path):
-            with open(self.path, "r", encoding="utf-8") as f:
-                return json.load(f)
+    def _empty_defaults(self) -> Dict[str, Any]:
+        """Dict de defaults vacíos (misma forma que el JSON sin datos)."""
         return {
             "uces": [],
             "ucs": [],
@@ -1233,6 +1249,196 @@ class Database:
             "cdh_tree_umbral2": {},
             "shap_analysis": {},
         }
+
+    def _load_json_dict(self) -> Dict[str, Any]:
+        if os.path.exists(self.path):
+            with open(self.path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return self._empty_defaults()
+
+    def _load_from_db(self) -> Dict[str, Any]:
+        """Reconstruye self.data desde PostgreSQL cuando no existe el JSON.
+
+        Devuelve el mismo dict de defaults vacíos que _load_json_dict si la
+        BD no está accesible (para no romper el arranque sin conexión).
+        """
+        defaults = self._empty_defaults()
+        try:
+            from reii.backend.sql.db import connect
+
+            conn = connect(self.dsn)
+            try:
+                data: Dict[str, Any] = {}
+
+                # ── documents → doc_metadata + doc_info ────────────────
+                doc_rows = conn.execute(
+                    "SELECT doc_id, doc_idx, orden, origen, metadata_json "
+                    "FROM documents"
+                ).fetchall()
+                doc_meta: Dict[str, Dict] = {}
+                doc_info: Dict[str, Dict] = {}
+                for r in doc_rows:
+                    did = str(r["doc_id"])
+                    try:
+                        meta = (
+                            json.loads(r["metadata_json"]) if r["metadata_json"] else {}
+                        )
+                    except (TypeError, ValueError):
+                        meta = {}
+                    if not isinstance(meta, dict):
+                        meta = {}
+                    doc_meta[did] = meta
+                    doc_info[did] = {
+                        "doc_idx": r["doc_idx"],
+                        "orden": r["orden"],
+                        "origen": r["origen"],
+                    }
+
+                # ── uces ───────────────────────────────────────────────
+                uce_rows = conn.execute("SELECT * FROM uces").fetchall()
+                uces: List[Dict] = []
+                for r in uce_rows:
+                    did = str(r["doc_id"])
+                    dinfo = doc_info.get(did, {})
+                    uce: Dict[str, Any] = {
+                        "id": r["uce_id"],
+                        "doc_id": _as_int(r["doc_id"]),
+                        "local_idx": r["local_idx"],
+                        "section_id": r["section_id"],
+                        "seccion": r["seccion"],
+                        "texto": r["texto"],
+                        "n_tokens": r["n_tokens"],
+                        "cluster_id": r["cluster_id"],
+                        "is_stable": bool(r["is_stable"]),
+                        "stability_method": r["stability_method"],
+                        "is_terminal_consolidated": bool(r["is_terminal_consolidated"]),
+                        "projected_cluster_id": r["projected_cluster_id"],
+                        "projection_distance": r["projection_distance"],
+                        "projection_margin": r["projection_margin"],
+                        "projection_ratio": r["projection_ratio"],
+                        "phi_score": r["phi_score"],
+                    }
+                    # Campos lingüísticos (linguistic_json)
+                    try:
+                        ling = (
+                            json.loads(r["linguistic_json"])
+                            if r["linguistic_json"]
+                            else {}
+                        )
+                    except (TypeError, ValueError):
+                        ling = {}
+                    if isinstance(ling, dict):
+                        uce.update(ling)
+                    # Métricas (metrics_json)
+                    try:
+                        metrics = (
+                            json.loads(r["metrics_json"]) if r["metrics_json"] else {}
+                        )
+                    except (TypeError, ValueError):
+                        metrics = {}
+                    if isinstance(metrics, dict):
+                        uce.update(metrics)
+                    # metadata reconstruida desde documents + la propia UCE
+                    uce["metadata"] = {
+                        "section_id": r["section_id"],
+                        "seccion": r["seccion"],
+                        "origen": dinfo.get("origen"),
+                        "doc_idx": dinfo.get("doc_idx"),
+                        "indice_orden": dinfo.get("orden"),
+                    }
+                    uces.append(uce)
+                data["uces"] = uces
+
+                # ── ucs ───────────────────────────────────────────────
+                uc_rows = conn.execute("SELECT * FROM ucs").fetchall()
+                ucs: List[Dict] = []
+                for r in uc_rows:
+                    try:
+                        uce_ids = (
+                            json.loads(r["uce_ids_json"]) if r["uce_ids_json"] else []
+                        )
+                    except (TypeError, ValueError):
+                        uce_ids = []
+                    try:
+                        lemmas = (
+                            json.loads(r["lemmas_json"]) if r["lemmas_json"] else []
+                        )
+                    except (TypeError, ValueError):
+                        lemmas = []
+                    ucs.append(
+                        {
+                            "id": r["uc_id"],
+                            "doc_id": _as_int(r["doc_id"]),
+                            "texto": r["texto"],
+                            "cluster_id": r["cluster_id"],
+                            "uce_ids": uce_ids,
+                            "lemmas": lemmas,
+                        }
+                    )
+                data["ucs"] = ucs
+
+                # ── doc_metadata ───────────────────────────────────────
+                data["doc_metadata"] = doc_meta
+
+                # ── terminos ───────────────────────────────────────────
+                term_rows = conn.execute("SELECT * FROM terms").fetchall()
+                terminos: List[Dict] = []
+                for r in term_rows:
+                    terminos.append(
+                        {
+                            "termino": r["term"],
+                            "cluster": r["cluster_id"],
+                            "frecuencia_global": r["frecuencia_global"],
+                            "frecuencia_cluster": r["frecuencia_cluster"],
+                            "chi2_yates": r["chi2_yates"],
+                            "p_valor": r["p_valor"],
+                            "p_adj": r["p_adj"],
+                            "phi": r["phi"],
+                            "cramer_v": r["cramer_v"],
+                            "C": r["c_value"],
+                            "significativo": bool(r["significativo"]),
+                            "asignado_estricto": bool(r["asignado_estricto"]),
+                        }
+                    )
+                data["terminos"] = terminos
+
+                # ── network ───────────────────────────────────────────
+                edge_rows = conn.execute(
+                    "SELECT src, dst, weight FROM network_edges"
+                ).fetchall()
+                nodes: List[str] = []
+                seen: Set[str] = set()
+                edges: List[list] = []
+                for r in edge_rows:
+                    src, dst = r["src"], r["dst"]
+                    if src not in seen:
+                        seen.add(src)
+                        nodes.append(src)
+                    if dst not in seen:
+                        seen.add(dst)
+                        nodes.append(dst)
+                    edges.append([src, dst, {"weight": r["weight"]}])
+                data["network"] = {"nodes": nodes, "edges": edges, "partition": []}
+
+                # ── kv_store (config y resto de claves) ────────────────
+                kv_rows = conn.execute(
+                    "SELECT key, value_json FROM kv_store"
+                ).fetchall()
+                for r in kv_rows:
+                    try:
+                        data[r["key"]] = json.loads(r["value_json"])
+                    except (TypeError, ValueError):
+                        data[r["key"]] = r["value_json"]
+
+                # Claves de defaults ausentes en la BD
+                for k, v in defaults.items():
+                    data.setdefault(k, v)
+                return data
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning("No se pudo cargar desde PostgreSQL: %s", e)
+            return defaults
 
     # ── Guarda anti-borrado accidental ───────────────────────────────────
     def _guard_against_ucs_network_wipe(self) -> None:

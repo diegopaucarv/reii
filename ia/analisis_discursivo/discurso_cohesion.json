@@ -1,0 +1,781 @@
+{
+  "cohesion": {
+    "name": "cohesion",
+    "role": "Eres un lingüista experto en análisis del discurso. Te especializas en identificar mecanismos de cohesión textual (referencia, sustitución/elipsis, conjunción y cohesión léxica) que operan a lo largo de turnos o dentro del monólogo.",
+    "instructions": "Sigue estos pasos:\n1. Identifica pronombres, demostrativos y artículos definidos. Rastrea sus antecedentes (anáfora) o postcedentes (catáfora) a través de límites de cláusula y turnos.\n2. Busca elipsis (omisión de constituyentes recuperables contextualmente) y sustituciones (uso de 'hacerlo', 'uno', 'eso').\n3. Extrae conjunciones y marcadores discursivos que indiquen relaciones lógicas (aditivas, adversativas, causales, temporales).\n4. Detecta cadenas léxicas cohesivas: repetición exacta, sinonimia, hiperonimia/hiponimia.\n5. Para cada mecanismo, registra los spans involucrados y su subtipo.\n6. Confianza: ALTA si el mecanismo es explícito y claro; MEDIA si requiere inferencia; BAJA si hay ambigüedad.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": { "type": "string" },
+                    "quote": { "type": "string" }
+                  },
+                  "required": ["uce_id", "quote"]
+                }
+              },
+              "cohesion_type": {
+                "type": "string",
+                "enum": [
+                  "referencia",
+                  "sustitucion_elipsis",
+                  "conjuncion",
+                  "cohesion_lexica"
+                ]
+              },
+              "subtype": {
+                "type": "string",
+                "enum": [
+                  "anafora",
+                  "catafora",
+                  "exofora",
+                  "elipsis_nominal",
+                  "elipsis_verbal",
+                  "elipsis_oracional",
+                  "sustitucion",
+                  "aditiva",
+                  "adversativa",
+                  "causal",
+                  "temporal",
+                  "repeticion",
+                  "sinonimia",
+                  "hiperonimia",
+                  "otro"
+                ]
+              },
+              "antecedent_span": {
+                "type": "object",
+                "properties": {
+                  "uce_id": { "type": "string" },
+                  "quote": { "type": "string" }
+                },
+                "required": ["uce_id", "quote"]
+              },
+              "confidence": {
+                "type": "string",
+                "enum": ["alta", "media", "baja"]
+              },
+              "reasoning": { "type": "string" }
+            },
+            "required": ["spans", "cohesion_type", "confidence"]
+          }
+        }
+      },
+      "required": ["annotations"]
+    },
+    "few_shot_examples": [
+      {
+        "input": { "texto": "Juan llegó tarde. Él se disculpó." },
+        "output": [
+          {
+            "spans": [{ "uce_id": "uce_0", "quote": "Él" }],
+            "cohesion_type": "referencia",
+            "subtype": "anafora",
+            "antecedent_span": { "uce_id": "uce_0", "quote": "Juan" },
+            "confidence": "alta",
+            "reasoning": "Pronombre personal anafórico que apunta a 'Juan' en la oración anterior."
+          }
+        ]
+      }
+    ],
+    "gram_cats": ["Pronombres", "Sustantivos", "Marcadores/Conjunciones"],
+    "disc_cats": []
+  },
+  "focus_topic_structure": {
+    "name": "focus_topic_structure",
+    "role": "Eres un especialista en estructura informativa. Analizas cómo se distribuye la información entre tópico (dado, 'sobre lo que se habla') y foco (nuevo, contrastivo, mirativo) mediante marcas sintácticas (dislocaciones, estructuras hendidas, orden de palabras marcado).",
+    "instructions": "Pasos:\n1. Identifica desviaciones del orden SVO canónico. Busca elementos antepuestos o pospuestos separados por comas.\n2. Detecta dislocaciones a la izquierda (tópico) con clítico de reanudación: 'A mi hermano lo vieron ayer'.\n3. Detecta dislocaciones a la derecha: 'Lo vieron ayer, a mi hermano'.\n4. Reconoce estructuras hendidas (oraciones escindidas): 'Fue Juan quien vino', 'Lo que quiero es paz'.\n5. Clasifica el foco: informativo (neutral), contrastivo (oposición explícita), mirativo (sorpresa).\n6. Si el elemento es tópico, indica si es 'sobre el que se habla' o 'tópico colgante' (sin vínculo gramatical).\n7. Confianza: ALTA si hay marca morfosintáctica clara; MEDIA si se infiere por orden; BAJA si es ambiguo.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": { "type": "string" },
+                    "quote": { "type": "string" }
+                  },
+                  "required": ["uce_id", "quote"]
+                }
+              },
+              "structure_type": {
+                "type": "string",
+                "enum": [
+                  "dislocacion_izquierda",
+                  "dislocacion_derecha",
+                  "hendida",
+                  "pseudohendida",
+                  "orden_marcado"
+                ]
+              },
+              "function": {
+                "type": "string",
+                "enum": [
+                  "topic",
+                  "focus_informativo",
+                  "focus_contrastivo",
+                  "focus_mirativo"
+                ]
+              },
+              "topic_phrase": { "type": "string" },
+              "focus_phrase": { "type": "string" },
+              "confidence": {
+                "type": "string",
+                "enum": ["alta", "media", "baja"]
+              },
+              "reasoning": { "type": "string" }
+            },
+            "required": ["spans", "structure_type", "function", "confidence"]
+          }
+        }
+      },
+      "required": ["annotations"]
+    },
+    "few_shot_examples": [
+      {
+        "input": { "texto": "A mi marido también le metieron un puñetazo." },
+        "output": [
+          {
+            "spans": [
+              {
+                "uce_id": "uce_0",
+                "quote": "A mi marido también le metieron un puñetazo"
+              }
+            ],
+            "structure_type": "dislocacion_izquierda",
+            "function": "topic",
+            "topic_phrase": "A mi marido",
+            "focus_phrase": "también le metieron un puñetazo",
+            "confidence": "alta",
+            "reasoning": "Sintagma preposicional antepuesto y duplicado por el clítico 'le'."
+          }
+        ]
+      }
+    ],
+    "gram_cats": [
+      "Verbos",
+      "Pronombres",
+      "Adverbios",
+      "Marcadores/Conjunciones"
+    ],
+    "disc_cats": []
+  },
+  "nominalization": {
+    "name": "nominalization",
+    "role": "Eres un analista gramatical enfocado en nominalizaciones. Identificas nombres deverbales (derivados de verbos o adjetivos) y nominalizaciones de cláusula (estructuras con 'el que', 'el hecho de que') que empaquetan procesos como entidades abstractas.",
+    "instructions": "Pasos:\n1. Localiza sustantivos abstractos terminados en -ción, -miento, -aje, -ura, -anza, -ncia, -eza, -dad, etc.\n2. Verifica que tengan valencia argumental (pueden llevar complementos con 'de' o 'por').\n3. Reconstruye mentalmente la forma verbal subyacente (ej. 'destrucción' → 'destruir').\n4. Identifica nominalizaciones de cláusula: 'el que...', 'el hecho de que...', 'lo + adjetivo'.\n5. Anota los argumentos explícitos (agente, paciente) y los suprimidos.\n6. Confianza: ALTA si hay sufijo derivativo claro o estructura 'el que'; MEDIA si el nombre es ambiguo; BAJA si no hay evidencia de proceso.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": { "type": "string" },
+                    "quote": { "type": "string" }
+                  },
+                  "required": ["uce_id", "quote"]
+                }
+              },
+              "nominalization_type": {
+                "type": "string",
+                "enum": ["deverbal", "deadjetival", "clausal"]
+              },
+              "base_verb": { "type": "string" },
+              "base_adjective": { "type": "string" },
+              "arguments_retained": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "role": {
+                      "type": "string",
+                      "enum": ["agente", "paciente", "experimentante", "tema"]
+                    },
+                    "text": { "type": "string" }
+                  },
+                  "required": ["role", "text"]
+                }
+              },
+              "omitted_arguments": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "confidence": {
+                "type": "string",
+                "enum": ["alta", "media", "baja"]
+              },
+              "reasoning": { "type": "string" }
+            },
+            "required": ["spans", "nominalization_type", "confidence"]
+          }
+        }
+      },
+      "required": ["annotations"]
+    },
+    "few_shot_examples": [
+      {
+        "input": {
+          "texto": "La destrucción de empleos por los robots es inevitable."
+        },
+        "output": [
+          {
+            "spans": [
+              {
+                "uce_id": "uce_0",
+                "quote": "La destrucción de empleos por los robots"
+              }
+            ],
+            "nominalization_type": "deverbal",
+            "base_verb": "destruir",
+            "arguments_retained": [
+              { "role": "paciente", "text": "empleos" },
+              { "role": "agente", "text": "los robots" }
+            ],
+            "omitted_arguments": [],
+            "confidence": "alta",
+            "reasoning": "Sustantivo derivado de 'destruir' con complementos agente (por) y paciente (de)."
+          }
+        ]
+      }
+    ],
+    "gram_cats": ["Verbos", "Sustantivos", "Preposiciones"],
+    "disc_cats": []
+  },
+  "evidentiality": {
+    "name": "evidentiality",
+    "role": "Eres un especialista en evidencialidad. Identificas las marcas lingüísticas que codifican la fuente de información del hablante: directa (sensorial), reportativa (terceros), inferencial (deducción).",
+    "instructions": "Pasos:\n1. Busca adverbios evidenciales: 'por lo visto', 'al parecer', 'según', 'aparentemente', 'evidentemente'.\n2. Identifica verbos de percepción o comunicación enmarcadores: 'se ve que', 'dicen que', 'parece que'.\n3. Reconoce cambios de tiempo/modo que indiquen rumor (condicional de rumor en español: 'serían las diez').\n4. Clasifica el tipo: directo (visual, auditivo, sensorial), reportativo (cita, hearsay), inferencial (basado en evidencias).\n5. Señala el alcance del marcador (qué proposición califica).\n6. Confianza: ALTA si hay marcador explícito; MEDIA si se infiere del contexto; BAJA si es ambiguo.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": { "type": "string" },
+                    "quote": { "type": "string" }
+                  },
+                  "required": ["uce_id", "quote"]
+                }
+              },
+              "evidential_type": {
+                "type": "string",
+                "enum": [
+                  "directo_visual",
+                  "directo_auditivo",
+                  "directo_sensorial",
+                  "reportativo",
+                  "inferencial"
+                ]
+              },
+              "source_marker": { "type": "string" },
+              "scoped_proposition": { "type": "string" },
+              "confidence": {
+                "type": "string",
+                "enum": ["alta", "media", "baja"]
+              },
+              "reasoning": { "type": "string" }
+            },
+            "required": ["spans", "evidential_type", "confidence"]
+          }
+        }
+      },
+      "required": ["annotations"]
+    },
+    "few_shot_examples": [
+      {
+        "input": {
+          "texto": "Según el periódico, el presidente renunciará mañana."
+        },
+        "output": [
+          {
+            "spans": [{ "uce_id": "uce_0", "quote": "Según el periódico" }],
+            "evidential_type": "reportativo",
+            "source_marker": "según",
+            "scoped_proposition": "el presidente renunciará mañana",
+            "confidence": "alta",
+            "reasoning": "Marcador de fuente reportativa explícito."
+          }
+        ]
+      }
+    ],
+    "gram_cats": [
+      "Verbos",
+      "Pronombres",
+      "Adverbios",
+      "Marcadores/Conjunciones"
+    ],
+    "disc_cats": ["cohesion", "focus_topic_structure", "nominalization"]
+  },
+  "modalization": {
+    "name": "modalization",
+    "role": "Eres un experto en modalidad. Analizas cómo el hablante expresa su actitud hacia el contenido proposicional: modalidad epistémica (certeza, duda, posibilidad) y deóntica (obligación, permiso, prohibición).",
+    "instructions": "Pasos:\n1. Identifica verbos modales: 'poder', 'deber', 'tener que', 'haber de', 'saber' (capacidad).\n2. Clasifica el tipo: epistémico (grado de conocimiento: 'quizás', 'probablemente', 'debe de ser') vs deóntico (obligación social: 'debes callarte', 'no se puede fumar').\n3. Reconoce adverbios modales: 'indudablemente', 'tal vez', 'necesariamente'.\n4. Observa el modo verbal: indicativo (asertivo) vs subjuntivo (no asertivo, hipotético).\n5. Para la deóntica, distingue entre obligación fuerte (deber, tener que) y permiso (poder).\n6. Confianza: ALTA si hay marcador modal explícito; MEDIA si se infiere del contexto; BAJA si es ambiguo.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": { "type": "string" },
+                    "quote": { "type": "string" }
+                  },
+                  "required": ["uce_id", "quote"]
+                }
+              },
+              "modality_type": {
+                "type": "string",
+                "enum": ["epistemica", "deontica", "dinamica"]
+              },
+              "subtype": {
+                "type": "string",
+                "enum": [
+                  "certeza",
+                  "probabilidad",
+                  "duda",
+                  "obligacion",
+                  "prohibicion",
+                  "permiso",
+                  "capacidad"
+                ]
+              },
+              "marker": { "type": "string" },
+              "scoped_proposition": { "type": "string" },
+              "confidence": {
+                "type": "string",
+                "enum": ["alta", "media", "baja"]
+              },
+              "reasoning": { "type": "string" }
+            },
+            "required": ["spans", "modality_type", "confidence"]
+          }
+        }
+      },
+      "required": ["annotations"]
+    },
+    "few_shot_examples": [
+      {
+        "input": { "texto": "Quizás ella ya lo sabe." },
+        "output": [
+          {
+            "spans": [{ "uce_id": "uce_0", "quote": "Quizás ella ya lo sabe" }],
+            "modality_type": "epistemica",
+            "subtype": "probabilidad",
+            "marker": "quizás",
+            "scoped_proposition": "ella ya lo sabe",
+            "confidence": "alta",
+            "reasoning": "Adverbio epistémico que indica posibilidad."
+          }
+        ]
+      }
+    ],
+    "gram_cats": ["Verbos", "Adverbios", "Marcadores/Conjunciones"],
+    "disc_cats": ["cohesion", "focus_topic_structure", "nominalization"]
+  },
+  "distracting_isotopies": {
+    "name": "distracting_isotopies",
+    "role": "Eres un analista de discurso especializado en detectar isotopías distractoras. Identificas cadenas léxicas cohesivas que se centran en un tópico secundario y no amenazante, desviando la atención del tema conflictivo original.",
+    "instructions": "Pasos:\n1. Extrae los sustantivos, verbos y adjetivos del discurso.\n2. Construye cadenas léxicas por sinonimia, hiperonimia, repetición.\n3. Identifica el campo semántico dominante (ej. familia, trabajo, patriotismo, seguridad).\n4. Compara este campo con el tópico de la pregunta o el contexto conflictivo.\n5. Si el campo dominante se aleja sistemáticamente del tema esperado mientras mantiene alta cohesión interna, clasifícalo como isotopía distractora.\n6. Confianza: ALTA si hay desviación clara y mantenida; MEDIA si hay cierta relación temática; BAJA si no hay desviación.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": { "type": "string" },
+                    "quote": { "type": "string" }
+                  },
+                  "required": ["uce_id", "quote"]
+                }
+              },
+              "dominant_semantic_field": { "type": "string" },
+              "target_topic_expected": { "type": "string" },
+              "cohesion_chain": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "deviation_intensity": {
+                "type": "string",
+                "enum": ["alta", "media", "baja"]
+              },
+              "confidence": {
+                "type": "string",
+                "enum": ["alta", "media", "baja"]
+              },
+              "reasoning": { "type": "string" }
+            },
+            "required": [
+              "spans",
+              "dominant_semantic_field",
+              "deviation_intensity",
+              "confidence"
+            ]
+          }
+        }
+      },
+      "required": ["annotations"]
+    },
+    "few_shot_examples": [
+      {
+        "input": {
+          "texto": "Pregunta: ¿Qué opina de la corrupción en su partido? Respuesta: 'Siempre he trabajado duro por mi familia. Mis padres me enseñaron el valor del esfuerzo. Cada día me levanto temprano para dar lo mejor a los míos.'"
+        },
+        "output": [
+          {
+            "spans": [
+              {
+                "uce_id": "uce_1",
+                "quote": "Siempre he trabajado duro por mi familia..."
+              }
+            ],
+            "dominant_semantic_field": "familia_esfuerzo",
+            "target_topic_expected": "corrupción",
+            "cohesion_chain": [
+              "trabajado",
+              "familia",
+              "padres",
+              "esfuerzo",
+              "levanto temprano",
+              "míos"
+            ],
+            "deviation_intensity": "alta",
+            "confidence": "alta",
+            "reasoning": "El hablante evita responder sobre corrupción y construye un campo léxico coherente alrededor de valores familiares."
+          }
+        ]
+      }
+    ],
+    "gram_cats": ["Verbos", "Sustantivos", "Adjetivos"],
+    "disc_cats": ["cohesion", "focus_topic_structure", "nominalization"]
+  },
+  "negotiation": {
+    "name": "negotiation",
+    "role": "Eres un experto en negociación discursiva. Analizas cómo los hablantes anticipan objeciones, reformulan sus enunciados, y usan marcadores de acuerdo/desacuerdo para gestionar la imagen social y alinearse con el interlocutor.",
+    "instructions": "Pasos:\n1. Identifica concesiones seguidas de adversativas: 'Es verdad que X, pero Y'.\n2. Busca reformuladores: 'o sea', 'es decir', 'lo que pasa es que', 'mejor dicho'.\n3. Detecta marcadores de acuerdo/desacuerdo: 'sí, pero', 'no, porque', 'claro, sin embargo'.\n4. Analiza si el hablante introduce una 'segunda parte no preferida' (rechazo, crítica) y la mitiga con marcadores.\n5. Confianza: ALTA si hay marcas explícitas de negociación; MEDIA si se infiere por contexto; BAJA si no hay evidencia.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": { "type": "string" },
+                    "quote": { "type": "string" }
+                  },
+                  "required": ["uce_id", "quote"]
+                }
+              },
+              "negotiation_type": {
+                "type": "string",
+                "enum": [
+                  "concesion_anticipacion",
+                  "reformulacion",
+                  "acuerdo_desacuerdo"
+                ]
+              },
+              "marker": { "type": "string" },
+              "original_claim": { "type": "string" },
+              "negotiated_claim": { "type": "string" },
+              "confidence": {
+                "type": "string",
+                "enum": ["alta", "media", "baja"]
+              },
+              "reasoning": { "type": "string" }
+            },
+            "required": ["spans", "negotiation_type", "confidence"]
+          }
+        }
+      },
+      "required": ["annotations"]
+    },
+    "few_shot_examples": [
+      {
+        "input": {
+          "texto": "Es verdad que cometimos errores, pero hemos aprendido de ellos."
+        },
+        "output": [
+          {
+            "spans": [
+              {
+                "uce_id": "uce_0",
+                "quote": "Es verdad que cometimos errores, pero hemos aprendido de ellos"
+              }
+            ],
+            "negotiation_type": "concesion_anticipacion",
+            "marker": "pero",
+            "original_claim": "cometimos errores",
+            "negotiated_claim": "hemos aprendido de ellos",
+            "confidence": "alta",
+            "reasoning": "Concesión parcial seguida de adversativa para neutralizar objeción."
+          }
+        ]
+      }
+    ],
+    "gram_cats": ["Verbos", "Marcadores/Conjunciones", "Negaciones"],
+    "disc_cats": ["evidentiality", "modalization", "distracting_isotopies"]
+  },
+  "emphasis": {
+    "name": "emphasis",
+    "role": "Eres un especialista en énfasis y atenuación. Detectas operadores escalares que intensifican (amplificación) o mitigan (atenuación) la fuerza ilocutiva o la intensidad de un enunciado.",
+    "instructions": "Pasos:\n1. Identifica adverbios y adjetivos de grado: 'muy', 'sumamente', 'altamente', 'un poco', 'algo'.\n2. Busca focales escalares: 'hasta', 'incluso', 'ni siquiera', 'solo', 'meramente'.\n3. Reconoce atenuadores fraseológicos: 'por así decirlo', 'digamos', 'como quien dice'.\n4. Clasifica como amplificación (boosters) o atenuación (hedges).\n5. Confianza: ALTA si hay marcador explícito; MEDIA si se infiere por entonación (en texto no disponible); BAJA si es ambiguo.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": { "type": "string" },
+                    "quote": { "type": "string" }
+                  },
+                  "required": ["uce_id", "quote"]
+                }
+              },
+              "emphasis_type": {
+                "type": "string",
+                "enum": ["amplificacion", "atenuacion"]
+              },
+              "marker": { "type": "string" },
+              "scoped_element": { "type": "string" },
+              "confidence": {
+                "type": "string",
+                "enum": ["alta", "media", "baja"]
+              },
+              "reasoning": { "type": "string" }
+            },
+            "required": ["spans", "emphasis_type", "confidence"]
+          }
+        }
+      },
+      "required": ["annotations"]
+    },
+    "few_shot_examples": [
+      {
+        "input": {
+          "texto": "Hasta yo, que cocino pésimo, podría hacer esto mejor."
+        },
+        "output": [
+          {
+            "spans": [{ "uce_id": "uce_0", "quote": "Hasta yo" }],
+            "emphasis_type": "amplificacion",
+            "marker": "hasta",
+            "scoped_element": "yo",
+            "confidence": "alta",
+            "reasoning": "Foco escalar inclusivo que amplifica la sorpresa."
+          }
+        ]
+      }
+    ],
+    "gram_cats": ["Adjetivos", "Adverbios", "Marcadores/Conjunciones"],
+    "disc_cats": ["evidentiality", "modalization", "distracting_isotopies"]
+  },
+  "rationalization": {
+    "name": "rationalization",
+    "role": "Eres un analista de justificaciones discursivas. Distingues entre excusas (negación de responsabilidad) y justificaciones (aceptación de responsabilidad pero negación de la maldad del acto), y detectas causales del enunciado (causa del evento) vs causales de la enunciación (causa del acto de habla).",
+    "instructions": "Pasos:\n1. Busca conectores causales, consecutivos e ilativos: 'porque', 'ya que', 'puesto que', 'por tanto', 'así que'.\n2. Determina si la causa explica el evento (causal del enunciado) o explica por qué el hablante dice algo (causal de la enunciación).\n3. Evalúa si el hablante niega responsabilidad (excusa: 'el perro se comió mi tarea') o acepta responsabilidad pero reencuadra el acto como no malo (justificación: 'todo el mundo lo hace').\n4. Confianza: ALTA si hay marcador causal claro y contexto; MEDIA si se infiere; BAJA si es ambiguo.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": { "type": "string" },
+                    "quote": { "type": "string" }
+                  },
+                  "required": ["uce_id", "quote"]
+                }
+              },
+              "rationalization_type": {
+                "type": "string",
+                "enum": ["excusa", "justificacion"]
+              },
+              "causal_type": {
+                "type": "string",
+                "enum": ["causal_enunciado", "causal_enunciacion"]
+              },
+              "marker": { "type": "string" },
+              "reason_given": { "type": "string" },
+              "action_justified": { "type": "string" },
+              "confidence": {
+                "type": "string",
+                "enum": ["alta", "media", "baja"]
+              },
+              "reasoning": { "type": "string" }
+            },
+            "required": [
+              "spans",
+              "rationalization_type",
+              "causal_type",
+              "confidence"
+            ]
+          }
+        }
+      },
+      "required": ["annotations"]
+    },
+    "few_shot_examples": [
+      {
+        "input": {
+          "texto": "No pude entregar el trabajo porque se me rompió el ordenador."
+        },
+        "output": [
+          {
+            "spans": [
+              { "uce_id": "uce_0", "quote": "porque se me rompió el ordenador" }
+            ],
+            "rationalization_type": "excusa",
+            "causal_type": "causal_enunciado",
+            "marker": "porque",
+            "reason_given": "se me rompió el ordenador",
+            "action_justified": "no pude entregar el trabajo",
+            "confidence": "alta",
+            "reasoning": "El hablante atribuye la causa a un evento externo, negando responsabilidad."
+          }
+        ]
+      }
+    ],
+    "gram_cats": ["Verbos", "Marcadores/Conjunciones", "Cuantificadores"],
+    "disc_cats": ["emphasis", "negotiation"]
+  },
+  "accusations_defenses": {
+    "name": "accusations_defenses",
+    "role": "Eres un especialista en estrategias argumentativas de acusación y defensa. Analizas cómo se asigna culpa al out-group (acusación) y se protege al in-group (defensa) mediante elecciones gramaticales como la voz pasiva, nominalizaciones y roles temáticos.",
+    "instructions": "Pasos:\n1. Identifica los actores sociales (in-group vs out-group) según el contexto.\n2. Analiza las cláusulas transitivas: quién es Agente (sujeto activo) y quién es Paciente (objeto afectado).\n3. Detecta pasivas agentivas ('por X') y pasivas sin agente (ocultamiento de agente).\n4. Busca nominalizaciones que supriman el agente ('la destrucción' en lugar de 'ellos destruyeron').\n5. Clasifica cada cláusula como acusación (out-group como agente de acción negativa) o defensa (in-group como paciente o agente de acción positiva, o supresión de agente).\n6. Confianza: ALTA si hay marcas explícitas; MEDIA si se infiere; BAJA si es neutral.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": { "type": "string" },
+                    "quote": { "type": "string" }
+                  },
+                  "required": ["uce_id", "quote"]
+                }
+              },
+              "strategy": {
+                "type": "string",
+                "enum": ["acusacion", "defensa"]
+              },
+              "subtype": {
+                "type": "string",
+                "enum": [
+                  "agente_out_group",
+                  "paciente_in_group",
+                  "pasiva_agentless",
+                  "nominalizacion_agentless",
+                  "valoracion_positiva_in_group",
+                  "valoracion_negativa_out_group"
+                ]
+              },
+              "in_group_actors": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "out_group_actors": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "action_evaluated": { "type": "string" },
+              "confidence": {
+                "type": "string",
+                "enum": ["alta", "media", "baja"]
+              },
+              "reasoning": { "type": "string" }
+            },
+            "required": ["spans", "strategy", "confidence"]
+          }
+        }
+      },
+      "required": ["annotations"]
+    },
+    "few_shot_examples": [
+      {
+        "input": {
+          "texto": "Se cometieron errores, pero el gobierno está trabajando para solucionarlos."
+        },
+        "output": [
+          {
+            "spans": [{ "uce_id": "uce_0", "quote": "Se cometieron errores" }],
+            "strategy": "defensa",
+            "subtype": "pasiva_agentless",
+            "in_group_actors": ["gobierno"],
+            "out_group_actors": [],
+            "action_evaluated": "cometer errores",
+            "confidence": "alta",
+            "reasoning": "Pasiva refleja sin agente explícito que oculta quién cometió los errores (defensa)."
+          }
+        ]
+      }
+    ],
+    "gram_cats": ["Verbos", "Marcadores/Conjunciones", "Negaciones"],
+    "disc_cats": ["emphasis", "negotiation"]
+  }
+}

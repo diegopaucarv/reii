@@ -60,16 +60,6 @@ def _hub_app():
         save_config=lambda u: calls.append(("save", dict(u))) or {"pushed": list(u)},
         reset_config=lambda: calls.append(("reset",)),
         start_workflow=lambda p: calls.append(("workflow", dict(p))),
-        list_workflows=lambda: [
-            {
-                "file": "1.json",
-                "name": "Figuras",
-                "agents": ["metafora", "anclaje"],
-                "progress": 0.5,
-            }
-        ],
-        rename_workflow=lambda f, n: calls.append(("rename", f, n)),
-        start_discourse=lambda *a: calls.append(("discourse", a)),
         run_fix=lambda fid: calls.append(("fix", fid)) or "hecho",
         render_agents_crud=lambda: None,
     )
@@ -111,12 +101,26 @@ def test_config_edit_then_save_and_run_pass_the_changed_values():
     ) in at.session_state["calls"]
 
 
-def test_save_is_disabled_without_changes_and_discourse_run_uses_db_source():
+def test_save_is_disabled_without_changes_and_discourse_options_are_published():
     at = AppTest.from_function(_hub_app, default_timeout=30).run()
     assert at.button(key="hub_cfg_save").disabled is True
-    at.button(key="hub_wfrun_1.json").click().run()
-    kind, args = [c for c in at.session_state["calls"] if c[0] == "discourse"][0]
-    assert args == ("1.json", True, None, False, "db")
+    # Las opciones del discurso se publican en sesión para que el CRUD de
+    # agentes (ctx.render_agents_crud) las use en sus botones de ejecutar.
+    assert at.session_state["hub_discourse_options"] == {
+        "store": True,
+        "force": False,
+        "label": None,
+        "source": "db",
+    }
+    # Cambiar el checkbox de re-procesar se refleja en la sesión. La fuente
+    # ya no es configurable: solo existe "db" (se eliminó el fallback json).
+    at.tabs[2].checkbox(key="hub_dc_force").set_value(True).run()
+    assert at.session_state["hub_discourse_options"] == {
+        "store": True,
+        "force": True,
+        "label": None,
+        "source": "db",
+    }
 
 
 def test_run_buttons_are_disabled_while_running():
@@ -125,10 +129,7 @@ def test_run_buttons_are_disabled_while_running():
     at.session_state["discourse_state"] = {"running": True}
     at.run()
     assert not at.exception, at.exception
-    assert (
-        at.button(key="hub_run_workflow").disabled
-        and at.button(key="hub_wfrun_1.json").disabled
-    )
+    assert at.button(key="hub_run_workflow").disabled
 
 
 def _results_app(empty=False):
@@ -272,3 +273,21 @@ def test_agent_filter_is_limited_to_the_selected_pipeline():
     at = AppTest.from_function(_results_wf_app, default_timeout=30).run()
     at.selectbox(key="dr_wf").select("1.json").run()
     assert list(at.multiselect(key="dr_agents_1.json").options) == ["metafora"]
+
+
+def test_discourse_options_are_published_to_session_for_the_agents_crud():
+    # dashboard.py lee st.session_state["hub_discourse_options"] para que los
+    # botones de ejecutar agentes (dentro de ctx.render_agents_crud) usen las
+    # mismas opciones en vez de valores fijos.
+    at = AppTest.from_function(_hub_app, default_timeout=30).run()
+    at.tabs[2].checkbox(key="hub_dc_force").set_value(True).run()
+    opts = at.session_state["hub_discourse_options"]
+    assert opts == {"store": True, "force": True, "label": None, "source": "db"}
+
+
+def test_checkpoints_section_renders_defensively():
+    # discourse_store (PostgreSQL) puede no estar disponible en el entorno de
+    # prueba; la sección de checkpoints es defensiva (try/except) y no debe
+    # romper la pestaña aunque la base de datos no exista.
+    at = AppTest.from_function(_hub_app, default_timeout=30).run()
+    assert not at.exception, at.exception

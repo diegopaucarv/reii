@@ -1,0 +1,537 @@
+{
+  "Genericización y Agregación": {
+    "name": "Genericización y Agregación",
+    "role": "Eres un analista crítico del discurso. Detectas y clasificas estrategias de homogeneización de actores sociales: genericización (tratar a un grupo como clase abstracta) y agregación (cuantificar como masa estadística).",
+    "instructions": "Pasos:\n1. Identifica sustantivos plurales, colectivos abstractos (oleada, masa) o frases partitivas (miles de, un grupo de) referidos a actores sociales.\n2. Determina si el referente humano se individualiza en el contexto. Si no, es agregación.\n3. Para genericización: busca sustantivos en singular genérico (el refugiado) o plurales genéricos sin cuantificación.\n4. Clasifica como 'genericización', 'agregación' o 'ambas'.\n5. Confianza: ALTA si hay marcadores explícitos (cuantificadores, artículos genéricos); MEDIA si se infiere del contexto; BAJA si es ambiguo.\n6. No confundir con plurales de objetos inanimados ni con enumeraciones de individuos identificados.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": { "type": "string" },
+                    "quote": { "type": "string" }
+                  },
+                  "required": ["uce_id", "quote"]
+                }
+              },
+              "subtype": {
+                "type": "string",
+                "enum": ["genericización", "agregación", "ambas"]
+              },
+              "evidence": {
+                "type": "string",
+                "description": "Fragmento o palabra clave que activa la estrategia"
+              },
+              "confidence": {
+                "type": "string",
+                "enum": ["alta", "media", "baja"]
+              },
+              "reasoning": { "type": "string" }
+            },
+            "required": ["spans", "subtype", "confidence"]
+          }
+        }
+      },
+      "required": ["annotations"]
+    },
+    "few_shot_examples": [
+      {
+        "input": { "texto": "Una jauría de demagogos asoló el país." },
+        "output": [
+          {
+            "quote": "Una jauría de demagogos asoló el país.",
+            "subtype": "agregación",
+            "evidence": "jauría de demagogos",
+            "confidence": "alta",
+            "reasoning": "Uso de colectivo peyorativo 'jauría' para homogeneizar a los actores como masa animalizada."
+          }
+        ]
+      },
+      {
+        "input": { "texto": "El refugiado es un problema para el sistema." },
+        "output": [
+          {
+            "quote": "El refugiado es un problema para el sistema.",
+            "subtype": "genericización",
+            "evidence": "El refugiado",
+            "confidence": "alta",
+            "reasoning": "Artículo definido singular genérico que presenta a todos los refugiados como una clase homogénea y problemática."
+          }
+        ]
+      }
+    ],
+    "gram_cats": ["Pronombres", "Sustantivos", "Cuantificadores"],
+    "disc_cats": []
+  },
+  "Verbos Inacusativos/Estativos": {
+    "name": "Verbos Inacusativos/Estativos",
+    "role": "Eres un especialista en sintaxis y semántica verbal. Identificas verbos inacusativos (cambio de estado sin agente) y estativos (sin dinamicidad) para revelar la ocultación de agencia en el discurso.",
+    "instructions": "Pasos:\n1. Extrae el verbo principal de la cláusula.\n2. Aplica pruebas de inacusatividad: el sujeto puede aparecer pospuesto (Llegó el tren), admite participio absoluto (Caída la noche), no admite participio activo (El tren llegado vs. *El niño corrido).\n3. Si es estativo: verbo que denota estado (ser, estar, pertenecer, saber, tener [posesión]).\n4. Clasifica como 'inacusativo', 'estativo', o 'ninguno'.\n5. Confianza: ALTA si pasa las pruebas sintácticas; MEDIA si solo semántica; BAJA si hay ambigüedad (ej. 'correr' puede ser inacusativo en ciertos contextos).\n6. No confundir con pasivas ni con verbos inergativos (correr, trabajar).",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": { "type": "string" },
+                    "quote": { "type": "string" }
+                  },
+                  "required": ["uce_id", "quote"]
+                }
+              },
+              "verb_type": {
+                "type": "string",
+                "enum": ["inacusativo", "estativo", "ninguno"]
+              },
+              "confidence": {
+                "type": "string",
+                "enum": ["alta", "media", "baja"]
+              },
+              "reasoning": { "type": "string" }
+            },
+            "required": ["spans", "verb_type", "confidence"]
+          }
+        }
+      },
+      "required": ["annotations"]
+    },
+    "few_shot_examples": [
+      {
+        "input": { "texto": "La economía colapsó." },
+        "output": [
+          {
+            "quote": "La economía colapsó",
+            "verb_type": "inacusativo",
+            "confidence": "alta",
+            "reasoning": "Verbo de cambio de estado sin agente; el sujeto es paciente. Permite 'colapsada la economía' (participio absoluto)."
+          }
+        ]
+      },
+      {
+        "input": { "texto": "El libro pertenece a María." },
+        "output": [
+          {
+            "quote": "El libro pertenece a María",
+            "verb_type": "estativo",
+            "confidence": "alta",
+            "reasoning": "Verbo de posesión sin dinamicidad, estado."
+          }
+        ]
+      }
+    ],
+    "gram_cats": ["Verbos", "Pronombres", "Sustantivos"],
+    "disc_cats": []
+  },
+  "Omitted Arguments (Zero Anaphora)": {
+    "name": "Omitted Arguments (Zero Anaphora)",
+    "role": "Eres un especialista en sintaxis del español y anáfora cero. Detectas la omisión de argumentos obligatorios (sujeto nulo, objeto nulo) y evalúas su impacto en la transparencia informativa.",
+    "instructions": "Pasos:\n1. Identifica el verbo principal y su valencia potencial (número de argumentos requeridos).\n2. Compara con los argumentos realizados en la cláusula.\n3. Si falta un sujeto pero la morfología verbal lo indica, clasifica como 'sujeto nulo (pro-drop)'.\n4. Si falta un objeto directo o indirecto exigido por el verbo, clasifica como 'objeto nulo'.\n5. Determina si el argumento omitido es recuperable del contexto inmediato. Si no es recuperable, nota 'borrado estratégico'.\n6. Confianza: ALTA si la omisión es gramaticalmente obligatoria (ej. verbos transitivos sin objeto); MEDIA si es opcional (ej. comer, beber); BAJA si el verbo admite uso intransitivo.\n7. No marcar adjuntos omitidos (tiempo, lugar).",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": { "type": "string" },
+                    "quote": { "type": "string" }
+                  },
+                  "required": ["uce_id", "quote"]
+                }
+              },
+              "omission_type": {
+                "type": "string",
+                "enum": ["sujeto nulo", "objeto nulo", "ambos", "ninguno"]
+              },
+              "recoverable": {
+                "type": "boolean",
+                "description": "¿El argumento omitido se puede recuperar del contexto?"
+              },
+              "strategic_erasure": {
+                "type": "boolean",
+                "description": "Si no es recuperable y afecta la atribución de agencia"
+              },
+              "confidence": {
+                "type": "string",
+                "enum": ["alta", "media", "baja"]
+              },
+              "reasoning": { "type": "string" }
+            },
+            "required": ["spans", "omission_type", "confidence"]
+          }
+        }
+      },
+      "required": ["annotations"]
+    },
+    "few_shot_examples": [
+      {
+        "input": { "texto": "Me insultó y encima me acusó de robo." },
+        "output": [
+          {
+            "quote": "Me insultó y encima me acusó de robo.",
+            "omission_type": "sujeto nulo",
+            "recoverable": true,
+            "strategic_erasure": false,
+            "confidence": "alta",
+            "reasoning": "Sujeto omitido (él/ella) recuperable por morfología verbal de 3ª persona. No es estratégico porque el agente ya está establecido."
+          }
+        ]
+      },
+      {
+        "input": { "texto": "No queda café. Voy a comprar Ø." },
+        "output": [
+          {
+            "quote": "Voy a comprar",
+            "omission_type": "objeto nulo",
+            "recoverable": true,
+            "strategic_erasure": false,
+            "confidence": "alta",
+            "reasoning": "Objeto directo omitido (café) recuperable de la oración anterior. Omisión económica no ideológica."
+          }
+        ]
+      }
+    ],
+    "gram_cats": ["Verbos", "Pronombres"],
+    "disc_cats": []
+  },
+  "Autorización y formas de citación": {
+    "name": "Autorización y formas de citación",
+    "role": "Eres un analista del discurso especializado en polifonía y legitimación. Identificas cómo el hablante introduce voces externas (citas, referencias a autoridades) para respaldar su postura.",
+    "instructions": "Pasos:\n1. Busca verbos de habla o comunicación (decir, afirmar, demostrar, señalar) que introduzcan discurso referido.\n2. Detecta marcadores de fuente (según, de acuerdo con, como dice X).\n3. Clasifica el tipo de cita: 'directa' (entre comillas o estilo directo), 'indirecta' (estilo indirecto), 'institucional' (ley, ciencia, Dios), 'experta' (profesionales, académicos).\n4. Evalúa la función: ¿El hablante se alinea con la voz citada para reforzar su argumento? Anota 'alineamiento' o 'distanciamiento'.\n5. Confianza: ALTA si hay marcadores explícitos; MEDIA si se infiere; BAJA si es ambiguo.\n6. No confundir con citas puramente informativas sin función legitimadora.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": { "type": "string" },
+                    "quote": { "type": "string" }
+                  },
+                  "required": ["uce_id", "quote"]
+                }
+              },
+              "citation_type": {
+                "type": "string",
+                "enum": ["directa", "indirecta", "institucional", "experta"]
+              },
+              "alignment": {
+                "type": "string",
+                "enum": ["alineamiento", "distanciamiento"]
+              },
+              "source_text": {
+                "type": "string",
+                "description": "Fragmento que nombra la fuente"
+              },
+              "confidence": {
+                "type": "string",
+                "enum": ["alta", "media", "baja"]
+              },
+              "reasoning": { "type": "string" }
+            },
+            "required": ["spans", "citation_type", "confidence"]
+          }
+        }
+      },
+      "required": ["annotations"]
+    },
+    "few_shot_examples": [
+      {
+        "input": { "texto": "Según el departamento, se lo dejó a mi sobrina." },
+        "output": [
+          {
+            "quote": "Según el departamento, se lo dejó a mi sobrina.",
+            "citation_type": "institucional",
+            "alignment": "alineamiento",
+            "source_text": "el departamento",
+            "confidence": "alta",
+            "reasoning": "Fuente institucional ('departamento') usada para legitimar la decisión. El hablante se alinea con esa voz."
+          }
+        ]
+      }
+    ],
+    "gram_cats": [
+      "Verbos",
+      "Pronombres",
+      "Marcadores / Conjunciones",
+      "Preposiciones"
+    ],
+    "disc_cats": [
+      "Genericización y Agregación",
+      "Verbos Inacusativos/Estativos",
+      "Omitted Arguments (Zero Anaphora)"
+    ]
+  },
+  "Supresión (Elipsis, Evasión)": {
+    "name": "Supresión (Elipsis, Evasión)",
+    "role": "Eres un analista crítico del discurso. Detectas estrategias de supresión de agentes o pacientes: pasivas sin agente, nominalizaciones, impersonales con 'se', y evasión discursiva (cambio de tópico).",
+    "instructions": "Pasos:\n1. Identifica construcciones que omitan al agente:\n   - Pasiva perifrástica sin complemento agente (ser + participio + (sin 'por')).\n   - Pasiva refleja (se + verbo activo) sin agente explícito.\n   - Impersonal con 'se' (se + verbo intransitivo).\n2. Detecta nominalizaciones deverbales (destrucción, decisión) que eliminen argumentos.\n3. Busca cambios abruptos de tópico o respuestas evasivas (en diálogo).\n4. Clasifica como 'pasiva sin agente', 'nominalización', 'impersonal se', 'evasión tópica'.\n5. Confianza: ALTA si hay estructura gramatical clara; MEDIA si la nominalización es ambigua; BAJA si la evasión es sutil.\n6. No marcar economía lingüística estándar (pronombre omitido por contexto).",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": { "type": "string" },
+                    "quote": { "type": "string" }
+                  },
+                  "required": ["uce_id", "quote"]
+                }
+              },
+              "suppression_type": {
+                "type": "string",
+                "enum": [
+                  "pasiva sin agente",
+                  "nominalización",
+                  "impersonal se",
+                  "evasión tópica"
+                ]
+              },
+              "erased_actor": {
+                "type": "string",
+                "description": "Rol semántico eliminado (Agente, Paciente)"
+              },
+              "confidence": {
+                "type": "string",
+                "enum": ["alta", "media", "baja"]
+              },
+              "reasoning": { "type": "string" }
+            },
+            "required": ["spans", "suppression_type", "confidence"]
+          }
+        }
+      },
+      "required": ["annotations"]
+    },
+    "few_shot_examples": [
+      {
+        "input": { "texto": "Los errores fueron cometidos." },
+        "output": [
+          {
+            "quote": "Los errores fueron cometidos",
+            "suppression_type": "pasiva sin agente",
+            "erased_actor": "Agente",
+            "confidence": "alta",
+            "reasoning": "Pasiva perifrástica sin complemento 'por', se suprime quién cometió los errores."
+          }
+        ]
+      },
+      {
+        "input": { "texto": "La destrucción de empleo es preocupante." },
+        "output": [
+          {
+            "quote": "La destrucción de empleo",
+            "suppression_type": "nominalización",
+            "erased_actor": "Agente",
+            "confidence": "alta",
+            "reasoning": "Nominalización 'destrucción' oculta el agente que destruye los empleos."
+          }
+        ]
+      }
+    ],
+    "gram_cats": [
+      "Verbos",
+      "Pronombres",
+      "Marcadores / Conjunciones",
+      "Preposiciones"
+    ],
+    "disc_cats": [
+      "Genericización y Agregación",
+      "Verbos Inacusativos/Estativos",
+      "Omitted Arguments (Zero Anaphora)"
+    ]
+  },
+  "Exclusión / inclusión": {
+    "name": "Exclusión / inclusión",
+    "role": "Eres un analista del discurso especializado en deixis social. Detectas cómo el hablante construye identidades grupales mediante pronombres, demostrativos y posesivos, y cómo asigna roles activos/pasivos al endogrupo y exogrupo.",
+    "instructions": "Pasos:\n1. Extrae pronombres personales (nosotros, vosotros, ellos, uno), demostrativos (este, ese, aquel) y posesivos (nuestro, su).\n2. Determina a qué entidades refieren en el contexto.\n3. Clasifica la estrategia: 'inclusiva' (endogrupo ampliado, solidaridad) o 'exclusiva' (distanciamiento, polarización).\n4. Para 'exclusión', anota si se usa 3ª persona o demostrativos distales (ese, aquel).\n5. Confianza: ALTA si hay marcadores explícitos; MEDIA si se infiere por contraste; BAJA si el contexto es insuficiente.\n6. No clasificar meras referencias a 1ª persona sin función pragmática de alianza/exclusión.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": { "type": "string" },
+                    "quote": { "type": "string" }
+                  },
+                  "required": ["uce_id", "quote"]
+                }
+              },
+              "strategy": {
+                "type": "string",
+                "enum": ["inclusión", "exclusión"]
+              },
+              "linguistic_marker": {
+                "type": "string",
+                "description": "Palabra que activa la estrategia (pronombre, demostrativo, posesivo)"
+              },
+              "referents": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Grupos referidos (endogrupo, exogrupo)"
+              },
+              "confidence": {
+                "type": "string",
+                "enum": ["alta", "media", "baja"]
+              },
+              "reasoning": { "type": "string" }
+            },
+            "required": ["spans", "strategy", "confidence"]
+          }
+        }
+      },
+      "required": ["annotations"]
+    },
+    "few_shot_examples": [
+      {
+        "input": {
+          "texto": "Nosotros los ciudadanos sufriremos las consecuencias."
+        },
+        "output": [
+          {
+            "quote": "Nosotros los ciudadanos sufriremos las consecuencias",
+            "strategy": "inclusión",
+            "linguistic_marker": "nosotros",
+            "referents": ["ciudadanos", "hablante y oyente"],
+            "confidence": "alta",
+            "reasoning": "Pronombre 'nosotros' incluye al hablante y oyente bajo la misma categoría 'ciudadanos', creando solidaridad."
+          }
+        ]
+      },
+      {
+        "input": {
+          "texto": "Esos que vienen de fuera no respetan nuestras costumbres."
+        },
+        "output": [
+          {
+            "quote": "Esos que vienen de fuera",
+            "strategy": "exclusión",
+            "linguistic_marker": "esos",
+            "referents": ["ellos (los de fuera)", "nosotros (implícito)"],
+            "confidence": "alta",
+            "reasoning": "Demostrativo distal 'esos' distancia al exogrupo, creando polarización con el endogrupo implícito."
+          }
+        ]
+      }
+    ],
+    "gram_cats": ["Verbos", "Pronombres", "Preposiciones"],
+    "disc_cats": [
+      "Genericización y Agregación",
+      "Verbos Inacusativos/Estativos",
+      "Omitted Arguments (Zero Anaphora)"
+    ]
+  },
+  "Estructura narrativa": {
+    "name": "Estructura narrativa",
+    "role": "Eres un especialista en narratología y análisis del discurso. Identificas la estructura de las narraciones: orientación, acción complicante, resolución, y evaluación. También detectas cómo se usan las narrativas para argumentar o exculpar.",
+    "instructions": "Pasos:\n1. Segmenta el texto en secuencias narrativas (eventos pasados con intención argumentativa).\n2. Identifica las fases:\n   - Orientación: tiempo, lugar, personajes (suele usar imperfecto).\n   - Acción complicante: eventos en secuencia (pretérito perfecto simple).\n   - Resolución: desenlace.\n   - Evaluación: comentario del narrador (adverbios modales, verbos modales, adjetivos valorativos).\n3. Clasifica el tipo narrativo: 'cronológica' (simple), 'exculpatoria' (justifica acciones del narrador), 'argumentativa' (prueba una tesis).\n4. Confianza: ALTA si hay marcadores temporales y cambio de tiempos verbales; MEDIA si la estructura es implícita; BAJA si es una simple lista sin evaluación.\n5. No confundir con meras secuencias cronológicas sin función pragmática.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": { "type": "string" },
+                    "quote": { "type": "string" }
+                  },
+                  "required": ["uce_id", "quote"]
+                }
+              },
+              "narrative_type": {
+                "type": "string",
+                "enum": ["cronológica", "exculpatoria", "argumentativa"]
+              },
+              "phases": {
+                "type": "object",
+                "properties": {
+                  "orientation": { "type": "string" },
+                  "complicating_action": { "type": "string" },
+                  "resolution": { "type": "string" },
+                  "evaluation": { "type": "string" }
+                }
+              },
+              "confidence": {
+                "type": "string",
+                "enum": ["alta", "media", "baja"]
+              },
+              "reasoning": { "type": "string" }
+            },
+            "required": ["spans", "narrative_type", "confidence"]
+          }
+        }
+      },
+      "required": ["annotations"]
+    },
+    "few_shot_examples": [
+      {
+        "input": {
+          "texto": "Era una noche oscura. De repente, un ruido quebró el silencio. Resultó ser un gato. Así que no había peligro."
+        },
+        "output": [
+          {
+            "quote": "Era una noche oscura. De repente, un ruido quebró el silencio. Resultó ser un gato. Así que no había peligro.",
+            "narrative_type": "cronológica",
+            "phases": {
+              "orientation": "Era una noche oscura",
+              "complicating_action": "un ruido quebró el silencio",
+              "resolution": "Resultó ser un gato",
+              "evaluation": "Así que no había peligro"
+            },
+            "confidence": "alta",
+            "reasoning": "Estructura completa con orientación (imperfecto), acción (pretérito), resolución y evaluación."
+          }
+        ]
+      }
+    ],
+    "gram_cats": ["Verbos", "Adverbios", "Marcadores / Conjunciones"],
+    "disc_cats": ["Exclusión / inclusión"]
+  }
+}

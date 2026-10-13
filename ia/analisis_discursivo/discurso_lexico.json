@@ -1,0 +1,1018 @@
+{
+  "valencia": {
+    "name": "valencia",
+    "role": "Eres un lingüista experto en valencia verbal. Analizas los verbos de un documento para determinar su valencia cuantitativa, cualitativa y la diferencia entre valencia potencial y realizada.",
+    "instructions": "Sigue estos pasos:\n1. Identifica el predicado verbal principal de cada cláusula.\n2. Determina su valencia cuantitativa: avalent (0 arg), monovalent (1 arg), bivalent (2 arg), trivalent (3 arg).\n3. Analiza la valencia cualitativa asignando roles temáticos (Agente, Paciente, Experimentante, Locativo, etc.) a cada argumento.\n4. Compara la valencia potencial del verbo con la realizada. Si falta algún argumento esperado, documéntalo en 'omitted_arguments'.\n5. Confianza: ALTA si todos los argumentos canónicos están presentes; MEDIA si alguno está implícito; BAJA si el verbo es ambiguo.\n6. Si la valencia no encaja en ninguna categoría, usa 'otro'.\n7. Los adjuntos (circunstanciales) NO son argumentos.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": {
+                      "type": "string"
+                    },
+                    "quote": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "uce_id",
+                    "quote"
+                  ]
+                }
+              },
+              "quantitative_valency": {
+                "type": "string",
+                "enum": [
+                  "avalent",
+                  "monovalent",
+                  "bivalent",
+                  "trivalent",
+                  "otro"
+                ]
+              },
+              "qualitative_valency": {
+                "type": "object"
+              },
+              "omitted_arguments": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "confidence": {
+                "type": "string",
+                "enum": [
+                  "alta",
+                  "media",
+                  "baja"
+                ]
+              },
+              "reasoning": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "spans",
+              "quantitative_valency",
+              "confidence"
+            ]
+          }
+        }
+      },
+      "required": [
+        "annotations"
+      ]
+    },
+    "few_shot_examples": [
+      {
+        "input": {
+          "texto": "Llueve"
+        },
+        "output": [
+          {
+            "spans": [
+              {
+                "uce_id": "uce_1",
+                "quote": "Llueve"
+              }
+            ],
+            "quantitative_valency": "avalent",
+            "qualitative_valency": {},
+            "omitted_arguments": [],
+            "confidence": "alta",
+            "reasoning": "Verbo meteorológico sin argumentos."
+          }
+        ]
+      },
+      {
+        "input": {
+          "texto": "El Duque de Alba mata un elefante"
+        },
+        "output": [
+          {
+            "spans": [
+              {
+                "uce_id": "uce_2",
+                "quote": "El Duque de Alba mata un elefante"
+              }
+            ],
+            "quantitative_valency": "bivalent",
+            "qualitative_valency": {
+              "agente": "El Duque de Alba",
+              "paciente": "un elefante"
+            },
+            "omitted_arguments": [],
+            "confidence": "alta",
+            "reasoning": "Sujeto agente y objeto paciente explícitos."
+          }
+        ]
+      }
+    ],
+    "gram_cats": [
+      "Verbos",
+      "Pronombres",
+      "Sustantivos",
+      "Preposiciones"
+    ],
+    "disc_cats": []
+  },
+  "telicidad": {
+    "name": "telicidad",
+    "role": "Eres un especialista en aspecto léxico (Aktionsart). Clasificas los eventos según Vendler: Estados, Actividades (atelic), Logros y Logros graduales (telic).",
+    "instructions": "Pasos:\n1. Extrae el verbo principal y su objeto directo.\n2. Si el objeto es contable e individualizado → telicidad (Logro o Logro gradual). Si es masivo o plural escueto → atelicidad (Actividad o Estado).\n3. Busca adjuntos de límite (hasta, a, en) que conviertan actividad en logro.\n4. Clasifica: Estado, Actividad, Logro, Logro gradual, u 'otro'.\n5. Confianza: ALTA si hay marca explícita; MEDIA si se infiere; BAJA si es ambiguo.\n6. No confundir con tiempo gramatical ni aspecto gramatical.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": {
+                      "type": "string"
+                    },
+                    "quote": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "uce_id",
+                    "quote"
+                  ]
+                }
+              },
+              "telic_subtype": {
+                "type": "string",
+                "enum": [
+                  "Estado",
+                  "Actividad",
+                  "Logro",
+                  "Logro gradual",
+                  "otro"
+                ]
+              },
+              "confidence": {
+                "type": "string",
+                "enum": [
+                  "alta",
+                  "media",
+                  "baja"
+                ]
+              },
+              "reasoning": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "spans",
+              "telic_subtype",
+              "confidence"
+            ]
+          }
+        }
+      },
+      "required": [
+        "annotations"
+      ]
+    },
+    "few_shot_examples": [
+      {
+        "input": {
+          "texto": "Ana María pertenecía a una familia rica"
+        },
+        "output": [
+          {
+            "spans": [
+              {
+                "uce_id": "uce_3",
+                "quote": "Ana María pertenecía a una familia rica"
+              }
+            ],
+            "telic_subtype": "Estado",
+            "confidence": "alta",
+            "reasoning": "Verbo estativo."
+          }
+        ]
+      },
+      {
+        "input": {
+          "texto": "Fabricó una bomba"
+        },
+        "output": [
+          {
+            "spans": [
+              {
+                "uce_id": "uce_4",
+                "quote": "Fabricó una bomba"
+              }
+            ],
+            "telic_subtype": "Logro gradual",
+            "confidence": "alta",
+            "reasoning": "Objeto contable, evento con punto final."
+          }
+        ]
+      }
+    ],
+    "gram_cats": [
+      "Verbos",
+      "Sustantivos",
+      "Preposiciones"
+    ],
+    "disc_cats": []
+  },
+  "ideacion": {
+    "name": "ideacion",
+    "role": "Eres un analista del discurso especializado en ideación: cómo el hablante empaqueta y clasifica la realidad mediante sinonimia, taxonomías, nominalizaciones y agregación.",
+    "instructions": "Pasos:\n1. Identifica cadenas léxicas (sinónimos, hiperónimos, hipónimos) que crean densidad semántica.\n2. Detecta nominalizaciones (verbos convertidos en sustantivos abstractos) y reconstruye su marco valencial para ver qué actores se omiten.\n3. Localiza cuantificadores pseudo-partitivos (un grupo de, una ola de) que agrupan individuos en masas.\n4. Clasifica cada instancia como: 'LexicalChain', 'Taxonomy', 'Nominalization', 'Genericization/Aggregation', u 'otro'.\n5. Confianza: ALTA si hay marcas explícitas; MEDIA si inferible; BAJA si ambiguo.\n6. Documenta los argumentos omitidos en nominalizaciones.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": {
+                      "type": "string"
+                    },
+                    "quote": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "uce_id",
+                    "quote"
+                  ]
+                }
+              },
+              "ideation_subtype": {
+                "type": "string",
+                "enum": [
+                  "LexicalChain",
+                  "Taxonomy",
+                  "Nominalization",
+                  "Genericization/Aggregation",
+                  "otro"
+                ]
+              },
+              "omitted_arguments": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "confidence": {
+                "type": "string",
+                "enum": [
+                  "alta",
+                  "media",
+                  "baja"
+                ]
+              },
+              "reasoning": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "spans",
+              "ideation_subtype",
+              "confidence"
+            ]
+          }
+        }
+      },
+      "required": [
+        "annotations"
+      ]
+    },
+    "few_shot_examples": [
+      {
+        "input": {
+          "texto": "La destrucción de empleo por los robots es inevitable."
+        },
+        "output": [
+          {
+            "spans": [
+              {
+                "uce_id": "uce_5",
+                "quote": "La destrucción de empleo"
+              }
+            ],
+            "ideation_subtype": "Nominalization",
+            "omitted_arguments": [
+              "agente (robots)"
+            ],
+            "confidence": "alta",
+            "reasoning": "Nominalización de 'destruir', se omite el agente explícito."
+          }
+        ]
+      },
+      {
+        "input": {
+          "texto": "Una jauría de demagogos controla el parlamento."
+        },
+        "output": [
+          {
+            "spans": [
+              {
+                "uce_id": "uce_6",
+                "quote": "Una jauría de demagogos"
+              }
+            ],
+            "ideation_subtype": "Genericization/Aggregation",
+            "omitted_arguments": [],
+            "confidence": "alta",
+            "reasoning": "Cuantificador pseudo-partitivo que agrupa individuos en una masa deshumanizada."
+          }
+        ]
+      }
+    ],
+    "gram_cats": [
+      "Sustantivos",
+      "Adjetivos",
+      "Adverbios"
+    ],
+    "disc_cats": [
+      "telicidad",
+      "valencia"
+    ]
+  },
+  "eufemismos": {
+    "name": "eufemismos",
+    "role": "Eres un experto en pragmática y análisis del discurso. Detectas eufemismos, ortobemismos y disfemismos en el texto, y explicas su función de mitigación o agravación.",
+    "instructions": "Pasos:\n1. Identifica términos que podrían ser tabú o conflictivos (muerte, violencia, crisis, etc.).\n2. Busca sustituciones léxicas que atenúen (eufemismo), que sean neutras (ortobemismo) o que agraven (disfemismo).\n3. Clasifica cada instancia como 'Euphemism', 'Orthophemism', 'Dysphemism', o 'otro'.\n4. Evalúa el efecto pragmático: ¿mitiga la responsabilidad? ¿normaliza un daño?\n5. Confianza: ALTA si hay contraste claro con el término directo; MEDIA si la atenuación es sutil; BAJA si es incierto.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": {
+                      "type": "string"
+                    },
+                    "quote": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "uce_id",
+                    "quote"
+                  ]
+                }
+              },
+              "x_phemism_type": {
+                "type": "string",
+                "enum": [
+                  "Euphemism",
+                  "Orthophemism",
+                  "Dysphemism",
+                  "otro"
+                ]
+              },
+              "literal_equivalent": {
+                "type": "string"
+              },
+              "pragmatic_effect": {
+                "type": "string"
+              },
+              "confidence": {
+                "type": "string",
+                "enum": [
+                  "alta",
+                  "media",
+                  "baja"
+                ]
+              },
+              "reasoning": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "spans",
+              "x_phemism_type",
+              "confidence"
+            ]
+          }
+        }
+      },
+      "required": [
+        "annotations"
+      ]
+    },
+    "few_shot_examples": [
+      {
+        "input": {
+          "texto": "Hubo daños colaterales durante el bombardeo."
+        },
+        "output": [
+          {
+            "spans": [
+              {
+                "uce_id": "uce_7",
+                "quote": "daños colaterales"
+              }
+            ],
+            "x_phemism_type": "Euphemism",
+            "literal_equivalent": "muertes de civiles",
+            "pragmatic_effect": "Mitiga la responsabilidad y deshumaniza las víctimas.",
+            "confidence": "alta",
+            "reasoning": "Eufemismo militar clásico para muertes accidentales."
+          }
+        ]
+      }
+    ],
+    "gram_cats": [
+      "Verbos",
+      "Sustantivos",
+      "Adjetivos",
+      "Adverbios"
+    ],
+    "disc_cats": [
+      "ideacion"
+    ]
+  },
+  "metaforas": {
+    "name": "metaforas",
+    "role": "Eres un especialista en metáfora conceptual. Identificas metáforas, determinas su dominio fuente y dominio destino, y clasificas su grado de convencionalidad.",
+    "instructions": "Pasos:\n1. Aplica el Procedimiento de Identificación de Metáfora (MIP): lee el texto, aísla unidades léxicas, busca si tienen un significado más básico/concreto en otro contexto.\n2. Si hay contraste y se puede entender por comparación, márcala como metáfora.\n3. Identifica el Dominio Fuente (concreto) y el Dominio Destino (abstracto).\n4. Clasifica como: 'Conceptual', 'Conventional', 'Novel/Creative', 'Dead/Catachresis', 'Grammatical/Ideational', u 'otro'.\n5. Confianza: ALTA si el contraste es claro; MEDIA si requiere inferencia; BAJA si es dudoso.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": {
+                      "type": "string"
+                    },
+                    "quote": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "uce_id",
+                    "quote"
+                  ]
+                }
+              },
+              "source_domain": {
+                "type": "string"
+              },
+              "target_domain": {
+                "type": "string"
+              },
+              "metaphor_type": {
+                "type": "string",
+                "enum": [
+                  "Conceptual",
+                  "Conventional",
+                  "Novel/Creative",
+                  "Dead/Catachresis",
+                  "Grammatical/Ideational",
+                  "otro"
+                ]
+              },
+              "confidence": {
+                "type": "string",
+                "enum": [
+                  "alta",
+                  "media",
+                  "baja"
+                ]
+              },
+              "reasoning": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "spans",
+              "source_domain",
+              "target_domain",
+              "metaphor_type",
+              "confidence"
+            ]
+          }
+        }
+      },
+      "required": [
+        "annotations"
+      ]
+    },
+    "few_shot_examples": [
+      {
+        "input": {
+          "texto": "El gobierno decidió inyectar liquidez en la economía."
+        },
+        "output": [
+          {
+            "spans": [
+              {
+                "uce_id": "uce_8",
+                "quote": "inyectar liquidez"
+              }
+            ],
+            "source_domain": "medicina (inyección)",
+            "target_domain": "economía",
+            "metaphor_type": "Conceptual",
+            "confidence": "alta",
+            "reasoning": "Metáfora conceptual LA ECONOMÍA ES UN ORGANISMO ENFERMO."
+          }
+        ]
+      }
+    ],
+    "gram_cats": [
+      "Verbos",
+      "Sustantivos",
+      "Adjetivos",
+      "Adverbios"
+    ],
+    "disc_cats": [
+      "ideacion"
+    ]
+  },
+  "transformaciones_semanticas": {
+    "name": "transformaciones_semanticas",
+    "role": "Eres un lingüista cognitivo. Detectas transformaciones semánticas deliberadas: metonimia, ironía, blending conceptual, violaciones de restricciones de selección.",
+    "instructions": "Pasos:\n1. Analiza las relaciones sintagmáticas (verbo+objeto, sustantivo+adjetivo) para detectar choques de restricciones de selección.\n2. Si la interpretación literal viola máximas de Grice (falsa, absurda), considera ironía.\n3. Para metonimia: identifica relación de contigüidad dentro del mismo dominio (parte-todo, productor-producto, etc.).\n4. Para blending: detecta mezcla de dos espacios mentales que genera un significado emergente.\n5. Clasifica como: 'Metonymy', 'Irony', 'ConceptualBlending', u 'otro'.\n6. Confianza: ALTA si la violación es clara; MEDIA si requiere contexto; BAJA si ambiguo.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": {
+                      "type": "string"
+                    },
+                    "quote": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "uce_id",
+                    "quote"
+                  ]
+                }
+              },
+              "transformation_type": {
+                "type": "string",
+                "enum": [
+                  "Metonymy",
+                  "Irony",
+                  "ConceptualBlending",
+                  "otro"
+                ]
+              },
+              "source_meaning": {
+                "type": "string"
+              },
+              "target_meaning": {
+                "type": "string"
+              },
+              "confidence": {
+                "type": "string",
+                "enum": [
+                  "alta",
+                  "media",
+                  "baja"
+                ]
+              },
+              "reasoning": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "spans",
+              "transformation_type",
+              "confidence"
+            ]
+          }
+        }
+      },
+      "required": [
+        "annotations"
+      ]
+    },
+    "few_shot_examples": [
+      {
+        "input": {
+          "texto": "Me gusta leer a Borges."
+        },
+        "output": [
+          {
+            "spans": [
+              {
+                "uce_id": "uce_9",
+                "quote": "leer a Borges"
+              }
+            ],
+            "transformation_type": "Metonymy",
+            "source_meaning": "Borges (autor)",
+            "target_meaning": "las obras de Borges",
+            "confidence": "alta",
+            "reasoning": "Metonimia autor-por-obra."
+          }
+        ]
+      }
+    ],
+    "gram_cats": [
+      "Verbos",
+      "Sustantivos",
+      "Adjetivos",
+      "Adverbios"
+    ],
+    "disc_cats": [
+      "ideacion"
+    ]
+  },
+  "juicios_valor": {
+    "name": "juicios_valor",
+    "role": "Eres un analista crítico del discurso. Detectas juicios de valor, el cuadrado ideológico (Van Dijk) y los recursos de valoración (afecto, juicio, apreciación).",
+    "instructions": "Pasos:\n1. Extrae léxico evaluativo: adjetivos valorativos (bueno, cruel, heroico), verbos mentales declarativos (amar, odiar, pensar).\n2. Clasifica cada instancia como 'Affect' (emociones), 'Judgement' (moral), 'Appreciation' (estético/valor), o 'IdeologicalSquare' (polarización nosotros/ellos).\n3. Para el cuadrado ideológico, identifica el grupo endogrupal y exogrupal, y registra si se enfatizan lo bueno propio / lo malo ajeno, o se mitiga lo malo propio / lo bueno ajeno.\n4. Confianza: ALTA si hay adjetivos explícitos; MEDIA si se infiere por contexto; BAJA si es neutral.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": {
+                      "type": "string"
+                    },
+                    "quote": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "uce_id",
+                    "quote"
+                  ]
+                }
+              },
+              "value_judgment_type": {
+                "type": "string",
+                "enum": [
+                  "Affect",
+                  "Judgement",
+                  "Appreciation",
+                  "IdeologicalSquare",
+                  "otro"
+                ]
+              },
+              "in_group": {
+                "type": "string"
+              },
+              "out_group": {
+                "type": "string"
+              },
+              "polarization_strategy": {
+                "type": "string",
+                "enum": [
+                  "emphasize_our_good",
+                  "emphasize_their_bad",
+                  "mitigate_our_bad",
+                  "mitigate_their_good",
+                  "none"
+                ]
+              },
+              "confidence": {
+                "type": "string",
+                "enum": [
+                  "alta",
+                  "media",
+                  "baja"
+                ]
+              },
+              "reasoning": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "spans",
+              "value_judgment_type",
+              "confidence"
+            ]
+          }
+        }
+      },
+      "required": [
+        "annotations"
+      ]
+    },
+    "few_shot_examples": [
+      {
+        "input": {
+          "texto": "Nuestros valientes soldados defienden la libertad, mientras que los terroristas cobardes atacan a civiles."
+        },
+        "output": [
+          {
+            "spans": [
+              {
+                "uce_id": "uce_10",
+                "quote": "valientes soldados ... terroristas cobardes"
+              }
+            ],
+            "value_judgment_type": "IdeologicalSquare",
+            "in_group": "nuestros soldados",
+            "out_group": "terroristas",
+            "polarization_strategy": "emphasize_our_good + emphasize_their_bad",
+            "confidence": "alta",
+            "reasoning": "Polarización nosotros/ellos con adjetivos valorativos opuestos."
+          }
+        ]
+      }
+    ],
+    "gram_cats": [
+      "Verbos",
+      "Adjetivos",
+      "Adverbios"
+    ],
+    "disc_cats": [
+      "eufemismos",
+      "metaforas",
+      "transformaciones_semanticas"
+    ]
+  },
+  "oposiciones": {
+    "name": "oposiciones",
+    "role": "Eres un especialista en retórica y polifonía. Detectas oposiciones sintácticas (correctivas, exclusivas) y dicotomías conceptuales.",
+    "instructions": "Pasos:\n1. Busca patrones bipartitos con partículas negativas + conjunciones adversativas/correctivas (no A sino B, not A but B).\n2. Identifica disyunciones exclusivas (o... o, either... or) que fuerzan una elección polarizada.\n3. Detecta pares de antónimos léxicos en el texto (luz/oscuridad, civilizado/bárbaro).\n4. Clasifica como: 'CorrectiveOpposition', 'ExclusiveDisjunction', 'ConceptualDichotomy', u 'otro'.\n5. Confianza: ALTA si hay marcadores explícitos; MEDIA si antónimos contextuales; BAJA si es comparación gradual.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": {
+                      "type": "string"
+                    },
+                    "quote": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "uce_id",
+                    "quote"
+                  ]
+                }
+              },
+              "opposition_type": {
+                "type": "string",
+                "enum": [
+                  "CorrectiveOpposition",
+                  "ExclusiveDisjunction",
+                  "ConceptualDichotomy",
+                  "otro"
+                ]
+              },
+              "left_pole": {
+                "type": "string"
+              },
+              "right_pole": {
+                "type": "string"
+              },
+              "confidence": {
+                "type": "string",
+                "enum": [
+                  "alta",
+                  "media",
+                  "baja"
+                ]
+              },
+              "reasoning": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "spans",
+              "opposition_type",
+              "confidence"
+            ]
+          }
+        }
+      },
+      "required": [
+        "annotations"
+      ]
+    },
+    "few_shot_examples": [
+      {
+        "input": {
+          "texto": "No es realismo, sino surrealismo."
+        },
+        "output": [
+          {
+            "spans": [
+              {
+                "uce_id": "uce_11",
+                "quote": "No es realismo, sino surrealismo"
+              }
+            ],
+            "opposition_type": "CorrectiveOpposition",
+            "left_pole": "realismo",
+            "right_pole": "surrealismo",
+            "confidence": "alta",
+            "reasoning": "Estructura 'no A sino B' que corrige y reemplaza."
+          }
+        ]
+      }
+    ],
+    "gram_cats": [
+      "Pronombres",
+      "Adjetivos",
+      "Adverbios",
+      "Marcadores/Conjunciones",
+      "Negaciones"
+    ],
+    "disc_cats": [
+      "eufemismos",
+      "metaforas",
+      "transformaciones_semanticas"
+    ]
+  },
+  "mitopoetica": {
+    "name": "mitopoetica",
+    "role": "Eres un analista del discurso especializado en mitopoética: identificación de arquetipos, narrativas cósmicas y universalización de conflictos locales.",
+    "instructions": "Pasos:\n1. Busca nombres propios usados como arquetipos (un Judas, un Aquiles) o epítetos culturalmente cargados.\n2. Detecta cambios al presente gnómico o atemporal (verbos en presente que expresan verdades universales).\n3. Identifica marcos narrativos cósmicos: Apocalipsis, Edad de Oro, Guerra Santa, etc.\n4. Clasifica como: 'ImaginativeUniversal/Archetype', 'CosmicNarrative', 'GnomicPresent', u 'otro'.\n5. Confianza: ALTA si hay referencias explícitas a mitos; MEDIA si hay lenguaje apocalíptico; BAJA si es metáfora ordinaria.",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "uce_id": {
+                      "type": "string"
+                    },
+                    "quote": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "uce_id",
+                    "quote"
+                  ]
+                }
+              },
+              "mythopoetic_type": {
+                "type": "string",
+                "enum": [
+                  "ImaginativeUniversal/Archetype",
+                  "CosmicNarrative",
+                  "GnomicPresent",
+                  "otro"
+                ]
+              },
+              "archetype_name": {
+                "type": "string"
+              },
+              "cosmic_frame": {
+                "type": "string"
+              },
+              "confidence": {
+                "type": "string",
+                "enum": [
+                  "alta",
+                  "media",
+                  "baja"
+                ]
+              },
+              "reasoning": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "spans",
+              "mythopoetic_type",
+              "confidence"
+            ]
+          }
+        }
+      },
+      "required": [
+        "annotations"
+      ]
+    },
+    "few_shot_examples": [
+      {
+        "input": {
+          "texto": "El senador se convirtió en un Judas al traicionar a su partido."
+        },
+        "output": [
+          {
+            "spans": [
+              {
+                "uce_id": "uce_12",
+                "quote": "un Judas"
+              }
+            ],
+            "mythopoetic_type": "ImaginativeUniversal/Archetype",
+            "archetype_name": "Judas",
+            "cosmic_frame": "",
+            "confidence": "alta",
+            "reasoning": "Uso del nombre propio como arquetipo de traición."
+          }
+        ]
+      },
+      {
+        "input": {
+          "texto": "Esta elección es la batalla final por el alma de la nación."
+        },
+        "output": [
+          {
+            "spans": [
+              {
+                "uce_id": "uce_13",
+                "quote": "la batalla final por el alma de la nación"
+              }
+            ],
+            "mythopoetic_type": "CosmicNarrative",
+            "archetype_name": "",
+            "cosmic_frame": "Apocalipsis / Batalla final",
+            "confidence": "alta",
+            "reasoning": "Framing de evento político como lucha cósmica definitiva."
+          }
+        ]
+      }
+    ],
+    "gram_cats": [
+      "Verbos",
+      "Sustantivos",
+      "Adjetivos",
+      "Adverbios"
+    ],
+    "disc_cats": [
+      "juicios_valor",
+      "oposiciones"
+    ]
+  },
+  "dssf": {
+    "name": "dssf",
+    "role": "",
+    "instructions": "",
+    "json_schema": {
+      "type": "object",
+      "properties": {}
+    },
+    "few_shot_examples": [],
+    "gram_cats": [],
+    "disc_cats": []
+  }
+}

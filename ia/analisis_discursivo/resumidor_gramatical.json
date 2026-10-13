@@ -1,0 +1,234 @@
+{
+  "name": "grammatical_summarizer",
+  "role": "Lingüista computacional especializado en análisis gramatical profundo del español",
+  "instructions": "Analiza todos los datos gramaticales de la UCE y genera un resumen estructurado que incluya las siguientes secciones (todas ellas dentro del objeto JSON raíz, no solo en 'annotations'):\n\n1. 'summary': texto narrativo de máximo 300 palabras que sintetice los hallazgos más importantes.\n\n2. 'nouns': objeto con campos: predominant_types (lista de tipos semánticos: concreto, abstracto, propio, común), density (alta/media/baja), diversity (índice de diversidad léxica).\n\n3. 'verbs': objeto con: valency_profile (transitiva/intransitiva/ditransitiva/mixta), telicity (telica/atelica/mixta), voice_dominance (activa/pasiva/media/impersonal), tense_aspect_mood (resumen), subordination_ratio (alta/media/baja).\n\n4. 'adjectives': objeto con: gradation (positivo/comparativo/superlativo/mixto), function (calificativo/clasificatorio/mixto), evaluation (positivo/negativo/neutro).\n\n5. 'adverbs': objeto con: main_categories (lista de categorías más frecuentes: tiempo, lugar, modo, grado, etc.).\n\n6. 'pronouns': objeto con: types (lista de tipos: personales, reflexivos, demostrativos, etc.), pro_drop_ratio (alta/media/baja), enclitic_presence (sí/no).\n\n7. 'quantifiers': objeto con: main_types (universal, existencial, negativo, proporcional, numeral).\n\n8. 'discourse_markers': objeto con: functions (reformuladores, estructuradores, argumentativos, conversacionales).\n\n9. 'insubordinations': objeto con: types (exclamativa_jusiva, refutativa, advertencia) y funciones.\n\n10. 'coref_clusters': objeto con: main_entities (lista de los representantes más frecuentes), thematic_roles (agente/paciente/otros).\n\n11. 'predicate_clusters': objeto con: top_verbs (lista de lemas verbales más frecuentes), top_objects (objetos directos más frecuentes), cluster_diversity (alta/media/baja).\n\n12. 'lexicometrics': objeto con: ttr, lexical_density, sophistication (media de Zipf), hapax_ratio.\n\nAdemás, puedes incluir un array 'annotations' con métricas específicas si lo deseas, pero no es obligatorio. El objetivo es que el JSON resultante sea autocontenido y útil para los agentes discursivos.",
+  "json_schema": {
+    "type": "object",
+    "properties": {
+      "summary": { "type": "string" },
+      "nouns": {
+        "type": "object",
+        "properties": {
+          "predominant_types": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "density": { "type": "string", "enum": ["alta", "media", "baja"] },
+          "diversity": { "type": "string", "enum": ["alta", "media", "baja"] }
+        }
+      },
+      "verbs": {
+        "type": "object",
+        "properties": {
+          "valency_profile": {
+            "type": "string",
+            "enum": ["transitiva", "intransitiva", "ditransitiva", "mixta"]
+          },
+          "telicity": {
+            "type": "string",
+            "enum": ["telica", "atelica", "mixta"]
+          },
+          "voice_dominance": {
+            "type": "string",
+            "enum": ["activa", "pasiva", "media", "impersonal"]
+          },
+          "tense_aspect_mood": { "type": "string" },
+          "subordination_ratio": {
+            "type": "string",
+            "enum": ["alta", "media", "baja"]
+          }
+        }
+      },
+      "adjectives": {
+        "type": "object",
+        "properties": {
+          "gradation": {
+            "type": "string",
+            "enum": ["positivo", "comparativo", "superlativo", "mixto"]
+          },
+          "function": {
+            "type": "string",
+            "enum": ["calificativo", "clasificatorio", "mixto"]
+          },
+          "evaluation": {
+            "type": "string",
+            "enum": ["positivo", "negativo", "neutro"]
+          }
+        }
+      },
+      "adverbs": {
+        "type": "object",
+        "properties": {
+          "main_categories": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "pronouns": {
+        "type": "object",
+        "properties": {
+          "types": { "type": "array", "items": { "type": "string" } },
+          "pro_drop_ratio": {
+            "type": "string",
+            "enum": ["alta", "media", "baja"]
+          },
+          "enclitic_presence": { "type": "string", "enum": ["si", "no"] }
+        }
+      },
+      "quantifiers": {
+        "type": "object",
+        "properties": {
+          "main_types": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "discourse_markers": {
+        "type": "object",
+        "properties": {
+          "functions": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "insubordinations": {
+        "type": "object",
+        "properties": {
+          "types": { "type": "array", "items": { "type": "string" } },
+          "functions": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "coref_clusters": {
+        "type": "object",
+        "properties": {
+          "main_entities": { "type": "array", "items": { "type": "string" } },
+          "thematic_roles": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "predicate_clusters": {
+        "type": "object",
+        "properties": {
+          "top_verbs": { "type": "array", "items": { "type": "string" } },
+          "top_objects": { "type": "array", "items": { "type": "string" } },
+          "cluster_diversity": {
+            "type": "string",
+            "enum": ["alta", "media", "baja"]
+          }
+        }
+      },
+      "lexicometrics": {
+        "type": "object",
+        "properties": {
+          "ttr": { "type": "number" },
+          "lexical_density": { "type": "number" },
+          "sophistication": { "type": "number" },
+          "hapax_ratio": { "type": "number" }
+        }
+      },
+      "annotations": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "category": { "type": "string" },
+            "quote": { "type": "string" },
+            "confidence": {
+              "type": "string",
+              "enum": ["alta", "media", "baja"]
+            }
+          }
+        }
+      }
+    },
+    "required": [
+      "summary",
+      "nouns",
+      "verbs",
+      "adjectives",
+      "adverbs",
+      "pronouns",
+      "quantifiers",
+      "discourse_markers",
+      "insubordinations",
+      "coref_clusters",
+      "predicate_clusters",
+      "lexicometrics"
+    ]
+  },
+  "few_shot_examples": [
+    {
+      "input": {
+        "texto": "El gobierno anunció ayer nuevas medidas. Los ciudadanos las recibieron con escepticismo.",
+        "verbos": [
+          {
+            "lema": "anunciar",
+            "valencia": { "obj": 1 },
+            "voz": "activa",
+            "tiempo": "past"
+          }
+        ],
+        "sustantivos": [
+          { "lema": "gobierno" },
+          { "lema": "medidas" },
+          { "lema": "ciudadanos" },
+          { "lema": "escepticismo" }
+        ],
+        "adjetivos": [{ "lema": "nuevas" }],
+        "adverbios": [{ "texto": "ayer", "categoria": "tiempo" }],
+        "pronombres": [{ "texto": "las", "subtipo": "PRONOMBRE_ACUSATIVO" }],
+        "cuantificadores": [],
+        "marcadores_discursivos": [],
+        "insubordinaciones": [],
+        "coref_chains": [
+          { "representative": "gobierno" },
+          { "representative": "medidas" }
+        ],
+        "predicate_frames": [
+          { "verb_lemma": "anunciar", "direct_object": "medidas" }
+        ]
+      },
+      "output": {
+        "summary": "La UCE presenta verbos de valencia transitiva (anunciar), predominio de voz activa y tiempo pasado. Los sustantivos son mayoritariamente concretos (gobierno, medidas) con un abstracto (escepticismo). Adjetivo calificativo 'nuevas'. Adverbio de tiempo 'ayer'. Pronombre acusativo 'las' que retoma 'medidas'. Correferencias claras. Léxicamente diverso.",
+        "nouns": {
+          "predominant_types": ["concreto", "abstracto"],
+          "density": "media",
+          "diversity": "alta"
+        },
+        "verbs": {
+          "valency_profile": "transitiva",
+          "telicity": "atelica",
+          "voice_dominance": "activa",
+          "tense_aspect_mood": "pasado perfectivo",
+          "subordination_ratio": "baja"
+        },
+        "adjectives": {
+          "gradation": "positivo",
+          "function": "calificativo",
+          "evaluation": "neutro"
+        },
+        "adverbs": { "main_categories": ["tiempo"] },
+        "pronouns": {
+          "types": ["acusativo"],
+          "pro_drop_ratio": "baja",
+          "enclitic_presence": "no"
+        },
+        "quantifiers": { "main_types": [] },
+        "discourse_markers": { "functions": [] },
+        "insubordinations": { "types": [], "functions": [] },
+        "coref_clusters": {
+          "main_entities": ["gobierno", "medidas"],
+          "thematic_roles": ["agente", "paciente"]
+        },
+        "predicate_clusters": {
+          "top_verbs": ["anunciar"],
+          "top_objects": ["medidas"],
+          "cluster_diversity": "baja"
+        },
+        "lexicometrics": {
+          "ttr": 0.85,
+          "lexical_density": 0.6,
+          "sophistication": 5.2,
+          "hapax_ratio": 0.3
+        },
+        "annotations": []
+      }
+    }
+  ]
+}

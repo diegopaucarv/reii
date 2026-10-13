@@ -1659,19 +1659,18 @@ def _resolve_quote_in_text(
 # Persistencia de estado
 # ─────────────────────────────────────────────
 def _load_state(path: Path) -> Dict:
-    if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    # El estado vive ahora en PostgreSQL; ``path`` se conserva por compatibilidad.
+    from reii.pipelines import discourse_store
+
+    return discourse_store.load_state()
 
 
 def _save_state(path: Path, state: Dict):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # structured_grammar may still contain Counter / set — serialise first
-    serialisable = _counter_to_serialisable(state)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(serialisable, f, indent=2, ensure_ascii=False)
-    print(f"💾 Estado guardado en {path}")
+    # El estado vive ahora en PostgreSQL; ``path`` se conserva por compatibilidad.
+    from reii.pipelines import discourse_store
+
+    discourse_store.save_state(state)
+    print("💾 Estado guardado en PostgreSQL")
 
 
 # ─────────────────────────────────────────────
@@ -1686,6 +1685,7 @@ class DebugOrchestrator:
         workflow_config_paths: List[str],
         workflow_data_path: str,
         state_path: str = str(STATE_FILE),
+        raw_data: Optional[Dict] = None,
     ):
         self.state_path = Path(state_path)
         print("📚 Cargando configuraciones…")
@@ -1693,8 +1693,13 @@ class DebugOrchestrator:
         with open(grammar_config_path, "r", encoding="utf-8") as f:
             self.grammar_summarizer = GlobalGrammaticalSummarizer(json.load(f))
 
-        with open(workflow_data_path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
+        if raw_data is not None:
+            # Entrada ya construida en memoria (p. ej. desde PostgreSQL); se
+            # evita leer/generar el JSON intermedio ``discourse_input.json``.
+            raw = raw_data
+        else:
+            with open(workflow_data_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
 
         raw_uces = raw.get("uces", [])
         for d in raw_uces:
@@ -2021,6 +2026,42 @@ class DebugOrchestrator:
             state["last_workflow"] = workflow
         _save_state(self.state_path, state)
 
+    def save_checkpoint(self, name: str) -> int:
+        """Guarda un checkpoint con el estado actual y devuelve su ``checkpoint_id``."""
+        from reii.pipelines import discourse_store
+
+        state: Dict[str, Any] = {
+            "grammar_summary": self.global_grammar_summary,
+            "structured_grammar": _safe_truncate_dict(
+                _counter_to_serialisable(self.global_structured_grammar),
+                max_list_items=20,
+            ),
+            "annotations_by_uce": {u.id: u.discourse_annotations for u in self.uces},
+        }
+        return discourse_store.save_checkpoint(name, state)
+
+    def restore_checkpoint(self, checkpoint_id: int) -> None:
+        """Restaura un checkpoint: resumen gramatical, estructura y anotaciones por UCE."""
+        from reii.pipelines import discourse_store
+
+        state = discourse_store.restore_checkpoint(checkpoint_id)
+        if not state:
+            print(f"⚠️  No existe el checkpoint {checkpoint_id}.")
+            return
+        if "grammar_summary" in state and "structured_grammar" in state:
+            self.global_grammar_summary = state["grammar_summary"]
+            raw_sg = state.get("structured_grammar", {})
+            self.global_structured_grammar = self._rehydrate_structured_grammar(raw_sg)
+        if "annotations_by_uce" in state:
+            loaded = 0
+            for uce in self.uces:
+                saved = state["annotations_by_uce"].get(uce.id, [])
+                uce.discourse_annotations = saved
+                loaded += len(saved)
+            print(
+                f"📂 {loaded} anotaciones restauradas desde el checkpoint {checkpoint_id}"
+            )
+
     # ── public API ────────────────────────────────────────────────────────
     def run_discourse_agent(
         self,
@@ -2273,11 +2314,15 @@ if __name__ == "__main__":
         and f != os.path.basename(GRAMMAR_CONFIG_PATH)
         and not f.startswith("_")
     ]
+    from reii.backend.dashboard_adapter import DashboardAdapter
+    from reii.pipelines.discourse_db import build_discourse_input
+
     mon = DebugOrchestrator(
         grammar_config_path=GRAMMAR_CONFIG_PATH,
         workflow_config_paths=workflow_paths,
-        workflow_data_path=WORKFLOW_DB_PATH,
+        workflow_data_path="",
         state_path=DISCOURSE_STATE_PATH,
+        raw_data=build_discourse_input(DashboardAdapter()),
     )
 
     mon.list_agents()

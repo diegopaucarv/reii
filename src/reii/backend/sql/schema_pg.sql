@@ -207,6 +207,24 @@ SELECT
 FROM uces u
 JOIN documents d ON d.doc_id = u.doc_id;
 
+-- ── discourse state (single row, JSON blob) ────────────────────────────────
+CREATE TABLE IF NOT EXISTS discourse_state (
+    id          INTEGER PRIMARY KEY DEFAULT 1,
+    state_json  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ── discourse checkpoints ─────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS discourse_checkpoints (
+    checkpoint_id  BIGSERIAL PRIMARY KEY,
+    name           TEXT NOT NULL,
+    state_json     TEXT NOT NULL,
+    created_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_discourse_checkpoints_created
+    ON discourse_checkpoints(created_at);
+
 -- ── schema version ─────────────────────────────────────────────────────────
 INSERT INTO _schema_version (version, applied_at) VALUES (1, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING;
 INSERT INTO _schema_version (version, applied_at) VALUES (2, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING;
+INSERT INTO _schema_version (version, applied_at) VALUES (3, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING;

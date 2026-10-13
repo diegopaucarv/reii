@@ -96,23 +96,22 @@ _BATCH_MAX_WORKERS = 4
 def _discourse_runner(
     log: List[str],
     state: Dict[str, Any],
-    workflow_file: str,
     store: bool,
     workflow: Optional[str],
     force: bool = False,
     source: str = "db",  # [pipeline-patch] d2
     agents: Optional[List[str]] = None,
+    progress: Optional[Dict[str, Any]] = None,
+    stop_flag: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Ejecuta un workflow de análisis de discurso en un hilo en segundo plano.
+    """Ejecuta agentes de análisis de discurso en un hilo en segundo plano.
 
     ``DebugOrchestrator`` es pesado (carga ``workflow_data.json`` ~56MB y
     construye el resumen gramatical), así que se corre en un hilo para no
     bloquear la UI. La salida ``print`` del agente se captura línea a línea
     en ``log`` para mostrarla en vivo.
 
-    Si ``agents`` se proporciona, ejecuta únicamente esos agentes (uno por
-    uno) vía ``run_discourse_agent``; en caso contrario ejecuta el workflow
-    completo ``workflow_file`` con ``run_workflow``.
+    Ejecuta los agentes de ``agents`` (uno por uno) vía ``run_discourse_agent``.
     """
     import contextlib
 
@@ -120,7 +119,6 @@ def _discourse_runner(
         DISCOURSE_STATE_PATH,
         GRAMMAR_CONFIG_PATH,
         IA_DIR,
-        WORKFLOW_DB_PATH,
     )
     from reii.ia_config_editor import list_workflow_files
     from reii.ia_discursiva import DebugOrchestrator
@@ -147,25 +145,49 @@ def _discourse_runner(
     try:
         with contextlib.redirect_stdout(stream):
             workflow_paths = [str(DISCOURSE_DIR / f) for f in list_workflow_files()]
-            from reii.pipelines.runtime import prepare_discourse_input, sync_after_run
+            # La entrada del análisis se lee directo de PostgreSQL (sin
+            # generar el JSON intermedio ``discourse_input.json``).
+            from reii.backend.dashboard_adapter import DashboardAdapter
+            from reii.pipelines.discourse_db import build_discourse_input
+            from reii.pipelines.runtime import sync_after_run
 
-            _q_input = prepare_discourse_input(source, WORKFLOW_DB_PATH)
+            _raw = build_discourse_input(DashboardAdapter())
+            _total = len(_raw.get("uces", []))
             mon = DebugOrchestrator(
                 grammar_config_path=GRAMMAR_CONFIG_PATH,
                 workflow_config_paths=workflow_paths,
-                workflow_data_path=_q_input,
+                workflow_data_path="",
                 state_path=DISCOURSE_STATE_PATH,
+                raw_data=_raw,
             )
             if agents:
                 for _agent_name in agents:
+                    if stop_flag and stop_flag.get("stop"):
+                        log.append("⏹ Ejecución detenida por el usuario.")
+                        break
                     log.append(f"▶ Ejecutando agente: {_agent_name}")
-                    mon.run_discourse_agent(
-                        _agent_name, store=store, workflow=workflow, force=force
-                    )
-            else:
-                mon.run_workflow(
-                    workflow_file, store=store, workflow=workflow, force=force
-                )
+                    if progress is not None:
+                        try:
+                            progress[_agent_name] = {
+                                "running": True,
+                                "done": 0,
+                                "total": _total,
+                            }
+                        except Exception:
+                            pass
+                    try:
+                        mon.run_discourse_agent(
+                            _agent_name, store=store, workflow=workflow, force=force
+                        )
+                    finally:
+                        if progress is not None:
+                            try:
+                                progress[_agent_name]["running"] = False
+                                progress[_agent_name]["done"] = progress[
+                                    _agent_name
+                                ].get("total", 0)
+                            except Exception:
+                                pass
             try:
                 sync_after_run(DISCOURSE_STATE_PATH)
             except Exception as _qe:
@@ -178,6 +200,29 @@ def _discourse_runner(
     finally:
         state["running"] = False
         state["finished"] = True
+
+
+def _count_input_uces(path: str) -> int:
+    """Cuenta las UCEs del JSON de entrada del análisis (defensivo).
+
+    Devuelve 0 si el archivo no existe o no tiene un formato reconocible, para
+    que la barra de progreso por agente se muestre como "sin progreso" en vez de
+    romper la ejecución.
+    """
+    try:
+        import json as _json
+
+        with open(path, encoding="utf-8") as _f:
+            _data = _json.load(_f)
+        if isinstance(_data, list):
+            return len(_data)
+        if isinstance(_data, dict):
+            for _k in ("uces", "data", "items"):
+                if isinstance(_data.get(_k), list):
+                    return len(_data[_k])
+        return 0
+    except Exception:
+        return 0
 
 
 import re as _re
@@ -13917,6 +13962,23 @@ def _render_tab_e():
 
 
 @st.fragment
+def _discourse_run_opts() -> Dict[str, Any]:
+    """Opciones elegidas en la pestaña del hub (fuente, guardar, re-procesar).
+
+    Antes, los botones de ejecutar un agente / varios / todos dentro de esta
+    pestaña ignoraban esas opciones y corrían siempre con force=False y
+    source="db" sin importar lo que el usuario eligiera arriba. Si la pestaña
+    del hub todavía no se renderizó en esta sesión, usa los mismos valores por
+    defecto que sus propios widgets.
+    """
+    opts = st.session_state.get("hub_discourse_options") or {}
+    return {
+        "store": opts.get("store", True),
+        "force": opts.get("force", False),
+        "source": opts.get("source", "db"),
+    }
+
+
 def _render_tab_e_crud():
     # ── CRUD: editor de configuración de agentes IA ──
     st.divider()
@@ -13988,15 +14050,13 @@ def _render_tab_e_crud():
 
     _agent_names = [_e["name"] for _e in _ordered]
 
-    # Cabecera: multiselect + ejecutar todos / seleccionados.
-    _h1, _h2, _h3 = st.columns([3, 2, 2])
+    # Cabecera: multiselect + ejecutar todos / seleccionados / detener / eliminar.
+    _h1, _h2, _h3, _h4, _h5 = st.columns([3, 2, 2, 1, 2])
     with _h1:
         st.multiselect("Seleccionar agentes", _agent_names, key="ia_sel_agents")
     with _h2:
         if st.button("▶ Ejecutar todos", key="ia_run_all", width="stretch"):
-            _pipeline_start_discourse_agents(
-                _agent_names, store=True, force=False, source="db"
-            )
+            _pipeline_start_discourse_agents(_agent_names, **_discourse_run_opts())
     with _h3:
         _n_sel = len(ss.get("ia_sel_agents", []))
         if st.button(
@@ -14006,11 +14066,24 @@ def _render_tab_e_crud():
             disabled=(_n_sel == 0),
         ):
             _pipeline_start_discourse_agents(
-                list(ss.get("ia_sel_agents", [])),
-                store=True,
-                force=False,
-                source="db",
+                list(ss.get("ia_sel_agents", [])), **_discourse_run_opts()
             )
+    with _h4:
+        if st.button("⏹ Detener", key="ia_stop_all", width="stretch"):
+            ss.setdefault("discourse_stop", {})["stop"] = True
+    with _h5:
+        if st.button(
+            f"🗑️ Eliminar seleccionados ({_n_sel})",
+            key="ia_del_sel",
+            width="stretch",
+            disabled=(_n_sel == 0),
+        ):
+            for _sel in list(ss.get("ia_sel_agents", [])):
+                _e = _by_name.get(_sel)
+                if _e:
+                    delete_agent_from_source(_sel, _e["source"])
+            st.success("Agentes seleccionados eliminados.")
+            st.rerun()
 
     for _entry in _ordered:
         _name = _entry["name"]
@@ -14019,72 +14092,95 @@ def _render_tab_e_crud():
         _k = _sanitize_key(_name)
         _count = agent_executed_count(_name)
         _is_grammar = _source == os.path.basename(GRAMMAR_CONFIG_PATH)
-        with st.expander(f"🤖 {_name}", expanded=False):
-            if _count > 0:
-                st.markdown(
-                    f"<span style='color:green'>✓ ejecutado · {_count} UCEs</span>",
-                    unsafe_allow_html=True,
+        # Estado de ejecución por agente: lo actualiza el runner en
+        # ss["discourse_progress"][_name] (running/done/total). Es más robusto
+        # que el flag global discourse_state.running porque permite cancelar y
+        # mostrar progreso agente por agente.
+        _prog = ss.get("discourse_progress", {}).get(_name, {})
+        _running_agent = bool(_prog.get("running"))
+        with st.container(border=True):
+            _r1, _r2, _r3, _r4, _r5 = st.columns([1, 3, 2, 2, 1])
+            with _r1:
+                st.checkbox(
+                    "",
+                    key=f"ia_sel_{_k}",
+                    label_visibility="collapsed",
+                    help=f"Incluir `{_name}` en la selección",
                 )
-            else:
-                st.markdown(
-                    "<span style='color:gray'>— no ejecutado</span>",
-                    unsafe_allow_html=True,
-                )
-            st.caption(f"Fuente: `{_source}`")
-            st.text_input(
-                "Nombre",
-                value=_agent.get("name", _name),
-                key=f"ia_ag_{_k}_name",
-            )
-            st.text_input("Rol", value=_agent.get("role", ""), key=f"ia_ag_{_k}_role")
-            st.text_area(
-                "Instrucciones",
-                value=_agent.get("instructions", ""),
-                key=f"ia_ag_{_k}_instructions",
-                height=120,
-            )
-            st.text_area(
-                "json_schema (JSON)",
-                value=to_json_text(_agent.get("json_schema", {})),
-                key=f"ia_ag_{_k}_json_schema",
-                height=120,
-            )
-            st.text_area(
-                "few_shot_examples (JSON)",
-                value=to_json_text(_agent.get("few_shot_examples", [])),
-                key=f"ia_ag_{_k}_few_shot",
-                height=120,
-            )
-            st.text_input(
-                "Categorías gramaticales (separadas por coma)",
-                value=to_list_text(_agent.get("gram_cats", [])),
-                key=f"ia_ag_{_k}_gram_cats",
-            )
-            st.text_input(
-                "Categorías discursivas (separadas por coma)",
-                value=to_list_text(_agent.get("disc_cats", [])),
-                key=f"ia_ag_{_k}_disc_cats",
-            )
-            _c1, _c2, _c3 = st.columns(3)
-            with _c1:
-                if st.button("💾 Guardar", key=f"ia_ag_{_k}_save", width="stretch"):
-                    _save_agent_unified(_entry)
-            with _c2:
-                _run_label = "▶ Ejecutar" if _count == 0 else "🔄 Re-ejecutar"
-                if st.button(_run_label, key=f"ia_ag_{_k}_run", width="stretch"):
-                    _pipeline_start_discourse_agent(
-                        _name, store=True, force=False, source="db"
-                    )
-            with _c3:
+            with _r2:
+                st.markdown(f"**🤖 {_name}**")
+                if _count > 0:
+                    st.caption(f"✓ ejecutado · {_count} UCEs · Fuente: `{_source}`")
+                else:
+                    st.caption(f"— no ejecutado · Fuente: `{_source}`")
+            with _r3:
+                _done = _prog.get("done", 0)
+                _total = _prog.get("total", 0)
+                if _total:
+                    st.progress(min(1.0, _done / _total))
+                    st.caption(f"{_done}/{_total} UCEs")
+                else:
+                    st.caption("— sin progreso —")
+            with _r4:
+                if _running_agent:
+                    if st.button(
+                        "⏹ Cancelar", key=f"ia_ag_{_k}_cancel", width="stretch"
+                    ):
+                        ss.setdefault("discourse_stop", {})["stop"] = True
+                else:
+                    _run_label = "▶ Ejecutar" if _count == 0 else "🔄 Re-ejecutar"
+                    if st.button(_run_label, key=f"ia_ag_{_k}_run", width="stretch"):
+                        _pipeline_start_discourse_agent(_name, **_discourse_run_opts())
+            with _r5:
                 if st.button(
-                    "🗑️ Eliminar",
+                    "🗑️",
                     key=f"ia_ag_{_k}_del",
                     width="stretch",
                     disabled=_is_grammar,
+                    help="Eliminar agente",
                 ):
                     if delete_agent_from_source(_name, _source):
                         st.success(f"Agente `{_name}` eliminado.")
                         st.rerun()
+            with st.expander("⚙️ Configuración", expanded=False):
+                st.text_input(
+                    "Nombre",
+                    value=_agent.get("name", _name),
+                    key=f"ia_ag_{_k}_name",
+                )
+                st.text_input(
+                    "Rol", value=_agent.get("role", ""), key=f"ia_ag_{_k}_role"
+                )
+                st.text_area(
+                    "Instrucciones",
+                    value=_agent.get("instructions", ""),
+                    key=f"ia_ag_{_k}_instructions",
+                    height=120,
+                )
+                st.text_area(
+                    "json_schema (JSON)",
+                    value=to_json_text(_agent.get("json_schema", {})),
+                    key=f"ia_ag_{_k}_json_schema",
+                    height=120,
+                )
+                st.text_area(
+                    "few_shot_examples (JSON)",
+                    value=to_json_text(_agent.get("few_shot_examples", [])),
+                    key=f"ia_ag_{_k}_few_shot",
+                    height=120,
+                )
+                st.text_input(
+                    "Categorías gramaticales (separadas por coma)",
+                    value=to_list_text(_agent.get("gram_cats", [])),
+                    key=f"ia_ag_{_k}_gram_cats",
+                )
+                st.text_input(
+                    "Categorías discursivas (separadas por coma)",
+                    value=to_list_text(_agent.get("disc_cats", [])),
+                    key=f"ia_ag_{_k}_disc_cats",
+                )
+                if st.button("💾 Guardar", key=f"ia_ag_{_k}_save", width="stretch"):
+                    _save_agent_unified(_entry)
 
     st.subheader("➕ Nuevo agente")
     st.text_input("Nombre del nuevo agente", key="ia_new_agent_name")
@@ -14158,32 +14254,6 @@ def _pipeline_start_workflow(params):
     ).start()
 
 
-def _pipeline_start_discourse(wf_file, store, workflow, force, source):
-    ss = st.session_state
-    ss.setdefault(
-        "discourse_state",
-        {"running": False, "finished": False, "exit_code": None, "refreshed": False},
-    )
-    ss.discourse_log = []
-    ss.discourse_state.update(
-        running=True, finished=False, exit_code=None, refreshed=False
-    )
-    _pipeline_status_cached.clear()
-    threading.Thread(
-        target=_discourse_runner,
-        args=(
-            ss.discourse_log,
-            ss.discourse_state,
-            wf_file,
-            store,
-            workflow,
-            force,
-            source,
-        ),
-        daemon=True,
-    ).start()
-
-
 def _pipeline_start_discourse_agent(agent_name, store, force, source):
     """Inicia la ejecución de UN solo agente en un hilo en segundo plano."""
     ss = st.session_state
@@ -14191,23 +14261,29 @@ def _pipeline_start_discourse_agent(agent_name, store, force, source):
         "discourse_state",
         {"running": False, "finished": False, "exit_code": None, "refreshed": False},
     )
+    ss.setdefault("discourse_progress", {})
+    ss.setdefault("discourse_stop", {})
     ss.discourse_log = []
     ss.discourse_state.update(
         running=True, finished=False, exit_code=None, refreshed=False
     )
+    ss.discourse_stop["stop"] = False
     _pipeline_status_cached.clear()
     threading.Thread(
         target=_discourse_runner,
         args=(
             ss.discourse_log,
             ss.discourse_state,
-            None,
             store,
             None,
             force,
             source,
         ),
-        kwargs={"agents": [agent_name]},
+        kwargs={
+            "agents": [agent_name],
+            "progress": ss.discourse_progress,
+            "stop_flag": ss.discourse_stop,
+        },
         daemon=True,
     ).start()
 
@@ -14219,23 +14295,29 @@ def _pipeline_start_discourse_agents(agent_names, store, force, source):
         "discourse_state",
         {"running": False, "finished": False, "exit_code": None, "refreshed": False},
     )
+    ss.setdefault("discourse_progress", {})
+    ss.setdefault("discourse_stop", {})
     ss.discourse_log = []
     ss.discourse_state.update(
         running=True, finished=False, exit_code=None, refreshed=False
     )
+    ss.discourse_stop["stop"] = False
     _pipeline_status_cached.clear()
     threading.Thread(
         target=_discourse_runner,
         args=(
             ss.discourse_log,
             ss.discourse_state,
-            None,
             store,
             None,
             force,
             source,
         ),
-        kwargs={"agents": list(agent_names)},
+        kwargs={
+            "agents": list(agent_names),
+            "progress": ss.discourse_progress,
+            "stop_flag": ss.discourse_stop,
+        },
         daemon=True,
     ).start()
 
@@ -14243,13 +14325,6 @@ def _pipeline_start_discourse_agents(agent_names, store, force, source):
 def _render_pipeline_hub():
     from reii.backend.config_store import CONFIG_CATEGORIES, ConfigStore
     from reii.config import WORKFLOW_CONFIG_PATH
-    from reii.ia_config_editor import (
-        get_workflow_agents,
-        list_workflow_files,
-        load_discourse_state_progress,
-        load_workflow_names,
-        save_workflow_names,
-    )
     from reii.pipelines import config_sync
     from reii.pipelines.hub_tab import HubContext, render_pipeline_hub
 
@@ -14278,30 +14353,6 @@ def _render_pipeline_hub():
             store.reset(k)
         _pipeline_status_cached.clear()
 
-    def _workflows():
-        total, by_agent = load_discourse_state_progress()
-        names = load_workflow_names()
-        out = []
-        for f in list_workflow_files():
-            agents = get_workflow_agents(f)
-            done = sum(by_agent.get(a, 0) for a in agents)
-            out.append(
-                {
-                    "file": f,
-                    "name": names.get(f, f),
-                    "agents": agents,
-                    "progress": min(1.0, done / (len(agents) * total))
-                    if total and agents
-                    else 0.0,
-                }
-            )
-        return out
-
-    def _rename(f, n):
-        names = load_workflow_names()
-        names[f] = n
-        save_workflow_names(names)
-
     from reii.pipelines.transcripciones import (
         render_entrevistas_prompts,
         render_transcripciones,
@@ -14316,9 +14367,6 @@ def _render_pipeline_hub():
             save_config=_save,
             reset_config=_reset,
             start_workflow=_pipeline_start_workflow,
-            list_workflows=_workflows,
-            rename_workflow=_rename,
-            start_discourse=_pipeline_start_discourse,
             run_fix=_pipeline_run_fix,
             render_agents_crud=_render_tab_e_crud,
             render_transcripciones=render_transcripciones,

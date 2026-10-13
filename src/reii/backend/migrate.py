@@ -497,17 +497,17 @@ def migrate_annotations(
     """
     ann_by_uce = data.get("annotations_by_uce") or {}
     if not ann_by_uce:
-        # Fallback: discourse_state.json (fuente real de las anotaciones).
+        # Fallback: el estado del discurso vive en PostgreSQL (discourse_store),
+        # ya no en discourse_state.json.
         try:
-            from reii.config import DISCOURSE_STATE_PATH
+            from reii.pipelines import discourse_store
 
-            _disc_path = Path(DISCOURSE_STATE_PATH)
-            if _disc_path.exists():
-                with open(_disc_path, "r", encoding="utf-8") as f:
-                    _disc = json.load(f)
-                ann_by_uce = _disc.get("annotations_by_uce") or {}
+            _disc = discourse_store.load_state()
+            ann_by_uce = _disc.get("annotations_by_uce") or {}
         except Exception as e:
-            logger.warning("No se pudo leer discourse_state.json: %s", e)
+            logger.warning(
+                "No se pudo leer el estado del discurso desde PostgreSQL: %s", e
+            )
     if not ann_by_uce:
         logger.info("annotations: no hay datos en el JSON")
         return 0
@@ -697,6 +697,15 @@ def migrate_kv(conn: psycopg.Connection, data: Dict, dry_run: bool = False) -> i
         "metadata_analysis",
         "section_registry",
         "origen_index",
+        "afc_result",
+        "cah_terminos",
+        "inter_class_semantic_distances",
+        "latent_vocabulary_profiles",
+        "narrative_trajectories",
+        "soft_class_membership",
+        "texto_completo_por_origen",
+        "uce_entropy",
+        "vocabulario",
     )
     present = {k: data[k] for k in KV_KEYS if k in data}
     if dry_run:
