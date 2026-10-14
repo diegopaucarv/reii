@@ -175,8 +175,16 @@ ROOTS_BATCH_SIZE: int = int(
     os.environ.get("REII_ROOTS_BATCH_SIZE", "32")
 )  # <=1: sin lotes
 # COREF: ventanas de coref por lote en ``_extract_global_chains`` (bulk_process).
-# <=1: sin lotes (una ventana por llamada, comportamiento anterior).
-COREF_BATCH_SIZE: int = int(os.environ.get("REII_COREF_BATCH_SIZE", "16"))
+#
+# ⚠ NO usar lotes (>1). Stanza's ``CorefProcessor`` hereda ``UDProcessor.bulk_process``,
+# que COMBINA todas las oraciones de todos los documentos en un único ``combined_doc``,
+# resuelve coref a través de TODAS las sub-ventanas (rompe la ventana limitada de
+# ``context_units`` UCEs) y devuelve los documentos originales con ``coref`` VACÍO
+# (las cadenas quedan en ``combined_doc``, que se descarta). Resultado: cadenas
+# perdidas + coref cruzando límites de ventana. Por eso el default es 1.
+#
+# <=1: sin lotes (una ventana por llamada, comportamiento correcto).
+COREF_BATCH_SIZE: int = int(os.environ.get("REII_COREF_BATCH_SIZE", "1"))
 
 # ---------------------------------------------------------------------------
 # Stanza remoto (servidor FastAPI en Colab): si STANZA_SERVER_URL está definido,

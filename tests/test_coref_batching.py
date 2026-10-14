@@ -215,6 +215,34 @@ def test_batch_size_one_uses_single_calls():
     assert sum(c[0] == "single" for c in pipe.calls) == 5
 
 
+# ── 2b. Aviso cuando se fuerza batching (>1): Stanza coref bulk_process ─────
+# combina sub-ventanas en un único documento (rompe la ventana y pierde cadenas).
+def test_warns_when_batch_size_gt_one(caplog):
+    import logging
+
+    texts = ["Ana vino", "Luis fue"]
+    segs, full = make_segments(texts)
+    pipe = FakeCorefPipe()
+    with caplog.at_level(logging.WARNING):
+        make_ps(pipe)._extract_global_chains(
+            segs, full, context_units=2, coref_batch_size=2
+        )
+    assert any("bulk_process combina" in r.message for r in caplog.records)
+
+
+def test_no_warning_when_batch_size_one(caplog):
+    import logging
+
+    texts = ["Ana vino", "Luis fue"]
+    segs, full = make_segments(texts)
+    pipe = FakeCorefPipe()
+    with caplog.at_level(logging.WARNING):
+        make_ps(pipe)._extract_global_chains(
+            segs, full, context_units=2, coref_batch_size=1
+        )
+    assert not any("bulk_process combina" in r.message for r in caplog.records)
+
+
 # ── 3. Fallback a una-a-una ante fallos de bulk ──────────────────────────────
 def test_fallback_when_bulk_raises():
     texts = ["Ana vino", "Luis fue", "María habló", "Pedro llegó"]

@@ -736,8 +736,14 @@ class ProgressiveSegmenter:
         Sliding window coreference extraction with:
           - Debug prints at every stage
           - Chain deduplication by mention-span fingerprint (FIX for duplicate merges)
-          - Batching: candidate sub-windows are processed in bulk via ``bulk_process``
-            (falls back to one-at-a-time if a batch fails).
+
+        NOTA (batching): ``bulk_process`` NO es válido para coref. Stanza's
+        ``CorefProcessor`` hereda ``UDProcessor.bulk_process``, que combina todas
+        las oraciones de todos los documentos en un único ``combined_doc``, resuelve
+        coref a través de TODAS las sub-ventanas (rompe la ventana limitada) y
+        devuelve los documentos originales con ``coref`` VACÍO. Por eso el default
+        es ``coref_batch_size=1`` (una sub-ventana por llamada). Si se fuerza
+        ``>1`` se emite un warning y se procesa igualmente (bajo tu propio riesgo).
         """
         global_chains = []
         # FIX: track chain fingerprints to avoid adding the same chain from overlapping windows
@@ -757,6 +763,14 @@ class ProgressiveSegmenter:
             return global_chains
 
         _bs = COREF_BATCH_SIZE if coref_batch_size is None else int(coref_batch_size)
+
+        if _bs > 1:
+            logging.warning(
+                "REII_COREF_BATCH_SIZE=%d > 1: Stanza coref bulk_process combina "
+                "sub-ventanas en un único documento (rompe la ventana limitada y "
+                "pierde cadenas). Se recomienda REII_COREF_BATCH_SIZE=1.",
+                _bs,
+            )
 
         # ── Pass 1: collect candidate sub-windows (windowing + candidate filter) ──
         pending = []  # list of (sub_text, sub_start)
