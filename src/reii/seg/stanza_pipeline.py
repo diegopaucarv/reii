@@ -67,5 +67,5 @@ def build_stanza_pipeline(
                 )
     except Exception as e:
         print(f"[COREF] ✗ Error cargando Stanza: {e}. Correferencias deshabilitadas.")
-        logger.warning("Error cargando Stanza: %s", e)
+        logger.exception("Error cargando Stanza (coref deshabilitado)")
     return None

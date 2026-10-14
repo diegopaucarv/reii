@@ -6,6 +6,7 @@ from typing import Optional
 
 import hnswlib
 import numpy as np
+import requests
 import spacy
 import stanza
 import torch
@@ -717,13 +718,17 @@ class ProgressiveSegmenter:
         devuelve los documentos originales con ``coref`` VACÍO. Por eso el default
         es ``coref_batch_size=1`` (una sub-ventana por llamada). Si se fuerza
         ``>1`` se emite un warning y se procesa igualmente (bajo tu propio riesgo).
+
+        Modo remoto: si ``STANZA_SERVER_URL`` está definido, las sub-ventanas se
+        envían a ``/v1/extract_coref`` y el servidor las procesa UNA A UNA (nunca
+        ``bulk_process``), respetando la ventana limitada. El pipeline local no se
+        carga salvo que el fallback a local lo requiera.
         """
         global_chains = []
         # FIX: track chain fingerprints to avoid adding the same chain from overlapping windows
         seen_chain_keys = set()
 
         buffer = []
-        stanza_pipe = self.get_stanza()
 
         total_uces = len(segments_info)
         self._dprint(
@@ -731,19 +736,21 @@ class ProgressiveSegmenter:
             f"(ventana deslizante de {context_units} UCEs)."
         )
 
-        if stanza_pipe is None:
-            self._dprint("✗ Stanza no disponible — saltando extracción de cadenas.")
-            return global_chains
-
         _bs = COREF_BATCH_SIZE if coref_batch_size is None else int(coref_batch_size)
 
-        if _bs > 1:
+        if _bs > 1 and not STANZA_SERVER_URL:
             logging.warning(
                 "REII_COREF_BATCH_SIZE=%d > 1: Stanza coref bulk_process combina "
                 "sub-ventanas en un único documento (rompe la ventana limitada y "
                 "pierde cadenas). Se recomienda REII_COREF_BATCH_SIZE=1.",
                 _bs,
             )
+
+        if not STANZA_SERVER_URL:
+            stanza_pipe = self.get_stanza()
+            if stanza_pipe is None:
+                self._dprint("✗ Stanza no disponible — saltando extracción de cadenas.")
+                return global_chains
 
         # ── Pass 1: collect candidate sub-windows (windowing + candidate filter) ──
         pending = []  # list of (sub_text, sub_start)
@@ -796,7 +803,11 @@ class ProgressiveSegmenter:
                 pending.append((sub_text, sub_start))
 
         # ── Pass 2: batch process candidate sub-windows ──
-        if _bs > 1:
+        if STANZA_SERVER_URL:
+            # Modo remoto: el servidor procesa cada sub-ventana individualmente
+            # (nunca bulk_process), respetando la ventana limitada.
+            self._extract_coref_remote(pending, seen_chain_keys, global_chains)
+        elif _bs > 1:
             # Lote adaptativo: el coref completo en CPU es pesado en RAM. Un lote
             # de 16 sub-ventanas grandes puede OOM (SIGKILL, sin traceback). Para
             # documentos grandes se encoge el lote (ver adaptive_coref_batch_size).
@@ -840,6 +851,96 @@ class ProgressiveSegmenter:
             f"sobre {total_uces} UCEs."
         )
         return global_chains
+
+    def _extract_coref_remote(self, pending, seen_chain_keys, global_chains):
+        """Extrae cadenas coref vía el servidor remoto (/v1/extract_coref).
+
+        Cada sub-ventana se envía como texto independiente: el servidor llama a
+        ``nlp(text)`` por texto (nunca ``bulk_process``), así que la ventana
+        limitada se respeta. Los offsets devueltos (relativos a la sub-ventana)
+        se mapean a globales con ``OffsetMapper`` y las cadenas se deduplican por
+        huella de menciones, igual que en ``_extract_chains_from_doc``.
+
+        Si una llamada falla y ``STANZA_SERVER_FALLBACK_LOCAL`` es True, se cae a
+        Stanza local (una sub-ventana por llamada); si es False, se propaga el
+        fallo (sin cadenas para ese lote).
+        """
+        if not pending:
+            return
+
+        # Lotes pequeños por petición: el coref es lento (~7s/texto) y el túnel
+        # de Cloudflare corta a los ~100s.
+        REMOTE_BATCH = 5
+        for i in range(0, len(pending), REMOTE_BATCH):
+            batch = pending[i : i + REMOTE_BATCH]
+            texts = [t for t, _ in batch]
+            try:
+                resp = requests.post(
+                    f"{STANZA_SERVER_URL}/v1/extract_coref",
+                    json={"texts": texts, "lang": self.stanza_lang},
+                    headers={"Authorization": f"Bearer {STANZA_SERVER_TOKEN}"},
+                    timeout=STANZA_SERVER_TIMEOUT,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                results = data.get("results", [])
+                if len(results) != len(texts):
+                    raise ValueError(
+                        f"el servidor devolvió {len(results)} resultados para "
+                        f"{len(texts)} textos"
+                    )
+            except Exception as e:
+                self._dprint(f"    ✗ Stanza remoto falló ({e!r}); usando Stanza local.")
+                logging.warning("Stanza remoto falló (%s); usando Stanza local", e)
+                if not STANZA_SERVER_FALLBACK_LOCAL:
+                    return
+                stanza_pipe = self.get_stanza()
+                if stanza_pipe is None:
+                    self._dprint(
+                        "✗ Stanza local no disponible — saltando sub-ventanas."
+                    )
+                    return
+                for sub_text, sub_start in batch:
+                    self._process_coref_window(
+                        stanza_pipe, sub_text, sub_start, seen_chain_keys, global_chains
+                    )
+                continue
+
+            for (sub_text, sub_start), r in zip(batch, results):
+                mapper = self.OffsetMapper(sub_start)
+                for chain in r.get("chains", []):
+                    mentions = []
+                    for m in chain.get("mentions", []):
+                        m_start_local = m.get("start_char")
+                        m_end_local = m.get("end_char")
+                        if m_start_local is None or m_end_local is None:
+                            continue
+                        m_start_global, m_end_global = mapper.to_global(
+                            m_start_local, m_end_local
+                        )
+                        mentions.append(
+                            {
+                                "text": sub_text[m_start_local:m_end_local],
+                                "start_char": m_start_global,
+                                "end_char": m_end_global,
+                            }
+                        )
+                    if not mentions:
+                        continue
+                    # ── FIX: deduplicate chains by their global mention span fingerprint ──
+                    chain_key = tuple(
+                        sorted((m["start_char"], m["end_char"]) for m in mentions)
+                    )
+                    if chain_key in seen_chain_keys:
+                        continue
+                    seen_chain_keys.add(chain_key)
+                    global_chains.append({"mentions": mentions})
+                    if self.debug_coref:
+                        mention_texts = [m["text"] for m in mentions]
+                        self._dprint(
+                            f"      ✓ Cadena #{len(global_chains)} añadida (remota) | "
+                            f"{len(mentions)} menciones: {mention_texts}"
+                        )
 
     def _extract_chains_from_doc(
         self, doc, sub_text, sub_start, seen_chain_keys, global_chains
@@ -1048,7 +1149,11 @@ class ProgressiveSegmenter:
             f"{'=' * 60}"
         )
 
-        if not segments or not isinstance(segments, list) or not self.get_stanza():
+        if (
+            not segments
+            or not isinstance(segments, list)
+            or (not STANZA_SERVER_URL and not self.get_stanza())
+        ):
             self._dprint(
                 "Condición de salida temprana: lista vacía o Stanza no disponible."
             )

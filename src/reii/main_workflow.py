@@ -48,6 +48,7 @@ from reii.config import (
     OUTPUT_DASHBOARD,
     OUTPUT_NETWORK_GEXF,
     SPACY_MODEL,
+    STANZA_SERVER_URL,
     TOGETHER_API_KEY,
     TOGETHER_BASE_URL,
     WORKFLOW_DB_PATH,
@@ -176,11 +177,18 @@ except ImportError:
 
 try:
     import hdbscan
-    import umap
 
     _HDBSCAN_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     _HDBSCAN_AVAILABLE = False
+    print(f"   [EMB] hdbscan no disponible: {e}")
+
+try:
+    import umap
+
+    _UMAP_AVAILABLE = True
+except ImportError:
+    _UMAP_AVAILABLE = False
 
 
 gc.collect()
@@ -355,7 +363,7 @@ class Config:
     stem_backend: str = "snowball"  # 'snowball' | 'none'
 
     min_uce_words: int = 2  # era 3; alineado con C (UCEs cortas)
-    uce_target_size: int = 18  # era getattr(..., 40); rango Reinert 12–18
+    uce_target_size: int = 26  # era getattr(..., 40); rango Reinert 12–18
     min_forms_uc: List[int] = field(default_factory=lambda: [13, 17])
 
     tsj: int = 3
@@ -2960,7 +2968,9 @@ def _compute_uce_centroids_from_retro(
     result = np.zeros((len(uces), d), dtype=np.float64)
 
     for i, uce in enumerate(uces):
-        tokens = uce.lemmas or []
+        # Los vectores retrofitted están indexados por stems (stem_backend !=
+        # "none"), no por lemmas; usar stems con fallback a lemmas.
+        tokens = uce.stems or uce.lemmas or []
         if not tokens:
             continue
         vecs: List[np.ndarray] = []
@@ -3015,7 +3025,7 @@ def _compute_uc_centroids(
     result = np.zeros((len(ucs), d), dtype=np.float64)
 
     for i, uc in enumerate(ucs):
-        tokens = uc.lemmas or []
+        tokens = uc.stems or uc.lemmas or []
         if not tokens:
             continue
 
@@ -3878,9 +3888,17 @@ class DoubleClassifier:
                 "   [COREF] ProgressiveSegmenter not injected — Method B unavailable."
             )
             return None
-        if ps.get_stanza() is None:
+        if not STANZA_SERVER_URL and ps.get_stanza() is None:
             print("   [COREF] Stanza unavailable — Method B unavailable.")
             return None
+
+        if STANZA_SERVER_URL:
+            print(
+                f"   [COREF] Modo remoto (Colab): {STANZA_SERVER_URL} — "
+                "coref por HTTP, sin pipeline local."
+            )
+        else:
+            print("   [COREF] Modo local: coref con pipeline Stanza local.")
 
         # ── 0'. Checkpoint por pase: B1 y B2 no comparten archivo ────────────
         checkpoint_path = checkpoint_path_for_pass(checkpoint_path, context_units)
@@ -5350,7 +5368,11 @@ class _FallbackClusterizador:
             k = self.config.n_clusters or self._sel_k(Z, dv, len(ucs))
             labels = fcluster(Z, t=k, criterion="maxclust") - 1
             return labels, Z, None
-        elif self.config.clustering_method == "hdbscan" and _HDBSCAN_AVAILABLE:
+        elif (
+            self.config.clustering_method == "hdbscan"
+            and _HDBSCAN_AVAILABLE
+            and _UMAP_AVAILABLE
+        ):
             if hasattr(ucs[0], "embedding") and ucs[0].embedding is not None:
                 data = np.array([uc.embedding for uc in ucs])
             else:
@@ -6943,6 +6965,11 @@ class Optimizador:
         mf2 = mf1 + params["forms_gap"]
 
         cfg = copy.deepcopy(self.config_base)
+        # El optimizador solo afina parámetros de word-count (Method A). Forzar
+        # wc_only evita que intente correr coref (Method B) y EMB (Method C),
+        # que no están disponibles aquí (sin progressive_segmenter ni
+        # retrofitted_vectors) y solo generan ruido + tiempo perdido.
+        cfg.classification_mode = "wc_only"
         cfg.min_forms_uc = [mf1, mf2]
         cfg.tsj = params["tsj"]
         cfg.pseudocount = 0.0  # BLOQUE 1: nunca sumar ε
@@ -8401,7 +8428,7 @@ if __name__ == "__main__":
         min_forms_uc=[10, 14],
         tsj=3,
         use_cdh=True,
-        uce_target_size=18,
+        uce_target_size=26,
         pseudocount=0.0,
         use_cah_per_class=True,
         cah_per_class_top_terms=20,
@@ -8519,8 +8546,10 @@ if __name__ == "__main__":
             similarity_threshold=0.6,
             max_depth=3,
         )
-        # Eagerly verify Stanza loads; fail fast rather than mid-pipeline
-        if progressive_seg.get_stanza() is None:
+        # Eagerly verify Stanza loads; fail fast rather than mid-pipeline.
+        # Con servidor remoto (Colab) el pipeline local no hace falta: el coref
+        # completo se resuelve por HTTP (/v1/extract_coref).
+        if not STANZA_SERVER_URL and progressive_seg.get_stanza() is None:
             print("[WARN] Stanza failed to load — Method B will be skipped.")
             progressive_seg = None
 

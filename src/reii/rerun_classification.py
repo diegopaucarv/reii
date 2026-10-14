@@ -39,7 +39,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from reii.config import BEST_PARAMS_PATH
+from reii.config import BEST_PARAMS_PATH, STANZA_SERVER_URL
 from reii.config import DATA_DIR as REII_DATA_DIR
 from reii.gram.gramatical_analyzer import Config as GramConfig
 from reii.gram.gramatical_analyzer import NLPProvider
@@ -227,6 +227,15 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    # ── 0. Diagnóstico: Stanza remoto (Colab) vs local ─────────────────
+    if STANZA_SERVER_URL:
+        print(f"=== Stanza REMOTO activo: {STANZA_SERVER_URL} ===")
+    else:
+        print(
+            "=== Stanza LOCAL (sin STANZA_SERVER_URL). "
+            "El coref se resolverá con el pipeline local (puede OOM). ==="
+        )
+
     # ── 1. Rebuild corpus_raw ────────────────────────────────────────────
     print("=== Rebuilding corpus_raw ===")
     uwu = rebuild_corpus_raw()
@@ -240,7 +249,7 @@ def main() -> int:
         min_forms_uc=[10, 14],
         tsj=3,
         use_cdh=True,
-        uce_target_size=18,
+        uce_target_size=26,  # 26 palabras/UCE como ALCESTE original (era 18)
         pseudocount=0.0,
         use_cah_per_class=True,
         cah_per_class_top_terms=20,
@@ -313,7 +322,10 @@ def main() -> int:
             similarity_threshold=0.6,
             max_depth=3,
         )
-        if progressive_seg.get_stanza() is None:
+        # Con servidor remoto (Colab) el pipeline local no hace falta: el coref
+        # completo se resuelve por HTTP (/v1/extract_coref). Sin remoto, sí hace
+        # falta Stanza local (y si falla, Method B se salta).
+        if not STANZA_SERVER_URL and progressive_seg.get_stanza() is None:
             print("   [WARN] Stanza unavailable — Method B will be skipped.")
             progressive_seg = None
 

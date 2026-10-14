@@ -12,7 +12,21 @@ stanza, sentence_transformers), por lo que este módulo tarda ~50s en cargar.
 
 import re
 
+import pytest
+
 from reii.seg.segmentador import ProgressiveSegmenter
+
+
+@pytest.fixture(autouse=True)
+def _no_remote_stanza(monkeypatch):
+    """Aísla estos tests del modo remoto: siempre prueban el camino local.
+
+    Si el shell deja ``STANZA_SERVER_URL`` definido (p. ej. tras probar el
+    servidor de Colab), ``_extract_global_chains`` tomaría el camino remoto y
+    estos tests (que usan un ``ProgressiveSegmenter`` sin ``__init__``) fallarían.
+    """
+    monkeypatch.setattr("reii.seg.segmentador.STANZA_SERVER_URL", "")
+
 
 # ── Fakes con la interfaz mínima que usa ``_extract_chains_from_doc`` ─────────
 PRONOUNS = {
