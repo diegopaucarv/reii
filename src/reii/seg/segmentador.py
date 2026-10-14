@@ -33,6 +33,7 @@ from reii.config import (
 )
 from reii.seg.coref_checkpoint import adaptive_coref_batch_size
 from reii.seg.root_cache import RootSubjectCache, StanzaRootExtractor
+from reii.seg.stanza_pipeline import COREF_PROCESSORS, build_stanza_pipeline
 
 # ── Stanza coref bug-fix ──────────────────────────────────────────────────────
 try:
@@ -373,37 +374,9 @@ class ProgressiveSegmenter:
     def get_stanza(self) -> Optional[stanza.Pipeline]:
         if self._stanza_pipeline is None:
             print("[COREF] Stanza pipeline not loaded — iniciando carga...")
-            try:
-                stanza.download(
-                    self.stanza_lang,
-                    processors="tokenize,pos,lemma,depparse,constituency,coref",
-                    verbose=False,
-                )
-                # GPU si hay CUDA; si falla (p. ej. VRAM compartida con
-                # SentenceTransformer) se reintenta en CPU en vez de desactivar COREF.
-                for use_gpu in [True, False] if self.stanza_use_gpu else [False]:
-                    try:
-                        self._stanza_pipeline = stanza.Pipeline(
-                            self.stanza_lang,
-                            processors="tokenize,pos,lemma,depparse,constituency,coref",
-                            use_gpu=use_gpu,
-                            verbose=False,
-                        )
-                        break
-                    except Exception as gpu_err:
-                        if not use_gpu:
-                            raise
-                        print(
-                            f"[COREF] ✗ Stanza en GPU falló ({gpu_err}); reintentando en CPU."
-                        )
-                print(
-                    f"[COREF] ✓ Stanza coref pipeline cargado ({'GPU' if use_gpu else 'CPU'})."
-                )
-            except Exception as e:
-                print(
-                    f"[COREF] ✗ Error cargando Stanza: {e}. Correferencias deshabilitadas."
-                )
-                self._stanza_pipeline = None
+            self._stanza_pipeline = build_stanza_pipeline(
+                self.stanza_lang, COREF_PROCESSORS, self.stanza_use_gpu
+            )
         else:
             self._dprint("Pipeline ya en memoria — reutilizando.")
         return self._stanza_pipeline

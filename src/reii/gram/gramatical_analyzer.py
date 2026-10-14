@@ -118,6 +118,7 @@ from reii.lang.es import (
     uce_to_global_annotations,
     verificar_concordancia_participio,
 )
+from reii.seg.stanza_pipeline import build_stanza_pipeline
 
 logging.basicConfig(
     level=logging.INFO,
@@ -3889,24 +3890,11 @@ class NLPProvider:
         if not config.use_coref:
             return None
         if cls._stanza_pipeline is None:
-            try:
-                stanza.download(
-                    config.stanza_lang,
-                    processors="tokenize,pos,constituency,coref",
-                    verbose=False,
-                )
-                cls._stanza_pipeline = stanza.Pipeline(
-                    config.stanza_lang,
-                    processors="tokenize,pos,constituency,coref",
-                    use_gpu=config.stanza_use_gpu,
-                    verbose=False,
-                )
-                logger.info("Stanza coref pipeline cargado.")
-            except Exception as e:
-                logger.warning(
-                    f"Error cargando Stanza coref: {e}. Deshabilitando correferencias."
-                )
-                cls._stanza_pipeline = None
+            cls._stanza_pipeline = build_stanza_pipeline(
+                config.stanza_lang,
+                "tokenize,pos,constituency,coref",
+                config.stanza_use_gpu,
+            )
         return cls._stanza_pipeline
 
     @classmethod

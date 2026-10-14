@@ -271,7 +271,7 @@ def main() -> int:
         hdbscan_uce_min_cluster_size=5,
         hdbscan_uce_min_cluster_size_loose=3,
         hdbscan_uce_metric="euclidean",
-        optimize=False,  # best_params.json already exists
+        optimize=True,  # best_params.json already exists
         optimize_trials=300,
         optimize_sampler="tpe",
         optimize_pruner="median",

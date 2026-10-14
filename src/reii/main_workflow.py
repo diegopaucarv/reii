@@ -450,7 +450,7 @@ class Config:
     rf_min_samples_for_tuning: int = 30
 
     # ── Optimizer (Optuna) ──────────────────────────────────────────────
-    optimize: bool = False
+    optimize: bool = True
     optimize_trials: int = 200
     optimize_sampler: str = "tpe"  # "tpe" | "random" | "cmaes"
     optimize_pruner: str = "median"  # "median" | "hyperband" | "none"
@@ -7733,11 +7733,18 @@ class WorkflowOrchestrator:
                 _stored_fp = best_data.get("corpus_fingerprint")
                 _current_fp = _corpus_fingerprint()
                 if _stored_fp and _stored_fp != _current_fp:
-                    print(
-                        "   [WARNING] best_params.json es de otro dataset "
-                        "(fingerprint distinto). Re-optimizando..."
-                    )
-                    best_params = None
+                    if self.config.optimize:
+                        print(
+                            "   [WARNING] best_params.json es de otro dataset. Re-optimizando..."
+                        )
+                        best_params = None
+                    else:
+                        print(
+                            "   [WARNING] best_params.json es de otro dataset y optimize=False. "
+                            "Se usará la config base."
+                        )
+                        best_params = None
+
                 else:
                     # Nuevo formato → 'best_params'; legacy → 'params'
                     best_params = best_data.get("best_params") or best_data.get(
