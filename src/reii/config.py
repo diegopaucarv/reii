@@ -174,6 +174,20 @@ ROOTS_SKIP_COREF: bool = (
 ROOTS_BATCH_SIZE: int = int(
     os.environ.get("REII_ROOTS_BATCH_SIZE", "32")
 )  # <=1: sin lotes
+# COREF: ventanas de coref por lote en ``_extract_global_chains`` (bulk_process).
+# <=1: sin lotes (una ventana por llamada, comportamiento anterior).
+COREF_BATCH_SIZE: int = int(os.environ.get("REII_COREF_BATCH_SIZE", "16"))
+
+# ---------------------------------------------------------------------------
+# Stanza remoto (servidor FastAPI en Colab): si STANZA_SERVER_URL está definido,
+# los sujetos raíz se piden por HTTP en vez de ejecutar Stanza localmente.
+# ---------------------------------------------------------------------------
+STANZA_SERVER_URL: str = os.environ.get("STANZA_SERVER_URL", "").rstrip("/")
+STANZA_SERVER_TOKEN: str = os.environ.get("STANZA_SERVER_TOKEN", "")
+STANZA_SERVER_TIMEOUT: float = float(os.environ.get("STANZA_SERVER_TIMEOUT", "120"))
+STANZA_SERVER_FALLBACK_LOCAL: bool = (
+    os.environ.get("STANZA_SERVER_FALLBACK_LOCAL", "true").lower() == "true"
+)
 
 # ---------------------------------------------------------------------------
 # API keys / tokens

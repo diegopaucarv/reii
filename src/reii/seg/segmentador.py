@@ -19,13 +19,19 @@ from spacy.language import Language
 from transformers import AutoTokenizer, BertModel, BertTokenizer, pipeline
 
 from reii.config import (
+    COREF_BATCH_SIZE,
     NLI_MODEL,
     ROOTS_BATCH_SIZE,
     ROOTS_SKIP_COREF,
     SEGMENTER_EMBEDDING_MODEL,
     SPACY_MODEL,
+    STANZA_SERVER_FALLBACK_LOCAL,
+    STANZA_SERVER_TIMEOUT,
+    STANZA_SERVER_TOKEN,
+    STANZA_SERVER_URL,
     STANZA_USE_GPU,
 )
+from reii.seg.coref_checkpoint import adaptive_coref_batch_size
 from reii.seg.root_cache import RootSubjectCache, StanzaRootExtractor
 
 # ── Stanza coref bug-fix ──────────────────────────────────────────────────────
@@ -329,6 +335,11 @@ class ProgressiveSegmenter:
             skip_coref=ROOTS_SKIP_COREF
             if roots_skip_coref is None
             else roots_skip_coref,
+            remote_url=STANZA_SERVER_URL,
+            remote_token=STANZA_SERVER_TOKEN,
+            remote_timeout=STANZA_SERVER_TIMEOUT,
+            remote_fallback_local=STANZA_SERVER_FALLBACK_LOCAL,
+            lang=self.stanza_lang,
         )
         _bs = ROOTS_BATCH_SIZE if roots_batch_size is None else int(roots_batch_size)
         self.root_cache = RootSubjectCache(
@@ -718,11 +729,15 @@ class ProgressiveSegmenter:
     # ─────────────────────────────────────────────────────────────────────────
     # _extract_global_chains — with full debug prints + chain deduplication FIX
     # ─────────────────────────────────────────────────────────────────────────
-    def _extract_global_chains(self, segments_info, full_doc_text, context_units=2):
+    def _extract_global_chains(
+        self, segments_info, full_doc_text, context_units=2, coref_batch_size=None
+    ):
         """
         Sliding window coreference extraction with:
           - Debug prints at every stage
           - Chain deduplication by mention-span fingerprint (FIX for duplicate merges)
+          - Batching: candidate sub-windows are processed in bulk via ``bulk_process``
+            (falls back to one-at-a-time if a batch fails).
         """
         global_chains = []
         # FIX: track chain fingerprints to avoid adding the same chain from overlapping windows
@@ -741,6 +756,10 @@ class ProgressiveSegmenter:
             self._dprint("✗ Stanza no disponible — saltando extracción de cadenas.")
             return global_chains
 
+        _bs = COREF_BATCH_SIZE if coref_batch_size is None else int(coref_batch_size)
+
+        # ── Pass 1: collect candidate sub-windows (windowing + candidate filter) ──
+        pending = []  # list of (sub_text, sub_start)
         for uce_idx, uce in enumerate(segments_info):
             buffer.append((uce["start"], uce["end"]))
             if len(buffer) > context_units + 1:
@@ -761,13 +780,6 @@ class ProgressiveSegmenter:
             CHUNK_OVERLAP = 500
 
             # ── Troceo con solape (reemplaza el truncado duro) ──
-            # Si la ventana supera MAX_WINDOW_CHARS se divide en sub-ventanas de
-            # ~4000 chars con ~500 chars de solape entre trozos consecutivos.
-            # El solape es crítico: una cadena que cruza la frontera entre dos
-            # trozos debe aparecer en ambos; el dedup por fingerprint (más abajo)
-            # evita contarla dos veces. Esto cubre también el caso
-            # len(buffer) == 1 (UCE gigante) que antes procesaba el documento
-            # entero de una vez → OOM.
             if window_char_len > MAX_WINDOW_CHARS:
                 step = MAX_WINDOW_CHARS - CHUNK_OVERLAP
                 sub_windows = []
@@ -788,141 +800,162 @@ class ProgressiveSegmenter:
 
             for sub_idx, (sub_text, sub_start) in enumerate(sub_windows):
                 # ── Filtro rápido de candidatos a correferencia (B2) ──
-                # Sin pronombres personales ni nombres propios (mayúscula
-                # inicial) no puede haber cadenas de coref: se salta Stanza.
-                # Chequeo conservador: ante la duda, se procesa la ventana.
                 if not _COREF_CANDIDATE_RE.search(sub_text):
                     self._dprint(
                         f"    Sub-ventana {sub_idx + 1}/{len(sub_windows)} sin "
                         f"candidatos de correferencia — saltando Stanza."
                     )
                     continue
+                pending.append((sub_text, sub_start))
 
+        # ── Pass 2: batch process candidate sub-windows ──
+        if _bs > 1:
+            # Lote adaptativo: el coref completo en CPU es pesado en RAM. Un lote
+            # de 16 sub-ventanas grandes puede OOM (SIGKILL, sin traceback). Para
+            # documentos grandes se encoge el lote (ver adaptive_coref_batch_size).
+            _bs = adaptive_coref_batch_size(_bs, sum(len(t) for t, _ in pending))
+            for i in range(0, len(pending), _bs):
+                batch = pending[i : i + _bs]
+                texts = [t for t, _ in batch]
                 try:
-                    doc = stanza_pipe(sub_text)
-                    n_chains_raw = len(doc.coref) if doc.coref else 0
-                    self._dprint(
-                        f"    Stanza OK → {n_chains_raw} cadenas en sub-ventana "
-                        f"{sub_idx + 1}/{len(sub_windows)}."
-                    )
-                except MemoryError:
-                    self._dprint(
-                        f"    MemoryError en ventana UCE {uce_idx + 1} "
-                        f"(sub-ventana {sub_idx + 1}) — saltando."
-                    )
-                    gc.collect()
-                    self._empty_cuda_cache()
-                    continue
+                    docs = stanza_pipe.bulk_process(texts)
+                    if len(docs) != len(texts):
+                        raise ValueError(
+                            f"bulk_process devolvió {len(docs)} docs para {len(texts)} textos"
+                        )
                 except Exception as e:
-                    logging.error(
-                        f"[COREF] Stanza window error "
-                        f"[{sub_start}:{sub_start + len(sub_text)}]: {e}"
+                    logging.warning(
+                        "coref bulk_process falló (%s); procesando una a una", e
                     )
-                    self._dprint(
-                        f"    ✗ Stanza falló en ventana UCE {uce_idx + 1}: {e}"
-                    )
-                    self._empty_cuda_cache()
+                    for sub_text, sub_start in batch:
+                        self._process_coref_window(
+                            stanza_pipe,
+                            sub_text,
+                            sub_start,
+                            seen_chain_keys,
+                            global_chains,
+                        )
                     continue
-
-                mapper = self.OffsetMapper(sub_start)
-                new_chains_this_window = 0
-                skipped_dupes = 0
-
-                skipped_mentions = 0
-                for chain_idx, chain in enumerate(doc.coref):
-                    mentions = []
-
-                    for mention in chain.mentions:
-                        # Defensive index extraction (MWT / Spanish contraction guard)
-                        s_idx = (
-                            mention.sentence[0]
-                            if isinstance(mention.sentence, (tuple, list))
-                            else mention.sentence
-                        )
-                        sw_idx = (
-                            mention.start_word[0]
-                            if isinstance(mention.start_word, (tuple, list))
-                            else mention.start_word
-                        )
-                        ew_idx = (
-                            mention.end_word[-1]
-                            if isinstance(mention.end_word, (tuple, list))
-                            else mention.end_word
-                        )
-
-                        sent = doc.sentences[s_idx]
-                        first_word = sent.words[sw_idx]
-                        last_word = sent.words[ew_idx - 1]
-
-                        m_start_local = first_word.start_char
-                        if m_start_local is None and getattr(
-                            first_word, "parent", None
-                        ):
-                            m_start_local = first_word.parent.start_char
-
-                        m_end_local = last_word.end_char
-                        if m_end_local is None and getattr(last_word, "parent", None):
-                            m_end_local = last_word.parent.end_char
-
-                        if m_start_local is None or m_end_local is None:
-                            skipped_mentions += 1
-                            self._dprint(
-                                f"      Mención saltada (offset None): "
-                                f"cadena {chain_idx}, palabra '{first_word.text}'"
-                            )
-                            continue
-
-                        m_start_global, m_end_global = mapper.to_global(
-                            m_start_local, m_end_local
-                        )
-                        mentions.append(
-                            {
-                                "text": sub_text[m_start_local:m_end_local],
-                                "start_char": m_start_global,
-                                "end_char": m_end_global,
-                            }
-                        )
-
-                    if not mentions:
-                        continue
-
-                    # ── FIX: deduplicate chains by their global mention span fingerprint ──
-                    chain_key = tuple(
-                        sorted((m["start_char"], m["end_char"]) for m in mentions)
+                for (sub_text, sub_start), doc in zip(batch, docs):
+                    self._extract_chains_from_doc(
+                        doc, sub_text, sub_start, seen_chain_keys, global_chains
                     )
-                    if chain_key in seen_chain_keys:
-                        skipped_dupes += 1
-                        continue
-                    seen_chain_keys.add(chain_key)
-
-                    global_chains.append({"mentions": mentions})
-                    new_chains_this_window += 1
-
-                    if self.debug_coref:
-                        mention_texts = [m["text"] for m in mentions]
-                        self._dprint(
-                            f"      ✓ Cadena #{len(global_chains)} añadida | "
-                            f"{len(mentions)} menciones: {mention_texts}"
-                        )
-
-                self._dprint(
-                    f"    Ventana {uce_idx + 1} (sub-ventana "
-                    f"{sub_idx + 1}/{len(sub_windows)}) resumen: "
-                    f"+{new_chains_this_window} nuevas, "
-                    f"{skipped_dupes} dupes saltados, "
-                    f"{skipped_mentions} menciones None-offset saltadas. "
-                    f"Total acumulado: {len(global_chains)} cadenas."
-                )
-
-                # ── Liberar memoria: el Document de Stanza retiene tensores ──
-                del doc
+                    del doc
                 gc.collect()
+        else:
+            for sub_text, sub_start in pending:
+                self._process_coref_window(
+                    stanza_pipe, sub_text, sub_start, seen_chain_keys, global_chains
+                )
 
         self._dprint(
             f"Extracción global completada: {len(global_chains)} cadenas únicas "
             f"sobre {total_uces} UCEs."
         )
         return global_chains
+
+    def _extract_chains_from_doc(
+        self, doc, sub_text, sub_start, seen_chain_keys, global_chains
+    ):
+        """Extract coref chains from a processed doc, map offsets, dedup, append."""
+        mapper = self.OffsetMapper(sub_start)
+
+        for chain_idx, chain in enumerate(doc.coref):
+            mentions = []
+
+            for mention in chain.mentions:
+                # Defensive index extraction (MWT / Spanish contraction guard)
+                s_idx = (
+                    mention.sentence[0]
+                    if isinstance(mention.sentence, (tuple, list))
+                    else mention.sentence
+                )
+                sw_idx = (
+                    mention.start_word[0]
+                    if isinstance(mention.start_word, (tuple, list))
+                    else mention.start_word
+                )
+                ew_idx = (
+                    mention.end_word[-1]
+                    if isinstance(mention.end_word, (tuple, list))
+                    else mention.end_word
+                )
+
+                sent = doc.sentences[s_idx]
+                first_word = sent.words[sw_idx]
+                last_word = sent.words[ew_idx - 1]
+
+                m_start_local = first_word.start_char
+                if m_start_local is None and getattr(first_word, "parent", None):
+                    m_start_local = first_word.parent.start_char
+
+                m_end_local = last_word.end_char
+                if m_end_local is None and getattr(last_word, "parent", None):
+                    m_end_local = last_word.parent.end_char
+
+                if m_start_local is None or m_end_local is None:
+                    self._dprint(
+                        f"      Mención saltada (offset None): "
+                        f"cadena {chain_idx}, palabra '{first_word.text}'"
+                    )
+                    continue
+
+                m_start_global, m_end_global = mapper.to_global(
+                    m_start_local, m_end_local
+                )
+                mentions.append(
+                    {
+                        "text": sub_text[m_start_local:m_end_local],
+                        "start_char": m_start_global,
+                        "end_char": m_end_global,
+                    }
+                )
+
+            if not mentions:
+                continue
+
+            # ── FIX: deduplicate chains by their global mention span fingerprint ──
+            chain_key = tuple(
+                sorted((m["start_char"], m["end_char"]) for m in mentions)
+            )
+            if chain_key in seen_chain_keys:
+                continue
+            seen_chain_keys.add(chain_key)
+
+            global_chains.append({"mentions": mentions})
+
+            if self.debug_coref:
+                mention_texts = [m["text"] for m in mentions]
+                self._dprint(
+                    f"      ✓ Cadena #{len(global_chains)} añadida | "
+                    f"{len(mentions)} menciones: {mention_texts}"
+                )
+
+    def _process_coref_window(
+        self, stanza_pipe, sub_text, sub_start, seen_chain_keys, global_chains
+    ):
+        """Process a single sub-window (fallback path) with per-window error handling."""
+        try:
+            doc = stanza_pipe(sub_text)
+        except MemoryError:
+            self._dprint("    MemoryError en sub-ventana — saltando.")
+            gc.collect()
+            self._empty_cuda_cache()
+            return
+        except Exception as e:
+            logging.error(
+                f"[COREF] Stanza window error "
+                f"[{sub_start}:{sub_start + len(sub_text)}]: {e}"
+            )
+            self._dprint(f"    ✗ Stanza falló en sub-ventana: {e}")
+            self._empty_cuda_cache()
+            return
+
+        self._extract_chains_from_doc(
+            doc, sub_text, sub_start, seen_chain_keys, global_chains
+        )
+        del doc
+        gc.collect()
 
     # ─────────────────────────────────────────────────────────────────────────
     # van_unidos — with debug prints

@@ -83,6 +83,13 @@ _UCE_PROJECTION_FIELDS = (
 from reii.gram.gramatical_analyzer import (
     Config as GramConfig,
 )
+from reii.seg.coref_checkpoint import (
+    COREF_CHECKPOINT_VERSION,
+    _cargar_checkpoint_coref,
+    _coref_code_fingerprint,
+    _guardar_checkpoint_coref,
+    checkpoint_path_for_pass,
+)
 from reii.seg.root_cache import RootSubjectCache, boundary_tails, root_context
 from reii.seg.segmentador import ProgressiveSegmenter
 
@@ -3583,47 +3590,6 @@ def _remap_uces_to_segments(
     return groups
 
 
-def _cargar_checkpoint_coref(checkpoint_path: str) -> Optional[Dict]:
-    """Carga un checkpoint de _clasificar_umbral_coref.
-
-    Devuelve None si el archivo no existe, está corrupto o tiene una versión
-    desconocida (en ese caso se empieza de cero, sin abortar el pipeline).
-    """
-    if not os.path.exists(checkpoint_path):
-        return None
-    try:
-        with open(checkpoint_path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        if data.get("version") != 1:
-            logger.warning(
-                "Checkpoint con versión desconocida (%s) — ignorado.",
-                checkpoint_path,
-            )
-            return None
-        return data
-    except Exception as e:
-        logger.warning("No se pudo cargar el checkpoint %s: %s", checkpoint_path, e)
-        return None
-
-
-def _guardar_checkpoint_coref(checkpoint_path: str, state: Dict) -> None:
-    """Escribe el checkpoint de forma atómica (tmp + os.replace).
-
-    Un fallo de escritura solo se registra en el log: nunca debe romper el
-    pipeline de clasificación.
-    """
-    try:
-        d = os.path.dirname(checkpoint_path)
-        if d:
-            os.makedirs(d, exist_ok=True)
-        tmp_path = f"{checkpoint_path}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as fh:
-            json.dump(state, fh, ensure_ascii=False, cls=_NumpyEncoder)
-        os.replace(tmp_path, checkpoint_path)
-    except Exception as e:
-        logger.warning("No se pudo escribir el checkpoint %s: %s", checkpoint_path, e)
-
-
 # ══════════════════════════════════════════════════════════════════════
 # T3 — DOBLE CLASIFICACIÓN (refactorizado para CDH)
 # ══════════════════════════════════════════════════════════════════════
@@ -3846,6 +3812,7 @@ class DoubleClassifier:
         context_units: int,
         retrofitted_vectors: Optional[Dict[str, np.ndarray]] = None,
         checkpoint_path: Optional[str] = None,
+        force: bool = False,
     ) -> Optional[Dict]:
         """
         Builds UCs by dissolving UCE boundaries that are bridged by a
@@ -3896,6 +3863,13 @@ class DoubleClassifier:
           el root_cache. Si el proceso muere (OOM, corte de energía), una
           re-ejecución con el mismo checkpoint_path reanuda saltando los
           documentos ya completados. Con None (default) no hay checkpointing.
+
+          La ruta se deriva por pase: ``checkpoint_path_for_pass`` añade un
+          sufijo ``.ctx{context_units}`` para que B1 (context=2) y B2
+          (context=4) no se pisen entre sí y cada uno conserve su memoria.
+
+        force : si es True, ignora cualquier checkpoint existente y rehace el
+          pase desde cero (sobrescribiendo el archivo).
         """
         # ── 0. Guard: hard fail, no silent fallback ───────────────────────────
         ps = self.progressive_segmenter
@@ -3907,6 +3881,9 @@ class DoubleClassifier:
         if ps.get_stanza() is None:
             print("   [COREF] Stanza unavailable — Method B unavailable.")
             return None
+
+        # ── 0'. Checkpoint por pase: B1 y B2 no comparten archivo ────────────
+        checkpoint_path = checkpoint_path_for_pass(checkpoint_path, context_units)
 
         # ── 1. Deep-copy + suffix ─────────────────────────────────────────────
         suffix = f"__coref{context_units}"
@@ -3922,9 +3899,13 @@ class DoubleClassifier:
         #       those UCEs only, through a cache shared by the B1 and B2 passes.
         #       (Before: one Stanza call per UCE per pass, keyed by suffixed id.)
         root_cache: Dict[str, set] = {}
-        rcache = getattr(ps, "root_cache", None) or RootSubjectCache(
-            ps.find_subjects_for_roots
-        )
+        # OJO: NO usar ``or`` aquí. ``RootSubjectCache`` define ``__len__``
+        # (devuelve len(self._store)), así que una caché VACÍA es falsy y el
+        # ``or`` crearía una caché nueva SIN el extractor por lotes, matando el
+        # batching (0 por lote, N individuales). Hay que comprobar None explícito.
+        rcache = getattr(ps, "root_cache", None)
+        if rcache is None:
+            rcache = RootSubjectCache(ps.find_subjects_for_roots)
         _calls0 = rcache.misses
 
         # ── 3. Per-document UC construction ──────────────────────────────────
@@ -3943,8 +3924,12 @@ class DoubleClassifier:
         # ── 3'. Checkpointing: reanudar desde un checkpoint previo ──────────
         processed_doc_ids: List[str] = []
         processed_doc_set: Set[str] = set()
-        if checkpoint_path:
-            ckpt = _cargar_checkpoint_coref(checkpoint_path)
+        if checkpoint_path and not force:
+            ckpt = _cargar_checkpoint_coref(
+                checkpoint_path,
+                context_units=context_units,
+                min_forms=min_forms,
+            )
             if ckpt is not None:
                 processed_doc_ids = ckpt["processed_doc_ids"]
                 processed_doc_set = set(processed_doc_ids)
@@ -3967,6 +3952,11 @@ class DoubleClassifier:
                     f"   [COREF] No hay checkpoint válido en {checkpoint_path} — "
                     "empezando de cero."
                 )
+        elif checkpoint_path and force:
+            print(
+                f"   [COREF] --force: ignorando checkpoint en {checkpoint_path} — "
+                "rehaciendo desde cero."
+            )
 
         for doc_uces in uces_por_doc_local:
             if not doc_uces:
@@ -4042,6 +4032,12 @@ class DoubleClassifier:
                 current_offset = end + 1
 
             # ── 3c. Extract global coref chains (sliding window, deduped) ──
+            #       (print, no _dprint: debug_coref=False en rerun_classification
+            #       silenciaba este paso y el crash quedaba invisible)
+            print(
+                f"   [COREF] Extrayendo cadenas globales para doc {doc_id} "
+                f"({len(premerged_groups)} grupos)..."
+            )
             try:
                 global_chains = ps._extract_global_chains(
                     segments_info,
@@ -4055,6 +4051,10 @@ class DoubleClassifier:
                     e,
                 )
                 global_chains = []
+            print(
+                f"   [COREF] Cadenas globales extraídas: {len(global_chains)} "
+                f"para doc {doc_id}."
+            )
             total_chains += len(global_chains)
 
             # ── 3d. Greedy forward merge pass (group-level) ──
@@ -4149,13 +4149,20 @@ class DoubleClassifier:
                 global_uc_counter += 1
 
             # ── 3g. Checkpoint: persistir progreso tras cada documento ──
+            #       El dict de estado se construye DENTRO de un try/except:
+            #       antes se evaluaba como argumento de _guardar_checkpoint_coref
+            #       (fuera de su try/except), así que un fallo de serialización
+            #       (p. ej. un campo no serializable en uc.to_dict()) rompía el
+            #       pipeline sin mensaje.
             if checkpoint_path:
                 processed_doc_ids.append(doc_id)
                 processed_doc_set.add(doc_id)
-                _guardar_checkpoint_coref(
-                    checkpoint_path,
-                    {
-                        "version": 1,
+                try:
+                    state = {
+                        "version": COREF_CHECKPOINT_VERSION,
+                        "context_units": context_units,
+                        "min_forms": min_forms,
+                        "code_fingerprint": _coref_code_fingerprint(),
                         "processed_doc_ids": processed_doc_ids,
                         "ucs": [uc.to_dict() for uc in ucs],
                         "uce_to_uc": uce_to_uc,
@@ -4168,12 +4175,19 @@ class DoubleClassifier:
                             ctx: list(subjects)
                             for ctx, subjects in rcache._store.items()
                         },
-                    },
-                )
-                print(
-                    f"   [COREF] Checkpoint guardado ({checkpoint_path}): "
-                    f"{len(processed_doc_ids)} docs, {len(ucs)} UCs."
-                )
+                    }
+                except Exception as e:
+                    logger.warning(
+                        "No se pudo construir el checkpoint %s: %s",
+                        checkpoint_path,
+                        e,
+                    )
+                else:
+                    _guardar_checkpoint_coref(checkpoint_path, state)
+                    print(
+                        f"   [COREF] Checkpoint guardado ({checkpoint_path}): "
+                        f"{len(processed_doc_ids)} docs, {len(ucs)} UCs."
+                    )
 
         print(
             f"   [COREF context={context_units}] roots: "
@@ -4880,6 +4894,7 @@ class DoubleClassifier:
         cached_uces_por_doc: Optional[List[List[UCE]]] = None,
         cached_doc_metadata_map: Optional[Dict] = None,
         checkpoint_path: Optional[str] = None,
+        force: bool = False,
     ) -> Tuple:
         self.ppmi_builder = ppmi_builder
         mode = getattr(self.config, "classification_mode", "wc_only")
@@ -4968,6 +4983,7 @@ class DoubleClassifier:
                 cu_tight,
                 retrofitted_vectors=retrofitted_vectors,
                 checkpoint_path=checkpoint_path,
+                force=force,
             )
             print(f"--- Classification B2: coref loose (context_units={cu_loose}) ---")
             res_coref2 = self._clasificar_umbral_coref(
@@ -4976,6 +4992,7 @@ class DoubleClassifier:
                 cu_loose,
                 retrofitted_vectors=retrofitted_vectors,
                 checkpoint_path=checkpoint_path,
+                force=force,
             )
 
             if res_coref1 and res_coref2:
@@ -7668,6 +7685,7 @@ class WorkflowOrchestrator:
         grammatical_dashboard_path: str = "",
         lex_analyzer=None,  # GlobalLexicalAnalyzer instance, optional
         checkpoint_path: Optional[str] = None,
+        force: bool = False,
     ) -> None:
         print("=== Iniciando Pipeline ALCESTE v5 ===")
 
@@ -7808,6 +7826,7 @@ class WorkflowOrchestrator:
             cached_uces_por_doc=cached_uces_por_doc,  # from optimizer, or None
             cached_doc_metadata_map=cached_doc_metadata_map,
             checkpoint_path=checkpoint_path,
+            force=force,
         )
 
         # ── Retrofitting on pass-1 output ─────────────────────────────────────────
@@ -7852,6 +7871,7 @@ class WorkflowOrchestrator:
                 cached_uces_por_doc=uces_por_doc_p1,  # always reuse pass-1 UCEs
                 cached_doc_metadata_map=doc_metadata_map,
                 checkpoint_path=checkpoint_path,
+                force=force,
             )
 
             # ── Persist pairwise stability matrices ───────────────────────────────

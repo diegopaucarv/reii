@@ -213,9 +213,17 @@ def main() -> int:
     parser.add_argument(
         "--checkpoint-path",
         default=None,
-        help="Ruta del checkpoint de la clasificación coref (Method B). Si el "
-        "proceso muere (OOM), re-ejecutar con la misma ruta reanuda saltando "
-        "los documentos ya procesados. Por defecto: sin checkpointing.",
+        help="Ruta base del checkpoint de la clasificación coref (Method B). "
+        "Si el proceso muere (OOM), re-ejecutar con la misma ruta reanuda "
+        "saltando los documentos ya procesados. Cada pase (B1 context=2, "
+        "B2 context=4) deriva su propio archivo añadiendo un sufijo .ctx{context}, "
+        "así no se pisan entre sí. Por defecto: sin checkpointing.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Ignora cualquier checkpoint existente y rehace la clasificación "
+        "coref desde cero (sobrescribiendo los archivos derivados).",
     )
     args = parser.parse_args()
 
@@ -378,6 +386,7 @@ def main() -> int:
         lex_analyzer=None,
         grammatical_dashboard_path="",  # ← skip legacy grammar JSON
         checkpoint_path=args.checkpoint_path,
+        force=args.force,
     )
     print("=== Done ===")
     return 0

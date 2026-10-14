@@ -14,6 +14,8 @@ import logging
 import time
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, TypeVar
 
+import requests
+
 logger = logging.getLogger(__name__)
 
 ROOT_CTX_CHARS = 500  # misma ventana que ``van_unidos`` (últimos 500 caracteres)
@@ -83,12 +85,39 @@ class StanzaRootExtractor:
     skip_coref   : pasa ``processors=ROOT_PROCESSORS``. Si la versión de Stanza no
                    admite ese argumento (TypeError) vuelve, una vez, al pipeline completo.
 
+    Modo remoto: si ``remote_url`` está definido, las llamadas se envían por HTTP al
+    servidor FastAPI (p. ej. Colab) en vez de ejecutar Stanza localmente. Si una
+    llamada remota falla y ``remote_fallback_local`` es True, se cae a Stanza local
+    (y tras ``remote_max_failures`` fallos seguidos el modo remoto se desactiva para
+    el resto de la ejecución); si es False, el fallo se propaga.
+
     No importa stanza: recibe el pipeline, así que se puede probar con uno falso.
     """
 
-    def __init__(self, get_pipeline: Callable[[], object], skip_coref: bool = True):
+    def __init__(
+        self,
+        get_pipeline: Callable[[], object],
+        skip_coref: bool = True,
+        remote_url: str = "",
+        remote_token: str = "",
+        remote_timeout: float = 120.0,
+        remote_fallback_local: bool = True,
+        remote_max_failures: int = 3,
+        lang: str = "es",
+    ):
         self._get = get_pipeline
         self.skip_coref = bool(skip_coref)
+        self.remote_url = (remote_url or "").rstrip("/")
+        self.remote_token = remote_token or ""
+        self.remote_timeout = float(remote_timeout)
+        self.remote_fallback_local = bool(remote_fallback_local)
+        self.remote_max_failures = max(1, int(remote_max_failures))
+        self._remote_failures = 0
+        self.lang = lang
+
+    @property
+    def remote(self) -> bool:
+        return bool(self.remote_url)
 
     def _run(self, pipe, inp, bulk: bool):
         fn = pipe.bulk_process if bulk else pipe
@@ -111,8 +140,61 @@ class StanzaRootExtractor:
             self.skip_coref = False
             return fn(inp)
 
-    def single(self, text: str) -> List[str]:
-        """Una llamada. Cualquier fallo = sin sujetos (igual que antes)."""
+    def _post(self, texts: List[str]) -> List[List[str]]:
+        """Una llamada HTTP al servidor remoto. Lanza si algo falla."""
+        out: List[List[str]] = [[] for _ in texts]
+        idx = [i for i, t in enumerate(texts) if t and t.strip()]
+        if not idx:
+            return out
+        resp = requests.post(
+            f"{self.remote_url}/v1/extract_roots",
+            json={"texts": [texts[i] for i in idx], "lang": self.lang},
+            headers={"Authorization": f"Bearer {self.remote_token}"},
+            timeout=self.remote_timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results", [])
+        if len(results) != len(idx):
+            raise ValueError(
+                f"el servidor devolvió {len(results)} resultados para {len(idx)} textos"
+            )
+        for i, r in zip(idx, results):
+            out[i] = list(r.get("subjects", []))
+        return out
+
+    def _remote_failed(
+        self,
+        exc: Exception,
+        text: Optional[str] = None,
+        texts: Optional[List[str]] = None,
+    ):
+        """Fallo remoto: cae a local si está permitido; si no, propaga."""
+        self._remote_failures += 1
+        if not self.remote_fallback_local:
+            raise exc
+        print(
+            f"   [COREF] ⚠ Stanza remoto falló ({exc!r}); "
+            f"usando Stanza local (fallo {self._remote_failures}/"
+            f"{self.remote_max_failures})."
+        )
+        logger.warning("Stanza remoto falló (%s); usando Stanza local", exc)
+        if self._remote_failures >= self.remote_max_failures:
+            print(
+                "   [COREF] ⚠ Stanza remoto DESACTIVADO tras "
+                f"{self._remote_failures} fallos seguidos; Stanza local."
+            )
+            logger.warning(
+                "Stanza remoto desactivado tras %d fallos seguidos",
+                self._remote_failures,
+            )
+            self.remote_url = ""
+        if texts is not None:
+            return self._batch_local(texts)
+        return self._single_local(text)
+
+    def _single_local(self, text: str) -> List[str]:
+        """Una llamada local. Cualquier fallo = sin sujetos (igual que antes)."""
         try:
             pipe = self._get()
             if not pipe:
@@ -122,7 +204,7 @@ class StanzaRootExtractor:
             logger.error("[COREF] Subject extraction  failure: %s", e)
             return []
 
-    def batch(self, texts: Sequence[str]) -> List[List[str]]:
+    def _batch_local(self, texts: Sequence[str]) -> List[List[str]]:
         """Un solo ``bulk_process`` para todos los textos no vacíos (mismo orden).
 
         Lanza si algo falla: ``RootSubjectCache`` reintenta ese lote uno a uno.
@@ -142,6 +224,27 @@ class StanzaRootExtractor:
         for i, d in zip(idx, docs):
             out[i] = subjects_from_doc(d)
         return out
+
+    def single(self, text: str) -> List[str]:
+        """Una llamada. Cualquier fallo = sin sujetos (igual que antes)."""
+        if self.remote:
+            try:
+                return self._post([text])[0]
+            except Exception as e:
+                return self._remote_failed(e, text=text)
+        return self._single_local(text)
+
+    def batch(self, texts: Sequence[str]) -> List[List[str]]:
+        """Un solo ``bulk_process`` (o una llamada HTTP) para todos los textos no vacíos.
+
+        Lanza si algo falla: ``RootSubjectCache`` reintenta ese lote uno a uno.
+        """
+        if self.remote:
+            try:
+                return self._post(list(texts))
+            except Exception as e:
+                return self._remote_failed(e, texts=list(texts))
+        return self._batch_local(texts)
 
 
 class RootSubjectCache:

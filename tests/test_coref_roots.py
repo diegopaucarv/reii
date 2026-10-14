@@ -33,7 +33,9 @@ class Counter:
 def test_root_context_keeps_last_500_chars():
     assert root_context("abc") == "abc"
     long = "x" * 700 + "FIN"
-    assert root_context(long) == long[-ROOT_CTX_CHARS:] and root_context(long).endswith("FIN")
+    assert root_context(long) == long[-ROOT_CTX_CHARS:] and root_context(long).endswith(
+        "FIN"
+    )
 
 
 def test_boundary_tails_skip_last_group_and_empties():
@@ -89,6 +91,24 @@ def test_batch_extractor_used_and_falls_back_on_error():
     assert rc2.get("Bea b") == {"Bea"} and rc2._batch is None  # degradó a individual
 
 
+def test_empty_cache_is_falsy_so_or_pattern_loses_batch():
+    """Regresión: ``RootSubjectCache`` define ``__len__``, así que una caché
+    VACÍA es falsy. El patrón ``getattr(ps, 'root_cache', None) or
+    RootSubjectCache(...)`` crearía una caché nueva SIN el extractor por lotes
+    (matando el batching). Hay que comprobar ``is None`` explícito.
+    """
+
+    def batch(ts):
+        return [fake_roots(t) for t in ts]
+
+    rc = RootSubjectCache(fake_roots, batch, batch_size=2)
+    assert rc._batch is not None  # el extractor por lotes SÍ está
+    assert not rc  # pero la caché vacía es falsy (len(_store) == 0)
+    # el patrón correcto preserva el extractor:
+    chosen = rc if rc is not None else RootSubjectCache(fake_roots)
+    assert chosen._batch is not None
+
+
 def test_transient_batch_failure_keeps_batching_for_later_chunks():
     seen = []
 
@@ -102,10 +122,19 @@ def test_transient_batch_failure_keeps_batching_for_later_chunks():
     rc.prefetch(["Mala x", "Ana a", "Bea b", "Cai c"])
     # el primer lote falla (se resuelve uno a uno) pero el segundo sigue yendo por lote
     assert seen == [["Mala x", "Ana a"], ["Bea b", "Cai c"]] and rc._batch is not None
-    assert [rc.get(t) for t in ("Mala x", "Ana a", "Bea b", "Cai c")] == [{"Mala"}, {"Ana"}, {"Bea"}, {"Cai"}]
+    assert [rc.get(t) for t in ("Mala x", "Ana a", "Bea b", "Cai c")] == [
+        {"Mala"},
+        {"Ana"},
+        {"Bea"},
+        {"Cai"},
+    ]
 
-    rc3 = RootSubjectCache(fake_roots, lambda ts: 1 / 0, batch_size=2, max_batch_failures=2)
-    rc3.prefetch(["A a", "B b", "C c", "D d", "E e", "F f"])  # 2 fallos seguidos -> se apaga
+    rc3 = RootSubjectCache(
+        fake_roots, lambda ts: 1 / 0, batch_size=2, max_batch_failures=2
+    )
+    rc3.prefetch(
+        ["A a", "B b", "C c", "D d", "E e", "F f"]
+    )  # 2 fallos seguidos -> se apaga
     assert rc3._batch is None
 
 
@@ -135,7 +164,12 @@ def test_new_flow_matches_old_flow_and_never_asks_for_more(seed):
     groups, k = [], 0
     for _ in range(n_groups):
         size = rng.randint(1, 4)
-        groups.append([U(k + j, f"Sujeto{k + j} dijo algo {rng.randint(0, 3)}") for j in range(size)])
+        groups.append(
+            [
+                U(k + j, f"Sujeto{k + j} dijo algo {rng.randint(0, 3)}")
+                for j in range(size)
+            ]
+        )
         k += size
     decisions = [rng.random() < 0.5 for _ in range(n_groups)]
     all_uces = [u for g in groups for u in g]
@@ -150,7 +184,9 @@ def test_new_flow_matches_old_flow_and_never_asks_for_more(seed):
     tails = boundary_tails(groups)
     rc.prefetch([root_context(u.texto) for u in tails])
     new = {u.id: rc.get(root_context(u.texto)) for u in tails}
-    new_seen = _simulate(groups, decisions, lambda u: new[u.id])  # KeyError si faltara alguna cola
+    new_seen = _simulate(
+        groups, decisions, lambda u: new[u.id]
+    )  # KeyError si faltara alguna cola
 
     assert new_seen == old_seen
     assert len(ex.calls) <= len(tails) <= max(0, len(groups) - 1) <= len(all_uces)
