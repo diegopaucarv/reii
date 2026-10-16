@@ -107,6 +107,13 @@ BEST_PARAMS_PATH: str = str(
 UCE_CALIBRATION_PATH: str = str(
     ROOT_DIR / os.environ.get("REII_UCE_CALIBRATION_PATH", "data/uce_calibration.json")
 )
+# Cache en disco de las cadenas coref precomputadas por context_units
+# (ver Optimizador._ensure_coref_chains en main_workflow.py). Mismo patrón
+# de invalidación por huella del corpus + segmentación que UCE_CALIBRATION_PATH.
+COREF_CHAINS_CACHE_PATH: str = str(
+    ROOT_DIR
+    / os.environ.get("REII_COREF_CHAINS_CACHE_PATH", "data/coref_chains_cache.json")
+)
 DISCOURSE_STATE_PATH: str = str(
     ROOT_DIR / os.environ.get("REII_DISCOURSE_STATE_PATH", "data/discourse_state.json")
 )

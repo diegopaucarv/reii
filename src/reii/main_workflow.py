@@ -20,7 +20,7 @@ from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import nltk
 import numpy as np
@@ -42,6 +42,7 @@ from transformers import utils
 
 from reii.config import (
     BEST_PARAMS_PATH,
+    COREF_CHAINS_CACHE_PATH,
     CORPUS_NAME,
     DATABASE_URL,
     EMBEDDING_MODEL_NAME,
@@ -57,6 +58,13 @@ from reii.config import (
 )
 from reii.config import (
     DATA_DIR as REII_DATA_DIR,
+)
+from reii.coref_cache import (
+    atomic_write_json,
+    build_cache_document,
+    file_lock,
+    load_cache,
+    missing_ctx_values,
 )
 from reii.gram.gramatical_analyzer import (
     UCE,
@@ -290,6 +298,9 @@ for indice_orden, ruta_json in enumerate(archivos_json):
 # documentos sin cambios). Para forzar el reprocesamiento completo:
 #   python src/reii/main_workflow.py --force
 # (o --reprocess, alias).
+# Para elegir el modo de clasificación (A/B/C):
+#   python src/reii/main_workflow.py --mode wc_only|emb_only|all
+# (ver _parse_cli_mode más abajo).
 _FORCE_REPROCESS = "--force" in sys.argv or "--reprocess" in sys.argv
 if not _FORCE_REPROCESS:
     try:
@@ -315,6 +326,50 @@ if not _FORCE_REPROCESS:
             uwu = {k: v for k, v in uwu.items() if k not in _procesados}
     except Exception as _e:
         print(f"   [WARNING] No se pudo verificar docs procesados: {_e}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# MODO DE CLASIFICACIÓN VÍA CLI (--mode)
+# ══════════════════════════════════════════════════════════════════════
+#   python src/reii/main_workflow.py --mode wc_only
+#   python src/reii/main_workflow.py --mode emb_only
+#   python src/reii/main_workflow.py --mode all
+# El flag --mode gana sobre el override de ConfigStore (dashboard/PostgreSQL).
+_CLI_MODES_VALIDOS = {
+    "wc_only",
+    "coref_only",
+    "emb_only",
+    "wc_coref",
+    "wc_emb",
+    "coref_emb",
+    "all",
+    # aliases legacy
+    "both",
+    "sim_only",
+    "wc_sim",
+    "sim_emb",
+}
+
+
+def _parse_cli_mode() -> Optional[str]:
+    """Devuelve el modo de --mode si está presente; valida y sale con error si es inválido."""
+    if "--mode" not in sys.argv:
+        return None
+    i = sys.argv.index("--mode")
+    if i + 1 >= len(sys.argv) or sys.argv[i + 1].startswith("--"):
+        print(
+            "   [ERROR] --mode requiere un valor. Válidos: "
+            + ", ".join(sorted(_CLI_MODES_VALIDOS))
+        )
+        sys.exit(2)
+    mode = sys.argv[i + 1].strip().lower()
+    if mode not in _CLI_MODES_VALIDOS:
+        print(
+            f"   [ERROR] --mode inválido: {mode!r}. Válidos: "
+            + ", ".join(sorted(_CLI_MODES_VALIDOS))
+        )
+        sys.exit(2)
+    return mode
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -7012,26 +7067,28 @@ class Optimizador:
         self._precomputed_chains: Optional[Dict[int, Dict[str, List]]] = None
         if progressive_segmenter is not None:
             try:
-                self._precomputed_chains = self._precompute_coref_chains()
+                self._precomputed_chains = self._load_coref_cache() or {}
             except Exception as e:
                 logger.warning(
-                    "Precomputación de cadenas coref falló (%s). "
-                    "El optimizador degradará a wc_emb.",
+                    "Carga del cache de cadenas coref falló (%s). "
+                    "Se extraerán lazy por trial.",
                     e,
                 )
-                self._precomputed_chains = None
+                self._precomputed_chains = {}
 
         print(
             f"   [Optimizador] Caché listo en {time.time() - start_time:.2f}s. "
             f"Total UCEs: {self.total_uces}"
             + (
-                f" · cadenas coref precomputadas para ctx={list(self._precomputed_chains.keys())}"
-                if self._precomputed_chains
+                f" · cadenas coref cargadas para ctx={list(self._precomputed_chains.keys())}"
+                if self._precomputed_chains is not None
                 else " · sin coref (modo degradado)"
             )
         )
 
-    def _precompute_coref_chains(self) -> Dict[int, Dict[str, List]]:
+    def _precompute_coref_chains(
+        self, ctx_values: Optional[Iterable[int]] = None
+    ) -> Dict[int, Dict[str, List]]:
         """
         Extrae cadenas de correferencia por documento para cada valor de
         context_units que el optimizador puede pedir (TODO el espacio de
@@ -7046,16 +7103,17 @@ class Optimizador:
         # los defaults del config). Si solo precomputáramos {2, 4}, cualquier
         # trial con context_units ∈ {1, 3, 5} caería al fallback de
         # re-extracción de cadenas con Stanza remoto (la parte cara).
-        try:
-            space = self.get_search_space()
-            tight_vals = space.get("coref_context_units_tight", [2])
-            loose_vals = space.get("coref_context_units_loose", [4])
-            ctx_values = set(tight_vals) | set(loose_vals)
-        except Exception:
-            ctx_values = {
-                int(getattr(self.config_base, "coref_context_units_tight", 2)),
-                int(getattr(self.config_base, "coref_context_units_loose", 4)),
-            }
+        if ctx_values is None:
+            try:
+                space = self.get_search_space()
+                tight_vals = space.get("coref_context_units_tight", [2])
+                loose_vals = space.get("coref_context_units_loose", [4])
+                ctx_values = set(tight_vals) | set(loose_vals)
+            except Exception:
+                ctx_values = {
+                    int(getattr(self.config_base, "coref_context_units_tight", 2)),
+                    int(getattr(self.config_base, "coref_context_units_loose", 4)),
+                }
         # Excluir el valor 0 o negativos por seguridad
         ctx_values = {int(c) for c in ctx_values if int(c) > 0}
         if not ctx_values:
@@ -7131,6 +7189,81 @@ class Optimizador:
                 f"en {len(by_doc)} documentos precomputadas."
             )
         return result
+
+    def _coref_cache_key(self, fp: str) -> str:
+        """Clave compuesta de invalidación: corpus + segmentación."""
+        uce_target = int(getattr(self.config_base, "uce_target_size", 26))
+        min_words = int(getattr(self.config_base, "min_uce_words", 2))
+        return f"{fp}:{uce_target}:{min_words}"
+
+    def _load_coref_cache(self) -> Optional[Dict[int, Dict[str, List]]]:
+        """Carga el cache en disco si su cache_key coincide con el corpus +
+        segmentación actuales. Devuelve None si no hay cache válido."""
+        fp = _corpus_fingerprint()
+        cache_key = self._coref_cache_key(fp)
+        return load_cache(COREF_CHAINS_CACHE_PATH, cache_key)
+
+    def _save_coref_cache(self, chains: Dict[int, Dict[str, List]]) -> None:
+        """Persiste el dict completo de cadenas de forma atómica, sellado con
+        cache_key. Nunca lanza (fallo de escritura se loguea y se ignora)."""
+        fp = _corpus_fingerprint()
+        cache_key = self._coref_cache_key(fp)
+        doc = build_cache_document(cache_key, fp, chains)
+        try:
+            atomic_write_json(COREF_CHAINS_CACHE_PATH, doc)
+        except OSError as e:
+            logger.warning("No se pudo guardar el cache de cadenas coref: %s", e)
+
+    def _ensure_coref_chains(self, ctx_values: Iterable[int]) -> None:
+        """Garantiza que cada ctx en ctx_values esté en self._precomputed_chains.
+        Extrae solo los faltantes (lazy) y persiste incrementalmente. Idempotente.
+        Nunca lanza: un fallo deja el dict como estaba y el fallback de
+        _clasificar_umbral_coref cubre la ausencia.
+
+        Con n_jobs>1 (multiprocessing) cada worker tiene su propia copia del
+        dict; el lock de archivo serializa load+compute+save entre workers
+        para evitar trabajo duplicado. Si el lock no se puede adquirir en
+        `timeout`, se procede sin lock (la escritura atómica evita corrupción;
+        el peor caso es trabajo duplicado).
+        """
+        if self.progressive_segmenter is None:
+            return
+        if self._precomputed_chains is None:
+            self._precomputed_chains = {}
+        missing = missing_ctx_values(ctx_values, self._precomputed_chains)
+        if not missing:
+            return
+        lock_path = COREF_CHAINS_CACHE_PATH + ".lock"
+        try:
+            with file_lock(lock_path, timeout=300.0):
+                # Re-check bajo el lock: otro worker pudo computar/guardar
+                # mientras esperábamos.
+                missing = missing_ctx_values(ctx_values, self._precomputed_chains)
+                if missing:
+                    disk = self._load_coref_cache() or {}
+                    for c in list(missing):
+                        if c in disk:
+                            self._precomputed_chains[c] = disk[c]
+                            missing.remove(c)
+                if missing:
+                    self._compute_and_save_coref(missing)
+        except OSError as e:
+            logger.warning(
+                "No se pudo adquirir el lock del cache coref (%s). "
+                "Se procede sin lock (escritura atómica; puede duplicar trabajo).",
+                e,
+            )
+            self._compute_and_save_coref(missing)
+
+    def _compute_and_save_coref(self, ctx_values: Iterable[int]) -> None:
+        """Computa los ctx faltantes y persiste el cache. Nunca lanza."""
+        try:
+            new_chains = self._precompute_coref_chains(ctx_values)
+        except Exception as e:
+            logger.warning("Extracción lazy de cadenas coref falló (%s).", e)
+            return
+        self._precomputed_chains.update(new_chains)
+        self._save_coref_cache(self._precomputed_chains)
 
     # ══════════════════════════════════════════════════════════════════════
     # Persistencia del frente de Pareto
@@ -7494,6 +7627,12 @@ class Optimizador:
         # ── Gate: tight debe ser estrictamente menor que loose ───────────
         if cfg.coref_context_units_tight >= cfg.coref_context_units_loose:
             return _SENTINEL_TRIAL
+
+        # ── Lazy: asegurar cadenas coref para los ctx de ESTE trial ──────
+        if self.progressive_segmenter is not None:
+            self._ensure_coref_chains(
+                [cfg.coref_context_units_tight, cfg.coref_context_units_loose]
+            )
 
         uc_cfg = copy.deepcopy(self.uc_config)
         uc_cfg.similarity_threshold = params.get(
@@ -8501,12 +8640,15 @@ class WorkflowOrchestrator:
 
         if best_params is None and self.config.optimize:
             # ── Mini pass-1 (retrofitting) ANTES del optimizador ─────────────
-            # Corre con use_embeddings en su estado normal (True) para que el
-            # clustering CHD sea consistente con el pass-1 principal. Así el
-            # optimizador puede evaluar classification_mode="all" completo
-            # (Method C / embeddings) en lugar de degradar a "wc_coref".
+            # Solo necesita el resultado word-count (resultados[0]) para
+            # computar los vectores retrofitted. Forzamos wc_only para NO
+            # correr coref/embeddings aquí (la extracción coref es muy lenta
+            # y no aporta nada al retrofitting). El optimizador ya precomputa
+            # las cadenas coref por separado en __init__.
             retro_vecs_for_optimizer: Optional[Dict[str, np.ndarray]] = None
+            _saved_mode = self.config.classification_mode
             try:
+                self.config.classification_mode = "wc_only"
                 (
                     _,
                     _,
@@ -8532,6 +8674,8 @@ class WorkflowOrchestrator:
                     e,
                 )
                 retro_vecs_for_optimizer = None
+            finally:
+                self.config.classification_mode = _saved_mode
 
             # Desactivar embeddings durante la optimización (coste)
             self.config.use_embeddings = False
@@ -9199,6 +9343,14 @@ if __name__ == "__main__":
             alceste_config = dataclasses.replace(alceste_config, **_valid)
     except Exception as e:
         print(f"   [WARNING] ConfigStore apply falló: {e}")
+
+    # ── Override CLI: --mode gana sobre ConfigStore ─────────────────────
+    _cli_mode = _parse_cli_mode()
+    if _cli_mode is not None:
+        alceste_config = dataclasses.replace(
+            alceste_config, classification_mode=_cli_mode
+        )
+        print(f"   [CLI] classification_mode={_cli_mode} (--mode override)")
 
     gram_config = GramConfig(
         min_tokens_por_uce=30,
