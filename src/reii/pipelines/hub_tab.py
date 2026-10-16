@@ -12,6 +12,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 import streamlit as st
 
+from reii.config import DISCOURSE_DIR
+from reii.pipelines.dependency_graph import WORKFLOW_META, load_workflow_specs
 from reii.pipelines.registry import BY_ID, HEADLINE, PIPELINES
 
 STATE_LABEL = {
@@ -321,6 +323,44 @@ def _checkpoints_section() -> None:
             st.warning(f"No se pudo acceder a los checkpoints: {_cpe}")
 
 
+def _dependency_map(ctx: HubContext) -> None:
+    """Mapa de dependencias entre los agentes del discurso (multiagente).
+
+    Muestra, por workflow (Cohesión / Crítico / Léxico), las capas de agentes
+    derivadas de ``dependency_graph``: la capa N depende de la capa N-1. Es
+    defensivo: si no se pueden cargar los JSONs, muestra un aviso en vez de
+    romper la pestaña.
+    """
+    with st.expander("🧭 Mapa de dependencias (multiagente)", expanded=False):
+        try:
+            specs = load_workflow_specs(str(DISCOURSE_DIR))
+        except Exception as _e:
+            st.caption(f"No se pudo cargar el mapa de dependencias: {_e}")
+            return
+
+        if not specs:
+            st.caption(
+                "No hay workflows de discurso disponibles (ia/analisis_discursivo/)."
+            )
+            return
+
+        for wf_name, (display_name, description) in WORKFLOW_META.items():
+            spec = specs.get(wf_name)
+            if spec is None:
+                continue
+            with st.expander(f"{display_name} — {description}", expanded=False):
+                if not spec.layers:
+                    st.caption("Sin agentes activos en este workflow.")
+                    continue
+                for i, layer in enumerate(spec.layers, start=1):
+                    if i == 1:
+                        st.markdown(f"**Capa {i}** (sin dependencias previas)")
+                    else:
+                        st.markdown(f"**Capa {i}** (depende de la capa {i - 1})")
+                    for agent in layer:
+                        st.markdown(f"- `{agent.name}`")
+
+
 def _tab_discourse(ctx: HubContext) -> None:
     _how_it_works("discourse")
     source = st.radio(
@@ -357,6 +397,7 @@ def _tab_discourse(ctx: HubContext) -> None:
     )
     _checkpoints_section()
     _run_panel(ctx, "discourse")
+    _dependency_map(ctx)
     if ctx.render_agents_crud:
         with st.expander("Agentes y prompts (ia/*.json)", expanded=False):
             st.caption(

@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -51,6 +52,7 @@ from reii.config import (
     STANZA_SERVER_URL,
     TOGETHER_API_KEY,
     TOGETHER_BASE_URL,
+    UCE_CALIBRATION_PATH,
     WORKFLOW_DB_PATH,
 )
 from reii.config import (
@@ -91,8 +93,12 @@ from reii.seg.coref_checkpoint import (
     _guardar_checkpoint_coref,
     checkpoint_path_for_pass,
 )
+from reii.seg.forms_merging import agrupar_secuencial_por_umbral, formas_distintas
 from reii.seg.root_cache import RootSubjectCache, boundary_tails, root_context
+from reii.seg.segment_grouping import agrupar_segmentos_por_seccion
 from reii.seg.segmentador import ProgressiveSegmenter
+from reii.seg.uce_calibration import calibrate as _calibrar_bayesiano
+from reii.seg.uce_calibration import desired_avg_for_corpus
 
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
@@ -343,6 +349,110 @@ def _corpus_fingerprint() -> str:
     return h.hexdigest()[:16]
 
 
+def _corpus_total_words(corpus_raw) -> int:
+    """Palabras totales del corpus (conteo crudo, .split()) — usado para
+    elegir el promedio deseado por tamaño de corpus (desired_avg_for_corpus),
+    la misma tabla que ALCESTE usa para auto-calibrar su UCE."""
+    total = 0
+    for doc_data in corpus_raw.values():
+        for seg in doc_data.get("texto_segmentos", []):
+            total += len((seg.get("texto") or "").split())
+    return total
+
+
+def calibrar_uce_target_size(
+    segmentador: "SegmentadorALCESTE",
+    corpus_raw,
+    desired_avg: Optional[float] = None,
+    bounds: Optional[Tuple[int, int]] = None,
+    max_evals: Optional[int] = None,
+    cache_path: Optional[str] = None,
+    force: bool = False,
+) -> Optional[int]:
+    """Calibra uce_target_size contra ESTE corpus y devuelve el valor a usar,
+    o None si la calibración falla o está desactivada (el llamador debe
+    conservar el uce_target_size que ya tenía en ese caso — nunca lo pisa
+    con un valor inventado).
+
+    Cachea el resultado en `cache_path` (por defecto UCE_CALIBRATION_PATH)
+    bajo la huella del corpus (_corpus_fingerprint), mismo mecanismo de
+    invalidación que best_params.json: si el corpus cambia, el cache se
+    descarta solo y se recalibra. `force=True` ignora el cache existente.
+
+    Nunca lanza: cualquier fallo (spaCy no disponible, corpus vacío, lo que
+    sea) se registra con logger.warning y devuelve None — la calibración es
+    una mejora opcional, no debe poder tumbar una corrida.
+    """
+    cfg = segmentador.config
+    bounds = bounds or getattr(cfg, "uce_calibration_bounds", (14, 30))
+    max_evals = max_evals or getattr(cfg, "uce_calibration_max_evals", 5)
+    desired_avg = (
+        desired_avg
+        if desired_avg is not None
+        else getattr(cfg, "uce_calibration_desired_avg", None)
+    )
+    cache_path = cache_path or UCE_CALIBRATION_PATH
+
+    try:
+        if desired_avg is None:
+            desired_avg = desired_avg_for_corpus(_corpus_total_words(corpus_raw))
+
+        fp = _corpus_fingerprint()
+        cache_key = f"{fp}:{desired_avg}:{bounds[0]}-{bounds[1]}"
+
+        if not force and os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                if cached.get("cache_key") == cache_key:
+                    print(
+                        f"   [UCE-calib] cache válido ({cache_path}): "
+                        f"uce_target_size={cached['target']} "
+                        f"(promedio real medido: {cached['measured_avg']:.1f})"
+                    )
+                    return int(cached["target"])
+            except (OSError, json.JSONDecodeError, KeyError) as e:
+                logger.warning("   [UCE-calib] cache ilegible, recalibrando: %s", e)
+
+        docs_muestra = segmentador.muestra_para_calibracion(corpus_raw)
+        if not docs_muestra:
+            logger.warning("   [UCE-calib] corpus vacío, no se calibra.")
+            return None
+
+        def measure_fn(target: int):
+            return segmentador.medir_promedio_real(docs_muestra, target)
+
+        resultado = _calibrar_bayesiano(
+            measure_fn, desired_avg=desired_avg, bounds=bounds, max_evals=max_evals
+        )
+        print(f"   [UCE-calib] {resultado.summary()}")
+
+        try:
+            os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "cache_key": cache_key,
+                        "target": resultado.target,
+                        "desired_avg": resultado.desired_avg,
+                        "measured_avg": resultado.measured_avg,
+                        "converged": resultado.converged,
+                        "n_mediciones": len(resultado.observations),
+                    },
+                    f,
+                    indent=2,
+                )
+        except OSError as e:
+            logger.warning("   [UCE-calib] no se pudo guardar el cache: %s", e)
+
+        return resultado.target
+    except Exception as e:
+        logger.warning(
+            "   [UCE-calib] calibración falló, se conserva el target actual: %s", e
+        )
+        return None
+
+
 # ══════════════════════════════════════════════════════════════════════
 # CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════════════
@@ -363,8 +473,26 @@ class Config:
     stem_backend: str = "snowball"  # 'snowball' | 'none'
 
     min_uce_words: int = 2  # era 3; alineado con C (UCEs cortas)
-    uce_target_size: int = 26  # era getattr(..., 40); rango Reinert 12–18
+    uce_target_size: int = 26  # objetivo de entrada; ver auto_calibrate_uce_size
     min_forms_uc: List[int] = field(default_factory=lambda: [13, 17])
+
+    # Auto-calibración bayesiana de uce_target_size (ver calibrar_uce_target_size
+    # y reii.seg.uce_calibration): corrige, ANTES de segmentar el corpus completo,
+    # el sesgo entre el objetivo de entrada y el promedio real de palabras/UCE
+    # que produce _segmentar_reinert_spacy en ESTE corpus — el sesgo depende de
+    # la densidad de puntuación del texto, no es una constante universal.
+    # uce_target_size de arriba queda como PUNTO DE PARTIDA si la calibración
+    # está desactivada o falla; con auto_calibrate_uce_size=True, se reemplaza
+    # por el valor calibrado antes de la segmentación real.
+    auto_calibrate_uce_size: bool = True
+    uce_calibration_bounds: Tuple[int, int] = (
+        14,
+        30,
+    )  # rango Reinert, nunca se sale de aquí
+    uce_calibration_desired_avg: Optional[float] = (
+        None  # None → tabla ALCESTE por tamaño de corpus
+    )
+    uce_calibration_max_evals: int = 5
 
     tsj: int = 3
     use_poisson_tsj: bool = False
@@ -471,8 +599,30 @@ class Config:
     optimize_directions: Tuple[str, ...] = ("maximize", "maximize", "minimize")
     # Preferencia sobre el frente de Pareto al seleccionar la solución final
     optimize_preference: str = "max_ari"  # "max_ari" | "max_coverage" | "knee"
-    # Gate duro de cobertura (Recomendación A) — prune si cae por debajo
-    optimize_coverage_gate: float = 0.65
+    # Gate duro de cobertura (Recomendación A) — prune si cae por debajo.
+    # 0.65 era inalcanzable: la estabilidad A1↔A2 real del corpus es
+    # 23-52%, así que todos los trials caían en centinela y nunca se
+    # escribía best_params.json. 0.25 filtra degenerados sin matar realistas.
+    optimize_coverage_gate: float = 0.25
+    # Gate duro de cobertura para el modo all (optimizador de etapa 2).
+    # Evidencia empírica (mockup edge case C): la cobertura estructural
+    # de la triple intersección se estaciona en ~26% bajo ruido realista,
+    # con mínimo observado ~20% en corpus de 300 UCEs. Un gate de 0.25
+    # sentineliza trials legítimos. 0.10 filtra degenerados extremos
+    # (K=1, todos en un cluster) sin matar soluciones reales.
+    optimize_coverage_gate_all: float = 0.10
+
+    # Modo del veredicto final de estabilidad:
+    #   "all"           → triple intersección (dentro + cross). Default, ALCESTE puro.
+    #   "two_of_three"  → 2-de-3 dentro + 2-de-3 cross. SÓLO diagnóstico;
+    #                     vulnerable cuando dos métodos comparten sesgo (edge case B2).
+    verdict_mode: str = "all"
+
+    # Fuente del cluster_id en el veredicto final:
+    #   "wc"        → ancla en word-count tight (comportamiento actual). Default.
+    #   "consensus" → por UCE, etiqueta del método con mayor ARI medio contra
+    #                 los otros dos (heterogéneo dentro del run). NO ACTIVO aún.
+    primary_cluster_source: str = "wc"
 
     prune_small_clusters: bool = False
     min_class_size: int = 19
@@ -1045,7 +1195,11 @@ class UCBuilder:
         """
 
         def content_forms(start: int, end: int) -> int:
-            return sum(len(doc_uces[i].lemmas) for i in range(start, end + 1))
+            # Formas analizadas DISTINTAS (semántica de ALCESTE), no el
+            # total con repeticiones — misma función que usa construir_ucs
+            # (método A), ver reii.seg.forms_merging.
+            lemmas_por_item = [u.lemmas for u in doc_uces]
+            return formas_distintas(lemmas_por_item, start, end)
 
         def seg_vec(start: int, end: int) -> np.ndarray:
             vecs = [
@@ -1664,12 +1818,18 @@ class SegmentadorALCESTE:
         )
         self.doc_metadata_map = {}
 
-    def _segmentar_reinert_spacy(self, doc) -> List:
-        """Segment a full document Doc into UCE spans with global char offsets."""
+    def _segmentar_reinert_spacy(self, doc, ideal_size: Optional[int] = None) -> List:
+        """Segment a full document Doc into UCE spans with global char offsets.
+
+        ideal_size : si se pasa, anula ``self.config.uce_target_size`` SOLO para
+          esta llamada (usado por la auto-calibración para probar varios
+          targets sobre el mismo ``doc`` ya parseado, sin repetir spaCy).
+        """
         if len(doc) == 0:
             return []
 
-        ideal_size = getattr(self.config, "uce_target_size", 12)
+        if ideal_size is None:
+            ideal_size = getattr(self.config, "uce_target_size", 12)
         window = int(ideal_size * 0.4)
 
         weights = np.array(
@@ -1720,6 +1880,58 @@ class SegmentadorALCESTE:
 
         return segments
 
+    def muestra_para_calibracion(
+        self, corpus_raw, max_textos: int = 80, seed: int = 42
+    ) -> List:
+        """Parsea con spaCy una muestra de los bloques por-sección del corpus
+        (ya agrupados como los verá segmentar_en_uces), UNA sola vez, para
+        reutilizarla en todas las mediciones de medir_promedio_real — cada
+        target de uce_target_size que se prueba solo repite el corte (barato,
+        sin spaCy), nunca el parseo (caro).
+
+        Si el corpus tiene <= max_textos bloques, se usan todos (sin
+        muestreo). Con más, se toma una muestra aleatoria con semilla fija
+        para que la calibración sea reproducible.
+        """
+        textos: List[str] = []
+        for doc_data in corpus_raw.values():
+            for _seccion, texto in agrupar_segmentos_por_seccion(
+                doc_data.get("texto_segmentos", [])
+            ):
+                if texto.strip():
+                    textos.append(texto)
+
+        if len(textos) > max_textos:
+            textos = random.Random(seed).sample(textos, max_textos)
+
+        return [self.nlp(t) for t in textos]
+
+    def medir_promedio_real(
+        self, docs_muestra: List, target: int
+    ) -> Tuple[float, float, int]:
+        """Promedio, desvío estándar y tamaño de muestra de palabras/UCE que
+        produce `target` como uce_target_size, sobre los documentos YA
+        parseados en docs_muestra (ver muestra_para_calibracion).
+
+        Usado como measure_fn de reii.seg.uce_calibration.calibrate: la
+        firma (target) -> (media, std, n) es exactamente la que esa función
+        espera. Reutiliza el mismo filtro min_uce_words que segmentar_en_uces,
+        para que la medición sea fiel a lo que de verdad va a producir el
+        corte real.
+        """
+        largos: List[int] = []
+        for doc in docs_muestra:
+            for span in self._segmentar_reinert_spacy(doc, ideal_size=target):
+                n = len(span.text.split())
+                if n >= self.config.min_uce_words:
+                    largos.append(n)
+
+        if not largos:
+            return (0.0, 0.0, 0)
+        arr = np.array(largos, dtype=float)
+        std = float(arr.std(ddof=1)) if len(arr) > 1 else 1.0
+        return (float(arr.mean()), std, len(arr))
+
     def segmentar_en_uces(self, corpus_raw):
         uces_por_doc = []
         self.doc_metadata_map = {}
@@ -1749,14 +1961,17 @@ class SegmentadorALCESTE:
             section_registry: Dict[str, int] = {}
             local_section_counter = 0
 
-            # Stop guessing with character offsets. Read the damn JSON segments directly.
-            for seg in segmentos:
-                seg_text = seg.get("texto", "").strip()
-                seccion = seg.get("otros_datos", {}).get("seccion", "Sin_Seccion")
-
-                if not seg_text:
-                    continue
-
+            # Antes: se parseaba y cortaba CADA seg por separado, así que
+            # cualquier seg de <=ideal_size+window tokens se volvía UNA UCE
+            # entera sin importar qué tan corto fuera (ver la guarda
+            # `remaining <= ideal_size+window` en _segmentar_reinert_spacy),
+            # generando una "cola" forzada por cada segmento de la entrevista.
+            # ALCESTE concatena STC libremente dentro de todo el u.c.i., sin
+            # ese límite artificial. Ahora se concatena todo el texto de una
+            # misma sección (misma semántica que ya usaba section_registry
+            # para agrupar, solo que antes NO se usaba para concatenar el
+            # texto, solo para el id) y se corta una sola vez por sección.
+            for seccion, seg_text in agrupar_segmentos_por_seccion(segmentos):
                 if seccion not in section_registry:
                     section_registry[seccion] = local_section_counter
                     local_section_counter += 1
@@ -1767,7 +1982,10 @@ class SegmentadorALCESTE:
                     "seccion": seccion,
                 }
 
-                # Parse just this perfectly-sectioned segment with Spacy
+                # NOTA: start_char/end_char quedan relativos a este texto
+                # concatenado por sección (como antes quedaban relativos al
+                # seg_text individual) — no son offsets dentro de
+                # texto_completo_txt ni antes ni ahora.
                 doc_spacy = self.nlp(seg_text)
                 spans = self._segmentar_reinert_spacy(doc_spacy)
 
@@ -1800,7 +2018,14 @@ class SegmentadorALCESTE:
                 uces_por_doc.append(doc_uces)
 
         total = sum(len(d) for d in uces_por_doc)
-        print(f"   {total} UCEs en {len(uces_por_doc)} documentos.")
+        largos = [len(u.texto.split()) for d in uces_por_doc for u in d]
+        promedio = (sum(largos) / len(largos)) if largos else 0.0
+        objetivo = getattr(self.config, "uce_target_size", None)
+        print(
+            f"   {total} UCEs en {len(uces_por_doc)} documentos. "
+            f"Promedio real: {promedio:.1f} palabras/UCE "
+            f"(objetivo uce_target_size={objetivo})."
+        )
         return uces_por_doc, self.doc_metadata_map
 
     def lematizar_uces(self, uces: List[UCE]) -> List[UCE]:
@@ -1977,86 +2202,41 @@ class SegmentadorALCESTE:
         return uces
 
     def construir_ucs(self, uces_por_doc, min_forms, doc_metadata_map):
+        """Concatena UCEs consecutivas de un mismo documento hasta acumular
+        >= min_forms formas (lemas) analizadas DISTINTAS — semántica de
+        ALCESTE ("mínimo de formas analizadas distintas por UC"), no el
+        total con repeticiones. El agrupamiento en sí (qué UCEs van en cada
+        UC) lo decide `agrupar_secuencial_por_umbral`, probado aparte en
+        tests/test_forms_merging.py; aquí solo se arma el objeto UC por
+        cada grupo que devuelve.
+        """
         ucs: List[UC] = []
         uce_to_uc: Dict[str, str] = {}
 
         for doc_uces in uces_por_doc:
-            acum_ids: List[str] = []
-            acum_text: List[str] = []
-            acum_lemmas: List[str] = []
-            acum_stems: List[str] = []
-            acum_bigrams: List[Tuple] = []
-            acum_bigram_stems: List[Tuple] = []
-            acum_trigrams: List[Tuple] = []
-            acum_trigram_stems: List[Tuple] = []
-            acum_forms = 0
+            if not doc_uces:
+                continue
 
-            for uce in doc_uces:
-                acum_ids.append(uce.id)
-                acum_text.append(uce.texto)
-                acum_lemmas.extend(uce.lemmas)
-                acum_stems.extend(uce.stems)
-                acum_bigrams.extend(uce.bigrams)
-                acum_bigram_stems.extend(uce.bigram_stems)
-                acum_trigrams.extend(uce.trigrams)
-                acum_trigram_stems.extend(uce.trigram_stems)
-                acum_forms += len(uce.lemmas)
-
-                if acum_forms >= min_forms:
-                    doc_id = doc_uces[0].doc_id
-                    shared = (doc_metadata_map or {}).get(doc_id, {})
-                    full_meta = {**shared, "uce_local_idx": acum_ids[0]}
-                    uc = UC(
-                        texto=" ".join(acum_text),
-                        metadata=doc_uces[0].metadata.copy(),
-                        uce_ids=list(acum_ids),
-                        lemmas=list(acum_lemmas),
-                        stems=list(acum_stems),
-                        bigrams=list(acum_bigrams),
-                        bigram_stems=list(acum_bigram_stems),
-                        trigrams=list(acum_trigrams),
-                        trigram_stems=list(acum_trigram_stems),
-                    )
-                    ucs.append(uc)
-                    for uid in acum_ids:
-                        uce_to_uc[uid] = uc.id
-                        for u in doc_uces:
-                            if u.id == uid:
-                                u.uc_id = uc.id
-                    # Reset
-                    acum_ids = []
-                    acum_text = []
-                    acum_lemmas = []
-                    acum_stems = []
-                    acum_bigrams = []
-                    acum_bigram_stems = []
-                    acum_trigrams = []
-                    acum_trigram_stems = []
-                    acum_forms = 0
-
-            if acum_ids:
-                doc_id = doc_uces[0].doc_id
-                shared = (doc_metadata_map or {}).get(doc_id, {})
-                full_meta = {**shared, "uce_local_idx": acum_ids[0]}
+            lemmas_por_uce = [uce.lemmas for uce in doc_uces]
+            for start, end in agrupar_secuencial_por_umbral(lemmas_por_uce, min_forms):
+                grupo = doc_uces[start : end + 1]
                 uc = UC(
-                    texto=" ".join(acum_text),
+                    texto=" ".join(u.texto for u in grupo),
                     metadata=doc_uces[0].metadata.copy(),
-                    uce_ids=list(acum_ids),
-                    lemmas=list(acum_lemmas),
-                    stems=list(acum_stems),
-                    bigrams=list(acum_bigrams),
-                    bigram_stems=list(acum_bigram_stems),
-                    trigrams=list(acum_trigrams),
-                    trigram_stems=list(acum_trigram_stems),
+                    uce_ids=[u.id for u in grupo],
+                    lemmas=[lema for u in grupo for lema in u.lemmas],
+                    stems=[s for u in grupo for s in u.stems],
+                    bigrams=[b for u in grupo for b in u.bigrams],
+                    bigram_stems=[b for u in grupo for b in u.bigram_stems],
+                    trigrams=[t for u in grupo for t in u.trigrams],
+                    trigram_stems=[t for u in grupo for t in u.trigram_stems],
                 )
                 ucs.append(uc)
-                for uid in acum_ids:
-                    uce_to_uc[uid] = uc.id
-                    for u in doc_uces:
-                        if u.id == uid:
-                            u.uc_id = uc.id
+                for u in grupo:
+                    uce_to_uc[u.id] = uc.id
+                    u.uc_id = uc.id
 
-        print(f"   {len(ucs)} UCs with ≥{min_forms} forms.")
+        print(f"   {len(ucs)} UCs with ≥{min_forms} forms (distintas).")
         all_ids = [uid for uc in ucs for uid in uc.uce_ids]
         assert len(all_ids) == len(set(all_ids)), "UCE in multiple UCs"
         return ucs, uce_to_uc
@@ -3823,6 +4003,9 @@ class DoubleClassifier:
         retrofitted_vectors: Optional[Dict[str, np.ndarray]] = None,
         checkpoint_path: Optional[str] = None,
         force: bool = False,
+        precomputed_chains: Optional[
+            Dict[str, List]
+        ] = None,  # ← NUEVO: {doc_id: chains}
     ) -> Optional[Dict]:
         """
         Builds UCs by dissolving UCE boundaries that are bridged by a
@@ -4057,11 +4240,14 @@ class DoubleClassifier:
                 f"({len(premerged_groups)} grupos)..."
             )
             try:
-                global_chains = ps._extract_global_chains(
-                    segments_info,
-                    full_doc_text,
-                    context_units=context_units,
-                )
+                if precomputed_chains is not None and doc_id in precomputed_chains:
+                    global_chains = precomputed_chains[doc_id]
+                else:
+                    global_chains = ps._extract_global_chains(
+                        segments_info,
+                        full_doc_text,
+                        context_units=context_units,
+                    )
             except Exception as e:
                 logger.warning(
                     "COREF chain extraction failed for doc %s: %s",
@@ -4784,6 +4970,18 @@ class DoubleClassifier:
             primary_ids = set(stable_cross_bc)
             primary_cluster = stable_sim
 
+        elif _mode == "two_of_three":
+            wc_s = set(stable_wc)
+            sim_s = set(stable_sim)
+            emb_s = set(stable_emb)
+            ab_s = set(stable_cross_ab)
+            bc_s = set(stable_cross_bc)
+            ac_s = set(stable_cross_ac)
+            within_2of3 = (wc_s & sim_s) | (sim_s & emb_s) | (wc_s & emb_s)
+            cross_2of3 = (ab_s & bc_s) | (bc_s & ac_s) | (ab_s & ac_s)
+            primary_ids = within_2of3 & cross_2of3
+            primary_cluster = stable_wc  # ancla WC preservada
+
         else:  # "all" — full triple intersection
             wc_s = set(stable_wc)
             sim_s = set(stable_sim)
@@ -4794,6 +4992,14 @@ class DoubleClassifier:
             primary_ids = wc_s & sim_s & emb_s & ab_s & bc_s & ac_s
             primary_cluster = stable_wc  # WC1 as cluster reference
 
+        if getattr(self.config, "primary_cluster_source", "wc") == "consensus":
+            raise NotImplementedError(
+                "primary_cluster_source='consensus' no está activo en esta versión. "
+                "El análisis aguas abajo (vocabulario, φ, AFC, CAH, forma_index, "
+                "P1–P5) asume primary_cluster = stable_wc. Activar 'consensus' "
+                "requiere refactorizar esos consumidores."
+            )
+
         # ── Back-propagate to UCE objects ─────────────────────────────────
         primary_stable_uces: List[UCE] = []
 
@@ -4801,7 +5007,7 @@ class DoubleClassifier:
             for uce in doc_uces:
                 uid = uce.id
 
-                if _mode == "all":
+                if _mode in ("all", "two_of_three"):
                     uce.stable_wc = uid in stable_wc
                     uce.stable_sim = uid in stable_sim
                     uce.stable_emb = uid in stable_emb
@@ -4870,6 +5076,33 @@ class DoubleClassifier:
                 f"║  Unstable in any method:        {n_unstable:>6}  ({_pct(n_unstable)})                   ║\n"
                 f"╚{'═' * 70}╝\n"
             )
+        elif _mode == "two_of_three":
+            n_wc = len(stable_wc)
+            n_sim = len(stable_sim)
+            n_emb = len(stable_emb)
+            n_ab = len(stable_cross_ab)
+            n_bc = len(stable_cross_bc)
+            n_ac = len(stable_cross_ac)
+            summary = (
+                f"\n╔{'═' * 70}╗\n"
+                f"║{'STABILITY REPORT — TWO-OF-THREE VERDICT':^70}║\n"
+                f"╠{'═' * 70}╣\n"
+                f"║  Total UCEs:                   {n_total:>6}  (100.0%)                    ║\n"
+                f"╠{'═' * 70}╣\n"
+                f"║  WITHIN-METHOD STABILITY                                             ║\n"
+                f"║  A  Word-count   (A1↔A2):      {n_wc:>6}  ({_pct(n_wc)})  ARI={ari_wc:.3f}     ║\n"
+                f"║  B  Similarity   (B1↔B2):      {n_sim:>6}  ({_pct(n_sim)})  ARI={ari_sim:.3f}     ║\n"
+                f"║  C  Embedding    (C1↔C2):      {n_emb:>6}  ({_pct(n_emb)})  ARI={ari_emb:.3f}     ║\n"
+                f"╠{'═' * 70}╣\n"
+                f"║  CROSS-METHOD PAIRWISE                                               ║\n"
+                f"║  A↔B cross-stable:             {n_ab:>6}  ({_pct(n_ab)})  ARI={ari_cross_ab:.3f}     ║\n"
+                f"║  B↔C cross-stable:             {n_bc:>6}  ({_pct(n_bc)})  ARI={ari_cross_bc:.3f}     ║\n"
+                f"║  A↔C cross-stable:             {n_ac:>6}  ({_pct(n_ac)})  ARI={ari_cross_ac:.3f}     ║\n"
+                f"╠{'═' * 70}╣\n"
+                f"║  TWO-OF-THREE INTERSECTION:     {n_primary:>6}  ({_pct(n_primary)})                   ║\n"
+                f"║  Unstable in any method:        {n_unstable:>6}  ({_pct(n_unstable)})                   ║\n"
+                f"╚{'═' * 70}╝\n"
+            )
         elif _mode in ("wc_sim", "both"):
             n_wc = len(stable_wc)
             n_sim = len(stable_sim)
@@ -4913,6 +5146,7 @@ class DoubleClassifier:
         cached_doc_metadata_map: Optional[Dict] = None,
         checkpoint_path: Optional[str] = None,
         force: bool = False,
+        precomputed_coref_chains: Optional[Dict[int, Dict[str, List]]] = None,
     ) -> Tuple:
         self.ppmi_builder = ppmi_builder
         mode = getattr(self.config, "classification_mode", "wc_only")
@@ -5002,6 +5236,11 @@ class DoubleClassifier:
                 retrofitted_vectors=retrofitted_vectors,
                 checkpoint_path=checkpoint_path,
                 force=force,
+                precomputed_chains=(
+                    precomputed_coref_chains.get(cu_tight)
+                    if precomputed_coref_chains
+                    else None
+                ),
             )
             print(f"--- Classification B2: coref loose (context_units={cu_loose}) ---")
             res_coref2 = self._clasificar_umbral_coref(
@@ -5011,6 +5250,11 @@ class DoubleClassifier:
                 retrofitted_vectors=retrofitted_vectors,
                 checkpoint_path=checkpoint_path,
                 force=force,
+                precomputed_chains=(
+                    precomputed_coref_chains.get(cu_loose)
+                    if precomputed_coref_chains
+                    else None
+                ),
             )
 
             if res_coref1 and res_coref2:
@@ -5093,9 +5337,16 @@ class DoubleClassifier:
             )
 
         # ── Step 5: triple verdict ─────────────────────────────────────
+        effective_verdict_mode = mode
+        if (
+            mode == "all"
+            and getattr(self.config, "verdict_mode", "all") == "two_of_three"
+        ):
+            effective_verdict_mode = "two_of_three"
+
         report = self._triple_stability_verdicts(
             uces_por_doc=uces_por_doc,
-            mode=mode,
+            mode=effective_verdict_mode,
             stable_wc=stable_wc,
             stable_sim=stable_coref,
             stable_emb=stable_emb,
@@ -5155,7 +5406,7 @@ class DoubleClassifier:
 
         # Choose primary result dict (for vocabulary extraction)
         effective_mode = report["effective_mode"]
-        if effective_mode in ("wc_only", "wc_coref", "wc_emb", "all"):
+        if effective_mode in ("wc_only", "wc_coref", "wc_emb", "all", "two_of_three"):
             primary_res = res_wc1
         elif effective_mode in ("coref_only", "coref_emb"):
             primary_res = res_coref1
@@ -6732,12 +6983,16 @@ class Optimizador:
         we_analyzer,
         subtlex_analyzer,
         total_uces: int = None,
+        progressive_segmenter=None,  # ← NUEVO: instancia de ProgressiveSegmenter o None
+        retrofitted_vectors: Optional[Dict[str, np.ndarray]] = None,  # ← NUEVO
     ):
         self.config_base = config_base
         self.corpus_raw = corpus_raw
         self.uc_config = uc_config
         self.we_analyzer = we_analyzer
         self.subtlex_analyzer = subtlex_analyzer
+        self.progressive_segmenter = progressive_segmenter
+        self.retrofitted_vectors = retrofitted_vectors
         self.segmentador = SegmentadorALCESTE(config_base)
         self.uces_por_doc, self.doc_metadata_map = self.segmentador.segmentar_en_uces(
             corpus_raw
@@ -6749,10 +7004,133 @@ class Optimizador:
         self.total_uces = total_uces or sum(len(d) for d in self.uces_por_doc)
         # Cache del espacio de búsqueda — se llena en optimizar()
         self._search_space_cached: Dict[str, Any] = {}
+
+        # ── Precomputación de cadenas coref por contexto ──────────────────
+        # Sólo si hay progressive_segmenter y el modo lo requiere. Con None,
+        # la evaluación degrada a wc_emb (Method B devuelve None dentro de
+        # DoubleClassifier.run, y el veredicto degrada como ya hace).
+        self._precomputed_chains: Optional[Dict[int, Dict[str, List]]] = None
+        if progressive_segmenter is not None:
+            try:
+                self._precomputed_chains = self._precompute_coref_chains()
+            except Exception as e:
+                logger.warning(
+                    "Precomputación de cadenas coref falló (%s). "
+                    "El optimizador degradará a wc_emb.",
+                    e,
+                )
+                self._precomputed_chains = None
+
         print(
             f"   [Optimizador] Caché listo en {time.time() - start_time:.2f}s. "
             f"Total UCEs: {self.total_uces}"
+            + (
+                f" · cadenas coref precomputadas para ctx={list(self._precomputed_chains.keys())}"
+                if self._precomputed_chains
+                else " · sin coref (modo degradado)"
+            )
         )
+
+    def _precompute_coref_chains(self) -> Dict[int, Dict[str, List]]:
+        """
+        Extrae cadenas de correferencia por documento para cada valor de
+        context_units que el optimizador puede pedir (TODO el espacio de
+        búsqueda de coref_context_units_tight/loose, no solo los defaults).
+        Determinista entre trials: la pre-merge sólo depende de los textos
+        de las UCEs, no de los hiperparámetros del trial.
+
+        Devuelve: {context_units: {doc_id: [chain, ...]}}
+        """
+        ps = self.progressive_segmenter
+        # Derivar TODOS los valores posibles del espacio de búsqueda (no solo
+        # los defaults del config). Si solo precomputáramos {2, 4}, cualquier
+        # trial con context_units ∈ {1, 3, 5} caería al fallback de
+        # re-extracción de cadenas con Stanza remoto (la parte cara).
+        try:
+            space = self.get_search_space()
+            tight_vals = space.get("coref_context_units_tight", [2])
+            loose_vals = space.get("coref_context_units_loose", [4])
+            ctx_values = set(tight_vals) | set(loose_vals)
+        except Exception:
+            ctx_values = {
+                int(getattr(self.config_base, "coref_context_units_tight", 2)),
+                int(getattr(self.config_base, "coref_context_units_loose", 4)),
+            }
+        # Excluir el valor 0 o negativos por seguridad
+        ctx_values = {int(c) for c in ctx_values if int(c) > 0}
+        if not ctx_values:
+            return {}
+
+        result: Dict[int, Dict[str, List]] = {c: {} for c in ctx_values}
+
+        for doc_uces in self.uces_por_doc:
+            if not doc_uces:
+                continue
+            doc_id = doc_uces[0].doc_id
+
+            # Replicar la pre-merge de _clasificar_umbral_coref (paso 3a)
+            if len(doc_uces) > 1:
+                uce_texts = [u.texto for u in doc_uces]
+                try:
+                    rec_seg = ps.recursive_segmentation(uce_texts)
+                    prog_seg = ps.final_clustering(rec_seg)
+                    premerged_groups = _remap_uces_to_segments(doc_uces, prog_seg)
+                except Exception as e:
+                    logger.warning(
+                        "Pre-merge falló para doc %s en precomputación coref: %s",
+                        doc_id,
+                        e,
+                    )
+                    premerged_groups = [[u] for u in doc_uces]
+            else:
+                premerged_groups = [doc_uces]
+
+            # Guard: pre-merge colapsado a 1 grupo en docs largos (mismo que en runtime)
+            if len(premerged_groups) == 1 and len(doc_uces) > 50:
+                premerged_groups = [[u] for u in doc_uces]
+
+            # Reconstruir segments_info (paso 3b)
+            full_doc_text = ""
+            segments_info: List[Dict] = []
+            current_offset = 0
+            for group in premerged_groups:
+                group_text = " ".join(u.texto for u in group)
+                start = current_offset
+                end = start + len(group_text)
+                segments_info.append(
+                    {
+                        "text": group_text,
+                        "start": start,
+                        "end": end,
+                        "uce_id": group[-1].id,
+                    }
+                )
+                full_doc_text += group_text + " "
+                current_offset = end + 1
+
+            # Extraer cadenas para cada context_units
+            for ctx in ctx_values:
+                try:
+                    chains = ps._extract_global_chains(
+                        segments_info, full_doc_text, context_units=ctx
+                    )
+                    result[ctx][doc_id] = chains
+                except Exception as e:
+                    logger.warning(
+                        "Extracción de cadenas falló para doc %s ctx=%d: %s",
+                        doc_id,
+                        ctx,
+                        e,
+                    )
+                    result[ctx][doc_id] = []
+
+        for ctx, by_doc in result.items():
+            total_chains = sum(len(v) for v in by_doc.values())
+            print(
+                f"   [Optimizador] ctx={ctx}: {total_chains} cadenas "
+                f"en {len(by_doc)} documentos precomputadas."
+            )
+        return result
 
     # ══════════════════════════════════════════════════════════════════════
     # Persistencia del frente de Pareto
@@ -6788,13 +7166,18 @@ class Optimizador:
         payload = {
             # ── Compatibilidad con lector legacy ────────────────────────
             "params": best_trial.params,
+            # values[0] es coverage_primary en stage 2 ("all") y ari en stage 1 ("wc_only").
             "score": float(best_trial.values[0]),
             # ── Nuevo formato Pareto ────────────────────────────────────
             "best_params": best_trial.params,
             "best_values": list(best_trial.values),
             "preference": self.config_base.optimize_preference,
             "directions": list(self.config_base.optimize_directions),
-            "objectives": ["ari", "coverage", "neg_k"],
+            "objectives": (
+                ["ari", "coverage", "neg_k"]
+                if getattr(self, "_current_stage_mode", "all") == "wc_only"
+                else ["coverage_primary", "agreement_sym", "neg_k"]
+            ),
             "pareto_front": [
                 {
                     "params": dict(t.params),
@@ -6818,6 +7201,101 @@ class Optimizador:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
         print(f"   [Optimizador] Pareto front saved to {path}")
+        try:
+            self.save_comparative_results(study)
+        except Exception as e:
+            logger.warning("save_comparative_results falló: %s", e)
+
+    def save_comparative_results(self, study: "optuna.Study") -> None:
+        """Escribe comparative_results.json con el desglose por trial."""
+        path = os.path.join(
+            os.path.dirname(self.config_base.db_local_path),
+            "comparative_results.json",
+        )
+        trials_payload = []
+        for t in study.trials:
+            trials_payload.append(
+                {
+                    "trial": int(t.number),
+                    "state": t.state.name,
+                    "params": dict(t.params),
+                    "values": list(t.values) if t.values else None,
+                    "user_attrs": dict(t.user_attrs),
+                }
+            )
+        payload = {
+            "schema_version": 2,
+            "corpus_fingerprint": _corpus_fingerprint(),
+            "timestamp": datetime.now().isoformat(),
+            "study_name": study.study_name,
+            "directions": list(study.directions),
+            "objective_names": ["coverage_primary", "agreement_sym", "neg_k"],
+            "n_trials": len(study.trials),
+            "n_completed": sum(
+                1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE
+            ),
+            "n_pruned": sum(
+                1 for t in study.trials if t.state == optuna.trial.TrialState.PRUNED
+            ),
+            "n_failed": sum(
+                1 for t in study.trials if t.state == optuna.trial.TrialState.FAIL
+            ),
+            "trials": trials_payload,
+            "pareto_front": [
+                {
+                    "trial": int(t.number),
+                    "params": dict(t.params),
+                    "values": list(t.values),
+                }
+                for t in study.best_trials
+                if not _is_sentinel(t.values)
+            ],
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False, default=str)
+        os.replace(tmp, path)
+        print(
+            f"   [Optimizador] comparative_results.json escrito ({len(trials_payload)} trials)."
+        )
+        try:
+            self._persist_trials_to_postgres(study)
+        except Exception as e:
+            logger.warning("Persistencia Postgres de trials falló: %s", e)
+
+    def _persist_trials_to_postgres(self, study: "optuna.Study") -> None:
+        from reii.backend.sql.db import connect
+
+        conn = connect(self.config_base.db_dsn)
+        try:
+            fp = _corpus_fingerprint()
+            for t in study.trials:
+                conn.execute(
+                    """
+                    INSERT INTO optimizer_trials
+                        (study_name, corpus_fingerprint, trial_number, state,
+                         params_json, values_json, user_attrs_json)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (study_name, corpus_fingerprint, trial_number)
+                    DO UPDATE SET
+                        state = EXCLUDED.state,
+                        params_json = EXCLUDED.params_json,
+                        values_json = EXCLUDED.values_json,
+                        user_attrs_json = EXCLUDED.user_attrs_json
+                    """,
+                    (
+                        study.study_name,
+                        fp,
+                        int(t.number),
+                        t.state.name,
+                        json.dumps(dict(t.params), default=str),
+                        json.dumps(list(t.values) if t.values else None, default=str),
+                        json.dumps(dict(t.user_attrs), default=str),
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
 
     def load_best_params(self) -> Optional[Dict]:
         """
@@ -6839,9 +7317,9 @@ class Optimizador:
         Elige el índice del trial del frente de Pareto que se aplicará
         al pipeline definitivo.
 
-        max_ari       → mayor ARI (primer objetivo)
-        max_coverage  → mayor coverage (segundo objetivo)
-        knee          → punto más cercano al ideal normalizado (1, 1, 0)
+        max_ari       → mayor agreement_sym (segundo objetivo, calidad)
+        max_coverage  → mayor coverage_primary (primer objetivo)
+        knee          → punto más cercano al ideal normalizado (1, 1, 1)
         """
         pref = getattr(self.config_base, "optimize_preference", "max_ari")
         best = best_trials
@@ -6849,7 +7327,7 @@ class Optimizador:
             return 0
 
         if pref == "max_coverage":
-            return int(max(range(len(best)), key=lambda i: best[i].values[1]))
+            return int(max(range(len(best)), key=lambda i: best[i].values[0]))
 
         if pref == "knee":
             arr = np.array([t.values for t in best], dtype=np.float64)
@@ -6857,12 +7335,12 @@ class Optimizador:
             maxs = arr.max(axis=0)
             rng = np.where(maxs > mins, maxs - mins, 1.0)
             norm = (arr - mins) / rng
-            # (ARI↑, coverage↑, −K↑): ideal normalizado es (1, 1, 1)
+            # (coverage↑, agreement_sym↑, −K↑): ideal normalizado es (1, 1, 1)
             ideal = np.array([1.0, 1.0, 1.0])
             return int(np.argmin(np.linalg.norm(norm - ideal, axis=1)))
 
-        # default max_ari
-        return int(max(range(len(best)), key=lambda i: best[i].values[0]))
+        # default max_ari (agreement_sym)
+        return int(max(range(len(best)), key=lambda i: best[i].values[1]))
 
     # ══════════════════════════════════════════════════════════════════════
     # Espacio de búsqueda (idéntico al optimizador anterior)
@@ -6889,6 +7367,10 @@ class Optimizador:
             "similarity_threshold": [0.25, 0.35, 0.45, 0.55, 0.65],
             "coref_weight": [0.0, 0.1, 0.2, 0.3, 0.4],
             "uc_window_size": [1, 2, 3, 4, 5],
+            "coref_context_units_tight": [1, 2, 3],
+            "coref_context_units_loose": [3, 4, 5],
+            "hdbscan_uce_min_cluster_size": [3, 5, 8, 12],
+            "hdbscan_uce_min_cluster_size_loose": [2, 3, 5, 8],
         }
 
     @staticmethod
@@ -6916,7 +7398,13 @@ class Optimizador:
             self.we_analyzer, self.subtlex_analyzer, uc_config_actual, self.config_base
         )
         uc_builder.vectorizer.clear_cache()  # evita contaminación entre trials
-        double_clf = DoubleClassifier(cfg, self.segmentador, uc_builder)
+        # ← Inyectar progressive_segmenter para Method B
+        double_clf = DoubleClassifier(
+            cfg,
+            self.segmentador,
+            uc_builder,
+            progressive_segmenter=self.progressive_segmenter,
+        )
 
         cache_ref = self.uces_por_doc
         for doc_uces in cache_ref:
@@ -6932,11 +7420,17 @@ class Optimizador:
         self.segmentador.lematizar_uces = lambda x: x
 
         try:
-            resultados = double_clf.run(self.corpus_raw)
+            resultados = double_clf.run(
+                self.corpus_raw,
+                retrofitted_vectors=self.retrofitted_vectors,  # ← NUEVO
+                precomputed_coref_chains=self._precomputed_chains,  # ← NUEVO
+            )
         finally:
             self.segmentador.segmentar_en_uces = original_seg
             self.segmentador.lematizar_uces = original_lem
 
+        # Persistir last_pairwise_stability para que _evaluate_trial lo consuma
+        self._last_pairwise = getattr(double_clf, "last_pairwise_stability", None)
         return resultados
 
     # ══════════════════════════════════════════════════════════════════════
@@ -6944,16 +7438,18 @@ class Optimizador:
     # ══════════════════════════════════════════════════════════════════════
     def _evaluate_trial(self, trial: "optuna.Trial"):
         """
-        Devuelve la tupla (ARI, coverage, −K) o un centinela dominado.
+        Devuelve la tupla objetivo o un centinela dominado.
+
+        Etapa 1 (wc_only): (ARI, coverage, −K) — prior para la etapa 2.
+        Etapa 2 (all):     (coverage, agreement_sym, −K) — veredicto final.
 
         Los gates duros (K fuera de [2,8], coverage < umbral, excepción
         en la evaluación) devuelven _SENTINEL_TRIAL en vez de lanzar
         TrialPruned. Motivo: Optuna 3.6.2 (pin <4.0.0) crashea en TPE
         multi-objetivo cuando un trial PRUNED (values=None) cae en el
         conjunto "below" del Parzen estimator. El centinela es
-        estrictamente dominado por cualquier trial real (peor ARI, peor
-        coverage, peor −K), así que no contamina el frente de Pareto ni
-        el conjunto "below" del sampler.
+        estrictamente dominado por cualquier trial real, así que no
+        contamina el frente de Pareto ni el conjunto "below" del sampler.
 
         Nota sobre pruning: al no lanzar TrialPruned, el MedianPruner
         queda inerte; el filtrado real lo hacen los gates duros de
@@ -6961,22 +7457,43 @@ class Optimizador:
         """
         params = self._suggest(trial, self._search_space_cached)
 
+        mode = getattr(self, "_current_stage_mode", "all")
+
         mf1 = params["min_forms_uc_1"]
         mf2 = mf1 + params["forms_gap"]
 
         cfg = copy.deepcopy(self.config_base)
-        # El optimizador solo afina parámetros de word-count (Method A). Forzar
-        # wc_only evita que intente correr coref (Method B) y EMB (Method C),
-        # que no están disponibles aquí (sin progressive_segmenter ni
-        # retrofitted_vectors) y solo generan ruido + tiempo perdido.
-        cfg.classification_mode = "wc_only"
+        cfg.classification_mode = mode
         cfg.min_forms_uc = [mf1, mf2]
         cfg.tsj = params["tsj"]
         cfg.pseudocount = 0.0  # BLOQUE 1: nunca sumar ε
         cfg.min_cluster_size_cdh = params["min_cluster_size_cdh"]
         cfg.swap_iterations = params["swap_iterations"]
         cfg.min_r2_threshold = params["min_r2_threshold"]
+        cfg.use_liminal_projection = False
         cfg.optimize = cfg.use_projection = cfg.use_network_analysis = False
+
+        # Parámetros nuevos del espacio de búsqueda (coref + HDBSCAN UCE)
+        cfg.coref_context_units_tight = params.get(
+            "coref_context_units_tight",
+            getattr(cfg, "coref_context_units_tight", 2),
+        )
+        cfg.coref_context_units_loose = params.get(
+            "coref_context_units_loose",
+            getattr(cfg, "coref_context_units_loose", 4),
+        )
+        cfg.hdbscan_uce_min_cluster_size = params.get(
+            "hdbscan_uce_min_cluster_size",
+            getattr(cfg, "hdbscan_uce_min_cluster_size", 5),
+        )
+        cfg.hdbscan_uce_min_cluster_size_loose = params.get(
+            "hdbscan_uce_min_cluster_size_loose",
+            getattr(cfg, "hdbscan_uce_min_cluster_size_loose", 3),
+        )
+
+        # ── Gate: tight debe ser estrictamente menor que loose ───────────
+        if cfg.coref_context_units_tight >= cfg.coref_context_units_loose:
+            return _SENTINEL_TRIAL
 
         uc_cfg = copy.deepcopy(self.uc_config)
         uc_cfg.similarity_threshold = params.get(
@@ -6991,44 +7508,97 @@ class Optimizador:
             logger.debug("Trial %d exception: %s", trial.number, e)
             return _SENTINEL_TRIAL
 
-        uces_list = result[0] if result else None
-        if not uces_list:
+        primary_stable = result[0] if result else None
+        if not primary_stable:
             return _SENTINEL_TRIAL
 
-        labels_uces = np.array(
-            [u.cluster_id for u in uces_list if u.cluster_id is not None]
-        )
-        if len(labels_uces) == 0:
+        labels_primary = [
+            u.cluster_id for u in primary_stable if u.cluster_id is not None
+        ]
+        if len(labels_primary) == 0:
             return _SENTINEL_TRIAL
 
-        n_clusters = int(len(np.unique(labels_uces)))
+        n_clusters = int(len(np.unique(labels_primary)))
 
         # ── Gate duro: K fuera de rango útil ─────────────────────────────
         if n_clusters < 2 or n_clusters > 8:
             return _SENTINEL_TRIAL
 
-        coverage = len(uces_list) / max(1, self.total_uces)
-        coverage_gate = float(getattr(self.config_base, "optimize_coverage_gate", 0.65))
+        coverage_primary = len(primary_stable) / max(1, self.total_uces)
 
-        # ── Gate duro: coverage insuficiente (Recomendación A) ──────────
-        if coverage < coverage_gate:
+        # ── Gate duro de cobertura, dependiente del modo ─────────────────
+        if mode == "all":
+            coverage_gate = float(
+                getattr(self.config_base, "optimize_coverage_gate_all", 0.10)
+            )
+        else:
+            coverage_gate = float(
+                getattr(self.config_base, "optimize_coverage_gate", 0.25)
+            )
+        if coverage_primary < coverage_gate:
             return _SENTINEL_TRIAL
 
-        # ── ARI: métrica headline, se calcula al final ───────────────────
-        # (trial.report/should_prune eliminados: Optuna 3.6.2 no soporta
-        # report en optimización multi-objetivo — NotImplementedError.)
-        labels1_uce = result[5]
-        labels2_uce = result[6]
-        if labels1_uce is None or labels2_uce is None:
-            return _SENTINEL_TRIAL
+        # ── Etapa 1 (wc_only): ARI como prior ─────────────────────────────
+        if mode == "wc_only":
+            all_res = result[4] if len(result) > 4 else []
+            if len(all_res) < 2 or all_res[0] is None or all_res[1] is None:
+                return _SENTINEL_TRIAL
+            uce_to_a1 = DoubleClassifier._extract_uce_labels(all_res[0])
+            uce_to_a2 = DoubleClassifier._extract_uce_labels(all_res[1])
+            common = sorted(set(uce_to_a1) & set(uce_to_a2))
+            if len(common) < 2:
+                return _SENTINEL_TRIAL
+            arr_a = np.array([uce_to_a1[u] for u in common])
+            arr_b = np.array([uce_to_a2[u] for u in common])
+            valid = (arr_a >= 0) & (arr_b >= 0)
+            if valid.sum() < 2:
+                return _SENTINEL_TRIAL
+            ari = float(adjusted_rand_score(arr_a[valid], arr_b[valid]))
+            return ari, float(coverage_primary), -float(n_clusters)
 
-        # Alinear longitudes antes de ARI (por seguridad)
-        n = min(len(labels1_uce), len(labels2_uce))
-        if n < 2:
-            return _SENTINEL_TRIAL
-        ari = float(adjusted_rand_score(labels1_uce[:n], labels2_uce[:n]))
+        # ── Etapa 2 (all): veredicto final vía agreement simétrico ───────
+        pairwise = self._last_pairwise or {}
+        ari_ab = float(pairwise.get("ari_cross_ab", 0.0))
+        ari_bc = float(pairwise.get("ari_cross_bc", 0.0))
+        ari_ac = float(pairwise.get("ari_cross_ac", 0.0))
+        agreement_sym = float(np.mean([ari_ab, ari_bc, ari_ac]))
 
-        return ari, float(coverage), -float(n_clusters)
+        trial.set_user_attr("coverage_primary", float(coverage_primary))
+        trial.set_user_attr("agreement_sym", agreement_sym)
+        trial.set_user_attr("n_clusters", n_clusters)
+        trial.set_user_attr(
+            "bottleneck_method", self._bottleneck(ari_ab, ari_bc, ari_ac)
+        )
+
+        return float(coverage_primary), agreement_sym, -float(n_clusters)
+
+    @staticmethod
+    def _active_methods(cfg) -> Set[str]:
+        mode = getattr(cfg, "classification_mode", "wc_only")
+        aliases = {
+            "both": "wc_coref",
+            "wc_sim": "wc_coref",
+            "sim_only": "coref_only",
+            "sim_emb": "coref_emb",
+        }
+        mode = aliases.get(mode, mode)
+        return {
+            "wc_only": {"wc"},
+            "coref_only": {"coref"},
+            "emb_only": {"emb"},
+            "wc_coref": {"wc", "coref"},
+            "wc_emb": {"wc", "emb"},
+            "coref_emb": {"coref", "emb"},
+            "all": {"wc", "coref", "emb"},
+        }.get(mode, {"wc"})
+
+    @staticmethod
+    def _bottleneck(ari_ab: float, ari_bc: float, ari_ac: float) -> str:
+        mean_wc = np.mean([ari_ab, ari_ac])
+        mean_coref = np.mean([ari_ab, ari_bc])
+        mean_emb = np.mean([ari_bc, ari_ac])
+        candidates = {"wc": mean_wc, "coref": mean_coref, "emb": mean_emb}
+        return min(candidates, key=candidates.get)
 
     # ══════════════════════════════════════════════════════════════════════
     # Orquestación Optuna
@@ -7086,13 +7656,52 @@ class Optimizador:
         study_name = f"{study_name}_{_corpus_fingerprint()}"
         return storage, study_name
 
-    def optimizar(self, n_trials: int = 200) -> Dict[str, Any]:
+    def optimizar(
+        self,
+        n_trials: int = 200,
+        two_stage: bool = True,
+        stage1_fraction: float = 0.3,
+    ) -> Dict[str, Any]:
         if not _OPTUNA_AVAILABLE:
             print("   [!] optuna no instalado. Ejecuta: pip install optuna")
             return {}
 
         # Cache del espacio de búsqueda — se consulta en cada trial
         self._search_space_cached = self.get_search_space()
+
+        if not two_stage:
+            params, _ = self._run_single_stage(
+                n_trials=n_trials, mode="all", warm_start_trials=[]
+            )
+            return params
+
+        n_stage1 = max(20, int(n_trials * stage1_fraction))
+        _, stage1_pareto = self._run_single_stage(
+            n_trials=n_stage1,
+            mode="wc_only",
+            warm_start_trials=[],
+            study_suffix="_stage1_wc",
+        )
+
+        n_stage2 = n_trials - n_stage1
+        stage2_params, _ = self._run_single_stage(
+            n_trials=n_stage2,
+            mode="all",
+            warm_start_trials=stage1_pareto,
+            study_suffix="_stage2_all",
+            perturb_warm_start=True,
+        )
+        return stage2_params
+
+    def _run_single_stage(
+        self,
+        n_trials: int,
+        mode: str,
+        warm_start_trials: List,
+        study_suffix: str = "",
+        perturb_warm_start: bool = False,
+    ) -> Tuple[Dict[str, Any], List]:
+        self._current_stage_mode = mode
 
         sampler = self._make_sampler()
         pruner = self._make_pruner(n_trials)
@@ -7106,6 +7715,7 @@ class Optimizador:
         )
         storage = getattr(self.config_base, "optimize_storage", None)
         study_name = getattr(self.config_base, "optimize_study_name", "reii_search")
+        study_name = f"{study_name}{study_suffix}"
 
         # ── Storage: el CWD del contenedor es /app (NO montado) ─────────
         # sqlite:///reii_optuna.db se crearía en /app y se perdería al
@@ -7140,13 +7750,19 @@ class Optimizador:
                 directions=directions,
             )
 
-        print(f"\n=== Optuna · {n_trials} trials ===")
+        # ── Warm start: enqueue de trials previos (y copias perturbadas) ─
+        for prev_trial in warm_start_trials:
+            study.enqueue_trial(prev_trial.params)
+            if perturb_warm_start:
+                for _ in range(2):
+                    study.enqueue_trial(self._perturb_params(prev_trial.params))
+
+        print(f"\n=== Optuna · {n_trials} trials (mode={mode}) ===")
         print(f"   Sampler    : {self.config_base.optimize_sampler}")
         print(f"   Pruner     : {self.config_base.optimize_pruner}")
         print(
-            f"   Objectives : {list(zip(['ari', 'coverage', 'n_clusters'], directions))}"
+            f"   Objectives : {list(zip(['coverage', 'agreement', 'n_clusters'], directions))}"
         )
-        print(f"   Coverage gate: {self.config_base.optimize_coverage_gate:.2f}")
         print(f"   UCEs       : {self.total_uces}")
 
         study.optimize(
@@ -7173,7 +7789,7 @@ class Optimizador:
         best_trials = [t for t in study.best_trials if not _is_sentinel(t.values)]
         if not best_trials:
             print("   [!] Sin soluciones válidas (todos los trials fueron centinela).")
-            return {}
+            return {}, []
 
         # Persistir frente completo
         self.save_pareto_front(study)
@@ -7190,13 +7806,38 @@ class Optimizador:
             f"{self.config_base.optimize_preference}): trial #{best_trial.number}"
         )
         print(
-            f"       ARI={best_trial.values[0]:.4f}  "
-            f"coverage={best_trial.values[1]:.4f}  "
+            f"       coverage={best_trial.values[0]:.4f}  "
+            f"agreement={best_trial.values[1]:.4f}  "
             f"K={-best_trial.values[2]:.0f}"
         )
         print(f"       params: {best_trial.params}")
 
-        return dict(best_trial.params)
+        return dict(best_trial.params), best_trials
+
+    def _perturb_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        import random
+
+        rng = random.Random(self.config_base.random_state)
+        perturbed = dict(params)
+        space = self._search_space_cached
+        for k, v in params.items():
+            spec = space.get(k)
+            if spec is None:
+                continue
+            if isinstance(spec, tuple) and len(spec) == 2:
+                lo, hi = spec
+                step = 1 if isinstance(lo, int) else (hi - lo) * 0.1
+                delta = rng.choice([-step, +step])
+                new = max(lo, min(hi, v + delta))
+                perturbed[k] = int(new) if isinstance(lo, int) else float(new)
+            elif isinstance(spec, list) and len(spec) > 1:
+                try:
+                    idx = spec.index(v)
+                    new_idx = max(0, min(len(spec) - 1, idx + rng.choice([-1, +1])))
+                    perturbed[k] = spec[new_idx]
+                except ValueError:
+                    continue
+        return perturbed
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -7704,6 +8345,33 @@ class WorkflowOrchestrator:
             grupos[uce.doc_id].append(uce)
         return list(grupos.values())
 
+    def _compute_retrofitted_vectors(
+        self,
+        resultados: Optional[List[Dict]],
+        voc: Optional[List[str]],
+    ) -> Optional[Dict[str, np.ndarray]]:
+        """Build retrofitted vectors from a pass-1 result (resultados[0] + voc).
+
+        Returns None if there are no significant terms or inputs are empty.
+        Mirrors the inline retrofitting block that used to live in ejecutar().
+        """
+        if not resultados or not voc:
+            return None
+        _all_ucs = resultados[0]["ucs"]
+        _labels = resultados[0]["labels"]
+        _builder = MatrizBuilder(self.config)
+        _mat = _builder.construir_matriz(_all_ucs, voc)
+        _df_terms = TermAnalyzer(self.config).compute(_mat, _labels, voc)
+        if not _df_terms.empty and _df_terms["significativo"].any():
+            _binary = _builder.construir_matriz_dispersa(_all_ucs, voc)
+            _ppmi = self.ppmi_builder.build(_binary, voc)
+            retro_vecs = self.embedding_pipeline.run(_ppmi, voc, _df_terms)
+            self.uc_builder.vectorizer.clear_cache()  # invalidate before pass 2
+            print(f"   Pass-1 retrofitting complete: {len(retro_vecs)} vectors.")
+            return retro_vecs
+        print("   Pass-1 had no significant terms; skipping retrofitting.")
+        return None
+
     def ejecutar(
         self,
         corpus_raw: Dict[str, Any],
@@ -7715,6 +8383,15 @@ class WorkflowOrchestrator:
         force: bool = False,
     ) -> None:
         print("=== Iniciando Pipeline ALCESTE v5 ===")
+
+        # ── 0. Auto-calibración de uce_target_size (antes de TODO lo demás:
+        #      best_params, el Optimizador y la segmentación real comparten
+        #      self.config por referencia, así que corregirlo acá se propaga
+        #      a todo el resto de esta ejecución) ───────────────────────────
+        if getattr(self.config, "auto_calibrate_uce_size", True):
+            target_calibrado = calibrar_uce_target_size(self.segmentador, corpus_raw)
+            if target_calibrado is not None:
+                self.config.uce_target_size = target_calibrado
 
         # ── 1. Optimización de hiperparámetros (El núcleo robusto) ─────────────
         cached_uces_por_doc = None
@@ -7743,6 +8420,20 @@ class WorkflowOrchestrator:
                 self.uc_config.coref_weight = bp["coref_weight"]
             if "uc_window_size" in bp:
                 self.uc_config.window_size = bp["uc_window_size"]
+            # Parámetros nuevos del espacio ampliado (coref + HDBSCAN UCE)
+            self.config.coref_context_units_tight = bp.get(
+                "coref_context_units_tight", self.config.coref_context_units_tight
+            )
+            self.config.coref_context_units_loose = bp.get(
+                "coref_context_units_loose", self.config.coref_context_units_loose
+            )
+            self.config.hdbscan_uce_min_cluster_size = bp.get(
+                "hdbscan_uce_min_cluster_size", self.config.hdbscan_uce_min_cluster_size
+            )
+            self.config.hdbscan_uce_min_cluster_size_loose = bp.get(
+                "hdbscan_uce_min_cluster_size_loose",
+                self.config.hdbscan_uce_min_cluster_size_loose,
+            )
 
         cached_uces_por_doc = None
         cached_doc_metadata_map = None
@@ -7809,6 +8500,39 @@ class WorkflowOrchestrator:
             )
 
         if best_params is None and self.config.optimize:
+            # ── Mini pass-1 (retrofitting) ANTES del optimizador ─────────────
+            # Corre con use_embeddings en su estado normal (True) para que el
+            # clustering CHD sea consistente con el pass-1 principal. Así el
+            # optimizador puede evaluar classification_mode="all" completo
+            # (Method C / embeddings) en lugar de degradar a "wc_coref".
+            retro_vecs_for_optimizer: Optional[Dict[str, np.ndarray]] = None
+            try:
+                (
+                    _,
+                    _,
+                    mini_voc,
+                    _,
+                    mini_resultados,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                ) = self.double_clf.run(
+                    corpus_raw,
+                    ppmi_builder=self.ppmi_builder,
+                )
+                retro_vecs_for_optimizer = self._compute_retrofitted_vectors(
+                    mini_resultados, mini_voc
+                )
+            except Exception as e:
+                logger.warning(
+                    "   [Optimizador] Mini pass-1 (retrofitting) falló; "
+                    "el optimizador degradará a 'wc_coref': %s",
+                    e,
+                )
+                retro_vecs_for_optimizer = None
+
             # Desactivar embeddings durante la optimización (coste)
             self.config.use_embeddings = False
 
@@ -7818,6 +8542,12 @@ class WorkflowOrchestrator:
                 corpus_raw,
                 self.we_analyzer,
                 self.subtlex_analyzer,
+                progressive_segmenter=self.double_clf.progressive_segmenter,
+                # retrofitted_vectors precomputados en el mini pass-1 de arriba:
+                # permite evaluar 'all' completo (Method C / embeddings) durante
+                # la optimización. Si el mini pass-1 falló, es None y 'all'
+                # degrada a 'wc_coref' como antes.
+                retrofitted_vectors=retro_vecs_for_optimizer,
             )
             mejores_params = optimizador.optimizar(n_trials=self.config.optimize_trials)
             if mejores_params:
@@ -7864,25 +8594,9 @@ class WorkflowOrchestrator:
         )
 
         # ── Retrofitting on pass-1 output ─────────────────────────────────────────
-        retro_vecs_p1: Optional[Dict[str, np.ndarray]] = None
-        if resultados_p1 and voc_p1:
-            _all_ucs_p1 = resultados_p1[0]["ucs"]
-            _labels_p1 = resultados_p1[0]["labels"]
-            _builder_p1 = MatrizBuilder(self.config)
-            _mat_p1 = _builder_p1.construir_matriz(_all_ucs_p1, voc_p1)
-            _df_terms_p1 = TermAnalyzer(self.config).compute(
-                _mat_p1, _labels_p1, voc_p1
-            )
-            if not _df_terms_p1.empty and _df_terms_p1["significativo"].any():
-                _binary_p1 = _builder_p1.construir_matriz_dispersa(_all_ucs_p1, voc_p1)
-                _ppmi_p1 = self.ppmi_builder.build(_binary_p1, voc_p1)
-                retro_vecs_p1 = self.embedding_pipeline.run(
-                    _ppmi_p1, voc_p1, _df_terms_p1
-                )
-                self.uc_builder.vectorizer.clear_cache()  # invalidate before pass 2
-                print(f"   Pass-1 retrofitting complete: {len(retro_vecs_p1)} vectors.")
-            else:
-                print("   Pass-1 had no significant terms; skipping retrofitting.")
+        retro_vecs_p1: Optional[Dict[str, np.ndarray]] = (
+            self._compute_retrofitted_vectors(resultados_p1, voc_p1)
+        )
 
         # ── Pass 2 (or fallback to pass-1 results) ───────────────────────────────
         if retro_vecs_p1 is not None:
@@ -8466,7 +9180,7 @@ if __name__ == "__main__":
         optimize_prune_n_startup=15,
         optimize_directions=("maximize", "maximize", "minimize"),
         optimize_preference="knee",  # o "max_ari" / "max_coverage"
-        optimize_coverage_gate=0.65,
+        optimize_coverage_gate=0.25,
     )
 
     # ── Overrides del dashboard (PostgreSQL vía ConfigStore) ─────────────

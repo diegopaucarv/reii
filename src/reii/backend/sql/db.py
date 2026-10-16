@@ -19,7 +19,7 @@ from psycopg.rows import dict_row
 from reii.config import DATABASE_URL
 
 _SCHEMA_PATH = Path(__file__).parent / "schema_pg.sql"
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 
 def _apply_schema(conn: psycopg.Connection) -> None:

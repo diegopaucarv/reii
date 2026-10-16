@@ -291,7 +291,11 @@ def main() -> int:
         optimize_prune_n_startup=15,
         optimize_directions=("maximize", "maximize", "minimize"),
         optimize_preference="knee",
-        optimize_coverage_gate=0.65,
+        # Gate de cobertura: 0.65 era inalcanzable — la estabilidad A1↔A2
+        # real del corpus es 23-52%, así que TODOS los trials caían en
+        # centinela y best_params.json nunca se escribía. 0.25 filtra
+        # soluciones degeneradas sin matar las realistas.
+        optimize_coverage_gate=0.25,
     )
 
     gram_config = GramConfig(min_tokens_por_uce=30, max_tokens_por_uce=200)

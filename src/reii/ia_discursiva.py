@@ -29,6 +29,7 @@ except ImportError:
 from reii.config import (
     DATA_DIR,
     DISCOURSE_CONFIG_PATH,
+    DISCOURSE_DIR,
     DISCOURSE_STATE_PATH,
     GRAMMAR_CONFIG_PATH,
     LLM_FALLBACK_MODEL,
@@ -2203,6 +2204,53 @@ class DebugOrchestrator:
             all_annos.extend(annos)
         return all_annos
 
+    def run_multiagent_analysis(
+        self,
+        store: bool = True,
+        workflow: Optional[str] = None,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """Ejecuta el flujo multiagente completo (explorador → orquestador → trabajadores).
+
+        La Fase 1 (resumen gramatical) ya está calculada en ``__init__``. Aquí
+        se ejecuta, por workflow, un **explorador** (scout) que reporta los
+        recursos discursivos presentes, un **orquestador** que decide la
+        **profundidad** del análisis (para ahorrar agentes) y los
+        **trabajadores** (los agentes existentes) que anotan en orden
+        topológico respetando las capas de dependencia derivadas de
+        ``dependency_graph``.
+
+        Devuelve el estado final del grafo LangGraph:
+        ``{"scout_reports", "depth_plans", "annotations"}``.
+        """
+        from reii.pipelines.dependency_graph import load_workflow_specs
+        from reii.pipelines.discourse_graph import build_discourse_graph
+        from reii.pipelines.langchain_llm import TogetherChatModel
+
+        specs = load_workflow_specs(str(DISCOURSE_DIR))
+        if not specs:
+            print(
+                "⚠️ No se encontraron workflows de discurso para el análisis multiagente."
+            )
+            return {"scout_reports": {}, "depth_plans": {}, "annotations": []}
+
+        agent_roles = {
+            name: agent.role for name, agent in self.discourse_agents.items()
+        }
+        llm = TogetherChatModel()
+
+        def executor(agent_name: str) -> List[DiscourseAnnotation]:
+            return self.run_discourse_agent(
+                agent_name, store=store, workflow=workflow, force=force
+            )
+
+        tagged_text, _ = self._build_tagged_text_and_map()
+        if len(tagged_text) > self.MAX_TAGGED_CHARS:
+            tagged_text = tagged_text[: self.MAX_TAGGED_CHARS]
+
+        graph = build_discourse_graph(llm, specs, agent_roles, executor)
+        return graph.run(self.global_grammar_summary, tagged_text)
+
     def _ensure_dependencies(
         self,
         agent_name: str,
@@ -2212,12 +2260,17 @@ class DebugOrchestrator:
     ):
         agent = self.discourse_agents[agent_name]
         for dep_name in agent.disc_cats:
-            has = any(
-                any(a.get("agent") == dep_name for a in u.discourse_annotations)
+            # Antes se comprobaba si *alguna* UCE tenía la dependencia (global),
+            # lo que dejaba documentos sin anotar cuando solo una parte del
+            # corpus ya estaba procesada. Ahora se comprueba si *falta* en
+            # alguna UCE (o si se fuerza el reprocesado), para que la
+            # dependencia se ejecute y complete los documentos pendientes.
+            missing = force or any(
+                not any(a.get("agent") == dep_name for a in u.discourse_annotations)
                 for u in self.uces
             )
-            if not has:
-                print(f"🔁 Dependencia faltante '{dep_name}'. Ejecutando primero…")
+            if missing:
+                print(f"🔁 Dependencia incompleta '{dep_name}'. Ejecutando primero…")
                 self.run_discourse_agent(dep_name, store, workflow, force)
 
     def list_agents(self):

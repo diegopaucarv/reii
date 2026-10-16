@@ -101,6 +101,12 @@ TRANSCRIPTS_DIR: str = str(
 BEST_PARAMS_PATH: str = str(
     ROOT_DIR / os.environ.get("REII_BEST_PARAMS_PATH", "data/best_params.json")
 )
+# Cache de la auto-calibración bayesiana de uce_target_size (ver
+# calibrar_uce_target_size en main_workflow.py). Mismo patrón de invalidación
+# por huella del corpus que BEST_PARAMS_PATH.
+UCE_CALIBRATION_PATH: str = str(
+    ROOT_DIR / os.environ.get("REII_UCE_CALIBRATION_PATH", "data/uce_calibration.json")
+)
 DISCOURSE_STATE_PATH: str = str(
     ROOT_DIR / os.environ.get("REII_DISCOURSE_STATE_PATH", "data/discourse_state.json")
 )
@@ -192,7 +198,7 @@ COREF_BATCH_SIZE: int = int(os.environ.get("REII_COREF_BATCH_SIZE", "1"))
 # ---------------------------------------------------------------------------
 STANZA_SERVER_URL: str = os.environ.get("STANZA_SERVER_URL", "").rstrip("/")
 STANZA_SERVER_TOKEN: str = os.environ.get("STANZA_SERVER_TOKEN", "")
-STANZA_SERVER_TIMEOUT: float = float(os.environ.get("STANZA_SERVER_TIMEOUT", "120"))
+STANZA_SERVER_TIMEOUT: float = float(os.environ.get("STANZA_SERVER_TIMEOUT", "90"))
 STANZA_SERVER_FALLBACK_LOCAL: bool = (
     os.environ.get("STANZA_SERVER_FALLBACK_LOCAL", "true").lower() == "true"
 )

@@ -4434,7 +4434,7 @@ if __name__ == "__main__":
         optimize_prune_n_startup=15,
         optimize_directions=("maximize", "maximize", "minimize"),
         optimize_preference="knee",  # o "max_ari" / "max_coverage"
-        optimize_coverage_gate=0.65,
+        optimize_coverage_gate=0.25,
     )
 
     # ── Overrides del dashboard (opcional) ────────────────────────────

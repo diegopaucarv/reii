@@ -228,3 +228,22 @@ CREATE INDEX IF NOT EXISTS idx_discourse_checkpoints_created
 INSERT INTO _schema_version (version, applied_at) VALUES (1, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING;
 INSERT INTO _schema_version (version, applied_at) VALUES (2, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING;
 INSERT INTO _schema_version (version, applied_at) VALUES (3, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING;
+INSERT INTO _schema_version (version, applied_at) VALUES (4, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING;
+
+-- ── optimizer trials (hybrid persistence) ───────────────────────────────────
+CREATE TABLE IF NOT EXISTS optimizer_trials (
+    id BIGSERIAL PRIMARY KEY,
+    study_name TEXT NOT NULL,
+    corpus_fingerprint TEXT NOT NULL,
+    trial_number INT NOT NULL,
+    state TEXT NOT NULL,
+    params_json JSONB NOT NULL,
+    values_json JSONB,
+    user_attrs_json JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (study_name, corpus_fingerprint, trial_number)
+);
+CREATE INDEX IF NOT EXISTS idx_optimizer_trials_study_fp
+    ON optimizer_trials (study_name, corpus_fingerprint);
+CREATE INDEX IF NOT EXISTS idx_optimizer_trials_bottleneck
+    ON optimizer_trials ((user_attrs_json->>'bottleneck_method'));

@@ -103,6 +103,7 @@ def _discourse_runner(
     agents: Optional[List[str]] = None,
     progress: Optional[Dict[str, Any]] = None,
     stop_flag: Optional[Dict[str, Any]] = None,
+    multiagent: bool = False,
 ) -> None:
     """Ejecuta agentes de análisis de discurso en un hilo en segundo plano.
 
@@ -111,7 +112,10 @@ def _discourse_runner(
     bloquear la UI. La salida ``print`` del agente se captura línea a línea
     en ``log`` para mostrarla en vivo.
 
-    Ejecuta los agentes de ``agents`` (uno por uno) vía ``run_discourse_agent``.
+    Con ``multiagent=True`` ejecuta el flujo multiagente completo
+    (explorador → orquestador → trabajadores) vía ``run_multiagent_analysis``;
+    en caso contrario ejecuta los agentes de ``agents`` (uno por uno) vía
+    ``run_discourse_agent``.
     """
     import contextlib
 
@@ -160,7 +164,20 @@ def _discourse_runner(
                 state_path=DISCOURSE_STATE_PATH,
                 raw_data=_raw,
             )
-            if agents:
+            if multiagent:
+                log.append(
+                    "🧭 Ejecutando análisis multiagente "
+                    "(explorador → orquestador → trabajadores)…"
+                )
+                _result = mon.run_multiagent_analysis(
+                    store=store, workflow=workflow, force=force
+                )
+                _depths = ", ".join(
+                    f"{name}={plan.depth}"
+                    for name, plan in _result.get("depth_plans", {}).items()
+                )
+                log.append(f"🧭 Profundidad decidida por workflow: {_depths or '—'}")
+            elif agents:
                 for _agent_name in agents:
                     if stop_flag and stop_flag.get("stop"):
                         log.append("⏹ Ejecución detenida por el usuario.")
@@ -13142,6 +13159,36 @@ def _render_tab_e():
                     or None
                 )
 
+        # ── Análisis multiagente (explorador → orquestador → trabajadores) ──
+        _ma_clicked = st.button(
+            "🧭 Ejecutar análisis multiagente (auto-profundidad)",
+            key="reii_disc_multiagent",
+            disabled=ds_state["running"],
+            width="stretch",
+            help="Un explorador reporta los recursos discursivos presentes, un "
+            "orquestador decide la profundidad (para ahorrar agentes) y los "
+            "trabajadores anotan en capas respetando las dependencias.",
+        )
+        if _ma_clicked:
+            st.session_state.discourse_log = []
+            ds_state["running"] = True
+            ds_state["finished"] = False
+            ds_state["exit_code"] = None
+            ds_state["refreshed"] = False
+            threading.Thread(
+                target=_discourse_runner,
+                kwargs={
+                    "log": st.session_state.discourse_log,
+                    "state": ds_state,
+                    "store": store,
+                    "workflow": workflow,
+                    "force": force,
+                    "multiagent": True,
+                },
+                daemon=True,
+            ).start()
+            st.rerun()
+
         workflow_files = list_workflow_files()
         workflow_names = load_workflow_names()
         total_uces, by_agent = load_discourse_state_progress()
@@ -13194,11 +13241,12 @@ def _render_tab_e():
                     args=(
                         st.session_state.discourse_log,
                         ds_state,
-                        wf_file,
                         store,
                         workflow,
                         force,
+                        "db",
                     ),
+                    kwargs={"agents": get_workflow_agents(wf_file)},
                     daemon=True,
                 ).start()
                 st.rerun()

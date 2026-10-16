@@ -770,8 +770,12 @@ class ProgressiveSegmenter:
                 f"buffer size={len(buffer)}"
             )
 
-            MAX_WINDOW_CHARS = 4000
-            CHUNK_OVERLAP = 500
+            # Coref es lento (~11s por ~100 chars medido en T4). El túnel de
+            # Cloudflare corta a ~100s y el timeout del cliente es 90s, así que
+            # cada sub-ventana debe resolverse en <60s. 1000 chars lo garantiza
+            # (~20-25s por llamada) incluso con la GPU degradada.
+            MAX_WINDOW_CHARS = 1000
+            CHUNK_OVERLAP = 400
 
             # ── Troceo con solape (reemplaza el truncado duro) ──
             if window_char_len > MAX_WINDOW_CHARS:
@@ -868,9 +872,11 @@ class ProgressiveSegmenter:
         if not pending:
             return
 
-        # Lotes pequeños por petición: el coref es lento (~7s/texto) y el túnel
-        # de Cloudflare corta a los ~100s.
-        REMOTE_BATCH = 5
+        # Lotes pequeños por petición: el coref es lento (~11s por ~100 chars
+        # medido en T4) y el túnel de Cloudflare corta a los ~100s. Con 5 textos
+        # por request (cada uno de hasta 1500 chars) se superaba el timeout de
+        # 120s. 1 texto por request lo mantiene bajo el límite.
+        REMOTE_BATCH = 1
         for i in range(0, len(pending), REMOTE_BATCH):
             batch = pending[i : i + REMOTE_BATCH]
             texts = [t for t, _ in batch]
