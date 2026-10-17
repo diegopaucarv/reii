@@ -1,0 +1,273 @@
+{
+  "base_url": "https://drugs-sitting-determination-successfully.trycloudflare.com",
+  "generated_at": "2026-10-16T07:13:57-0500",
+  "summary": {
+    "PASS": 9,
+    "FAIL": 0,
+    "SKIP": 0
+  },
+  "cases": [
+    {
+      "name": "01 · Conectividad + /health",
+      "status": "PASS",
+      "detail": "{'status': 'ok', 'model_loaded': True}",
+      "elapsed_s": 1.810415500003728,
+      "extra": {}
+    },
+    {
+      "name": "04 · Token inválido → 401",
+      "status": "PASS",
+      "detail": "status=401",
+      "elapsed_s": 1.0748506000090856,
+      "extra": {}
+    },
+    {
+      "name": "05 · lang≠es → 400",
+      "status": "PASS",
+      "detail": "status=400",
+      "elapsed_s": 1.1711638999986462,
+      "extra": {}
+    },
+    {
+      "name": "06 · /v1/extract_roots correctitud",
+      "status": "PASS",
+      "detail": "3 oraciones, sujetos no vacíos en todas",
+      "elapsed_s": 2.7941697999922326,
+      "extra": {
+        "results": [
+          {
+            "text": "El investigador analizó los datos del corpus.",
+            "subjects": [
+              "investigador"
+            ]
+          },
+          {
+            "text": "Las enfermeras de primera línea atendieron a los pacientes durante el desastre.",
+            "subjects": [
+              "enfermeras"
+            ]
+          },
+          {
+            "text": "La comunidad de Puente Piedra organizó una asamblea vecinal.",
+            "subjects": [
+              "comunidad"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "07 · /v1/extract_coref correctitud",
+      "status": "PASS",
+      "detail": "4 cadena(s), offsets consistentes",
+      "elapsed_s": 8.422858200006885,
+      "extra": {
+        "chains": [
+          {
+            "mentions": [
+              {
+                "text": "María",
+                "start_char": 0,
+                "end_char": 5
+              },
+              {
+                "text": "Ella",
+                "start_char": 41,
+                "end_char": 45
+              },
+              {
+                "text": "le",
+                "start_char": 134,
+                "end_char": 136
+              }
+            ]
+          },
+          {
+            "mentions": [
+              {
+                "text": "centro de salud",
+                "start_char": 24,
+                "end_char": 39
+              }
+            ]
+          },
+          {
+            "mentions": [
+              {
+                "text": "Ella revisó el historial de los pacientes antes de que el doctor Luis comenzara su turno.",
+                "start_char": 41,
+                "end_char": 130
+              },
+              {
+                "text": "el trabajo",
+                "start_char": 147,
+                "end_char": 157
+              }
+            ]
+          },
+          {
+            "mentions": [
+              {
+                "text": "el doctor Luis",
+                "start_char": 96,
+                "end_char": 110
+              },
+              {
+                "text": "su",
+                "start_char": 121,
+                "end_char": 123
+              },
+              {
+                "text": "Él",
+                "start_char": 131,
+                "end_char": 133
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "09 · Consistencia de lote (chunking=15)",
+      "status": "PASS",
+      "detail": "20/20 resultados",
+      "elapsed_s": 3.7201772999978857,
+      "extra": {}
+    },
+    {
+      "name": "08 · Ventana de ~1000 chars bajo timeout",
+      "status": "PASS",
+      "detail": "completó en 11.7s (margen de 78.3s antes de timeout=90.0s)",
+      "elapsed_s": 11.72214559999702,
+      "extra": {}
+    },
+    {
+      "name": "02 · /health bajo carga de GPU",
+      "status": "PASS",
+      "detail": "2/2 polls OK mientras la GPU trabajaba (latencia media /health=5.27s) — el event loop no se bloqueó",
+      "elapsed_s": null,
+      "extra": {
+        "health_results": [
+          {
+            "ok": true,
+            "elapsed": 2.7393541999917943
+          },
+          {
+            "ok": true,
+            "elapsed": 7.799696299989591
+          }
+        ]
+      }
+    },
+    {
+      "name": "03 · Concurrencia (20 en paralelo)",
+      "status": "PASS",
+      "detail": "20/20 con status 200",
+      "elapsed_s": 24.80208139999013,
+      "extra": {
+        "outcomes": [
+          {
+            "i": 0,
+            "status": 200,
+            "elapsed": 15.108078999997815
+          },
+          {
+            "i": 1,
+            "status": 200,
+            "elapsed": 16.264306600001873
+          },
+          {
+            "i": 2,
+            "status": 200,
+            "elapsed": 14.334389399999054
+          },
+          {
+            "i": 3,
+            "status": 200,
+            "elapsed": 17.03572339999664
+          },
+          {
+            "i": 4,
+            "status": 200,
+            "elapsed": 14.696296499998425
+          },
+          {
+            "i": 5,
+            "status": 200,
+            "elapsed": 15.393760100007057
+          },
+          {
+            "i": 6,
+            "status": 200,
+            "elapsed": 17.338995500002056
+          },
+          {
+            "i": 7,
+            "status": 200,
+            "elapsed": 24.49346840000362
+          },
+          {
+            "i": 8,
+            "status": 200,
+            "elapsed": 16.46534619999875
+          },
+          {
+            "i": 9,
+            "status": 200,
+            "elapsed": 21.206419400012237
+          },
+          {
+            "i": 10,
+            "status": 200,
+            "elapsed": 22.50638349998917
+          },
+          {
+            "i": 11,
+            "status": 200,
+            "elapsed": 23.034882200008724
+          },
+          {
+            "i": 12,
+            "status": 200,
+            "elapsed": 15.526668399994378
+          },
+          {
+            "i": 13,
+            "status": 200,
+            "elapsed": 18.266723199994885
+          },
+          {
+            "i": 14,
+            "status": 200,
+            "elapsed": 20.122040700007346
+          },
+          {
+            "i": 15,
+            "status": 200,
+            "elapsed": 23.67346859999816
+          },
+          {
+            "i": 16,
+            "status": 200,
+            "elapsed": 17.24821730000258
+          },
+          {
+            "i": 17,
+            "status": 200,
+            "elapsed": 23.16746779999812
+          },
+          {
+            "i": 18,
+            "status": 200,
+            "elapsed": 18.891653699989547
+          },
+          {
+            "i": 19,
+            "status": 200,
+            "elapsed": 21.48460250000062
+          }
+        ]
+      }
+    }
+  ]
+}

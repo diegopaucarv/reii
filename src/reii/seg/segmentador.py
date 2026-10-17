@@ -1,4 +1,5 @@
 import gc
+import hashlib
 import logging
 import re
 import unicodedata
@@ -284,6 +285,9 @@ class ClassicSegmenter:
 # ─────────────────────────────────────────────────────────────────────────────
 # ProgressiveSegmenter  — with full debug instrumentation on coref pipeline
 # ─────────────────────────────────────────────────────────────────────────────
+_PREMERGE_CACHE_MAXSIZE = 2000
+
+
 class ProgressiveSegmenter:
     def __init__(
         self,
@@ -349,6 +353,11 @@ class ProgressiveSegmenter:
             batch_extractor=self._roots.batch if _bs > 1 else None,
             batch_size=max(1, _bs),
         )
+        # Caché de pre-merge (recursive_segmentation + final_clustering)
+        # por documento. Vive toda la vida del ProgressiveSegmenter, que es
+        # única por corrida del pipeline (main + Optimizador comparten la
+        # misma instancia). Ver premerge_cached() para el análisis de pureza.
+        self._premerge_cache: dict = {}
         logging.info(f"[Init] Device: {self.device}")
 
     # ── debug helper ──────────────────────────────────────────────────────────
@@ -566,10 +575,13 @@ class ProgressiveSegmenter:
             return False
 
         # ── 2. HEAVY MATH ONLY IF IT PASSES THE FILTER ──
-        emb1 = self.model.encode([seg1_tail])[0]
-        emb2 = self.model.encode([segment2])[0]
-        similarity = cosine_similarity([emb1], [emb2])[0][0]
-
+        embs = self.model.encode(
+            [seg1_tail, segment2],
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        emb1, emb2 = embs[0], embs[1]
+        similarity = float(cosine_similarity(emb1[None, :], emb2[None, :])[0][0])
         try:
             tfidf1 = self.tfidf_vectorizer.transform([seg1_tail])
             tfidf2 = self.tfidf_vectorizer.transform([segment2])
@@ -612,9 +624,6 @@ class ProgressiveSegmenter:
             return segments
 
         merged_segments = [segments[0]]
-        merge_count = 0
-        rebuild_interval = 10
-        prev_len = 1  # track actual segment count changes for HNSW rebuild
 
         for i in range(1, len(segments)):
             last_segment = merged_segments[-1]
@@ -622,28 +631,10 @@ class ProgressiveSegmenter:
 
             if not self.detect_topic_shift(last_segment, current_segment, last_n=3):
                 merged_segments[-1] += " " + current_segment
-                merge_count += 1
-
-                # Only rebuild HNSW if segment count actually changed
-                if merge_count >= rebuild_interval and len(merged_segments) != prev_len:
-                    prev_len = len(merged_segments)
-                    self.embeddings = self.generate_embeddings(merged_segments)
-                    if len(self.embeddings) > 0:
-                        self.index = hnswlib.Index(
-                            space="cosine", dim=self.embeddings.shape[1]
-                        )
-                        self.index.init_index(
-                            max_elements=len(self.embeddings),
-                            ef_construction=self.hnsw_ef,
-                            M=self.hnsw_m,
-                        )
-                        self.index.add_items(self.embeddings)
-                        self.index.set_ef(self.hnsw_ef)
-                    merge_count = 0
             else:
                 merged_segments.append(current_segment)
 
-            # Cap history lists to avoid unbounded growth
+            # Cap history lists (esto sí se mantiene, es barato)
             MAX_HISTORY = 200
             for attr in (
                 "similarity_history",
@@ -661,6 +652,85 @@ class ProgressiveSegmenter:
             1 for token1, token2 in zip(doc1, doc2) if token1.dep_ != token2.dep_
         )
         return dep_diff / max(len(doc1), len(doc2))
+
+    def premerge_cached(self, doc_uces) -> list:
+        """Recursive + final clustering por documento, con caché por contenido.
+
+        Devuelve la lista de segmentos mergeados que produce
+        ``final_clustering(recursive_segmentation([u.texto for u in doc_uces]))``.
+
+        ── Por qué es seguro cachear ────────────────────────────────────────
+        Ambas sub-operaciones son puras respecto a su input:
+
+          · ``recursive_segmentation`` lee ``self.model`` (persistente, sin
+            dropout), ``self.similarity_threshold`` y ``self.max_depth``
+            —los tres inmutables tras ``__init__``— y usa scipy (determinista).
+
+          · ``final_clustering`` → ``progressive_clustering`` →
+            ``detect_topic_shift``. Este último MUTA self.similarity_history, self.syntactic_diff_history y self.lex_sim_history, pero NINGUNO de esos atributos se lee para decidir si un par de segmentos se mergea. Son estado muerto: se escriben y nadie los consulta. (Nota: self.embeddings y self.index ya NO se mutan aquí tras el Fix A; solo los escribe segment_text al final del path no-coref.)
+
+        Por tanto, saltarse la recomputación cuando el input no cambió no
+        altera el resultado. Los side-effects que se pierden en un cache hit
+        (historiales, ``self.embeddings``, ``self.index``) no afectan a
+        ninguna decisión posterior del pipeline.
+
+        ── Clave de caché ───────────────────────────────────────────────────
+        SHA-1 sobre los textos de los UCEs unidos con NUL. Inmune a:
+          · sufijos de ``uce.id`` (``__coref{ctx}``) añadidos por el caller
+            antes de invocar este método — el id no entra en la clave;
+          · el ``copy.deepcopy`` del caller — la clave usa los textos, no la
+            identidad de los objetos;
+          · reordenamientos dentro del doc (el hash es sensible al orden).
+
+        ── Contrato con el caller ───────────────────────────────────────────
+        El caller NO debe mutar la lista devuelta. Se devuelve una copia
+        superficial (los strings son inmutables, el contenedor es nuevo) para
+        que un caller futuro que mute la lista no envenene el caché.
+
+        ── Cota de memoria ──────────────────────────────────────────────────
+        Un entry típico pesa ~5 KB (≈15 strings de ~300 chars). El caché se
+        acota a ``_PREMERGE_CACHE_MAXSIZE`` entries con evicción FIFO. Con 2000
+        entries el pico es ~10 MB, independiente del tamaño del corpus.
+
+        ── Determinismo verificado ──────────────────────────────────────────
+        Ver ``tests/test_premerge_cache.py`` (si no existe, el bloque de
+        verificación del PR lo incluye) — compara bit-exacto el output con y
+        sin caché sobre docs reales del corpus.
+        """
+        if not doc_uces:
+            return []
+
+        key = hashlib.sha1(
+            b"\x00".join(u.texto.encode("utf-8") for u in doc_uces)
+        ).digest()
+
+        cached = self._premerge_cache.get(key)
+        if cached is not None:
+            # Copia superficial: el caller puede mutar la lista sin dañar el
+            # caché; los strings son inmutables y se comparten.
+            if self.debug_coref:
+                self._dprint(
+                    f"premerge cache HIT ({len(cached)} segmentos) key={key.hex()[:8]}"
+                )
+            return list(cached)
+
+        if self.debug_coref:
+            self._dprint(
+                f"premerge cache MISS ({len(doc_uces)} UCEs) key={key.hex()[:8]}"
+            )
+
+        uce_texts = [u.texto for u in doc_uces]
+        rec_seg = self.recursive_segmentation(uce_texts)
+        prog_seg = self.final_clustering(rec_seg)
+
+        # Evicción FIFO antes de insertar. Los dict de Python 3.7+ preservan
+        # el orden de inserción, así que next(iter(...)) es el más antiguo.
+        if len(self._premerge_cache) >= _PREMERGE_CACHE_MAXSIZE:
+            oldest = next(iter(self._premerge_cache))
+            del self._premerge_cache[oldest]
+
+        self._premerge_cache[key] = prog_seg
+        return list(prog_seg)
 
     def final_clustering(self, segments):
         clustered_segments = self.progressive_clustering(segments)

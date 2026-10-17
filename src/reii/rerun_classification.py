@@ -52,7 +52,16 @@ from reii.main_workflow import (
     obtener_llave_maestra,
 )
 
-_COREF_MODES = {"coref_only", "wc_coref", "coref_emb", "all"}
+_COREF_MODES = {
+    "coref_only",
+    "wc_coref",
+    "coref_emb",
+    "all",
+    "both",
+    "sim_only",
+    "wc_sim",
+    "sim_emb",
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -225,6 +234,14 @@ def main() -> int:
         help="Ignora cualquier checkpoint existente y rehace la clasificación "
         "coref desde cero (sobrescribiendo los archivos derivados).",
     )
+    parser.add_argument(
+        "--uce-target-size",
+        type=int,
+        default=None,
+        help="Fija uce_target_size (palabras/UCE objetivo) y DESACTIVA la "
+        "auto-calibración bayesiana. Si no se pasa, se elige automáticamente "
+        "con el promedio real medido (auto_calibrate_uce_size=True).",
+    )
     args = parser.parse_args()
 
     # ── 0. Diagnóstico: Stanza remoto (Colab) vs local ─────────────────
@@ -280,7 +297,7 @@ def main() -> int:
         hdbscan_uce_min_cluster_size=5,
         hdbscan_uce_min_cluster_size_loose=3,
         hdbscan_uce_metric="euclidean",
-        optimize=True,  # best_params.json already exists
+        optimize=False,  # best_params.json already exists
         optimize_trials=300,
         optimize_sampler="tpe",
         optimize_pruner="median",
@@ -297,6 +314,15 @@ def main() -> int:
         # soluciones degeneradas sin matar las realistas.
         optimize_coverage_gate=0.25,
     )
+
+    # ── Override CLI: --uce-target-size gana sobre la auto-calibración ───
+    if args.uce_target_size is not None:
+        alceste_config.uce_target_size = args.uce_target_size
+        alceste_config.auto_calibrate_uce_size = False
+        print(
+            f"   [CLI] uce_target_size={args.uce_target_size} "
+            "(--uce-target-size override; auto-calibración desactivada)"
+        )
 
     gram_config = GramConfig(min_tokens_por_uce=30, max_tokens_por_uce=200)
     retro_config = RetrofittingConfig(

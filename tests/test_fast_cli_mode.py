@@ -36,10 +36,29 @@ def _extract_parse_cli_mode() -> tuple:
     return ns["_parse_cli_mode"], ns["_CLI_MODES_VALIDOS"]
 
 
+def _extract_parse_cli_uce() -> callable:
+    """Return _parse_cli_uce_target_size extracted from main_workflow.py via AST."""
+    tree = ast.parse(_SRC.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if (
+            isinstance(node, ast.FunctionDef)
+            and node.name == "_parse_cli_uce_target_size"
+        ):
+            func_src = ast.get_source_segment(_SRC.read_text(encoding="utf-8"), node)
+            break
+    else:
+        raise AssertionError("_parse_cli_uce_target_size not found")
+
+    ns: dict = {"sys": sys, "Optional": Optional}
+    exec(func_src, ns)
+    return ns["_parse_cli_uce_target_size"]
+
+
 # Import typing.Optional for the namespace
 from typing import Optional  # noqa: E402
 
 _parse_cli_mode, _CLI_MODES_VALIDOS = _extract_parse_cli_mode()
+_parse_cli_uce_target_size = _extract_parse_cli_uce()
 
 
 def test_valid_modes_include_canonical_and_aliases():
@@ -90,4 +109,39 @@ def test_parse_cli_mode_invalid_exits(monkeypatch, argv):
     monkeypatch.setattr(sys, "argv", argv)
     with pytest.raises(SystemExit) as exc:
         _parse_cli_mode()
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "argv,expected",
+    [
+        (["main_workflow.py"], None),
+        (["main_workflow.py", "--force"], None),
+        (["main_workflow.py", "--mode", "all"], None),  # unrelated flag
+        (["main_workflow.py", "--uce-target-size", "30"], 30),
+        (["main_workflow.py", "--uce-target-size", "26"], 26),
+        (["main_workflow.py", "--uce-target-size", "18"], 18),
+        (["main_workflow.py", "--force", "--uce-target-size", "30"], 30),
+        (["main_workflow.py", "--uce-target-size", "30", "--mode", "all"], 30),
+    ],
+)
+def test_parse_cli_uce_valid(monkeypatch, argv, expected):
+    monkeypatch.setattr(sys, "argv", argv)
+    assert _parse_cli_uce_target_size() == expected
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["main_workflow.py", "--uce-target-size"],  # missing value
+        ["main_workflow.py", "--uce-target-size", "--force"],  # value is a flag
+        ["main_workflow.py", "--uce-target-size", "abc"],  # not an int
+        ["main_workflow.py", "--uce-target-size", "0"],  # must be > 0
+        ["main_workflow.py", "--uce-target-size", "-5"],  # must be > 0
+    ],
+)
+def test_parse_cli_uce_invalid_exits(monkeypatch, argv):
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as exc:
+        _parse_cli_uce_target_size()
     assert exc.value.code == 2

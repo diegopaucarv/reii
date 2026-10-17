@@ -372,6 +372,29 @@ def _parse_cli_mode() -> Optional[str]:
     return mode
 
 
+def _parse_cli_uce_target_size() -> Optional[int]:
+    """Devuelve el valor de --uce-target-size si está presente; valida y sale con error si es inválido."""
+    if "--uce-target-size" not in sys.argv:
+        return None
+    i = sys.argv.index("--uce-target-size")
+    if i + 1 >= len(sys.argv) or sys.argv[i + 1].startswith("--"):
+        print(
+            "   [ERROR] --uce-target-size requiere un valor entero "
+            "(p.ej. --uce-target-size 30)"
+        )
+        sys.exit(2)
+    raw = sys.argv[i + 1].strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"   [ERROR] --uce-target-size inválido: {raw!r}. Debe ser un entero.")
+        sys.exit(2)
+    if value <= 0:
+        print(f"   [ERROR] --uce-target-size debe ser > 0 (recibido: {value}).")
+        sys.exit(2)
+    return value
+
+
 # ══════════════════════════════════════════════════════════════════════
 # FINGERPRINT DEL CORPUS (best_params dataset-specific)
 # ══════════════════════════════════════════════════════════════════════
@@ -402,6 +425,129 @@ def _corpus_fingerprint() -> str:
         h.update(str(os.path.getmtime(_p)).encode("utf-8"))
         h.update(str(os.path.getsize(_p)).encode("utf-8"))
     return h.hexdigest()[:16]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Cache de cadenas coref: helpers de módulo para que el orquestador
+# (no solo el Optimizador) pueda leer/escribir el mismo cache en disco.
+# ══════════════════════════════════════════════════════════════════════
+from reii.coref_cache import (
+    atomic_write_json,
+    build_cache_document,
+    load_cache,
+    missing_ctx_values,
+)
+
+
+def _coref_cache_key_standalone(config_base: "Config", fp: str) -> str:
+    """Debe coincidir EXACTAMENTE con Optimizador._coref_cache_key."""
+    uce_target = int(getattr(config_base, "uce_target_size", 26))
+    min_words = int(getattr(config_base, "min_uce_words", 2))
+    return f"{fp}:{uce_target}:{min_words}"
+
+
+def load_coref_chains_from_disk(
+    config_base: "Config",
+) -> Dict[int, Dict[str, List]]:
+    """Carga el cache de cadenas coref del disco si su clave coincide con
+    el corpus + segmentación actuales. Devuelve {} si no hay cache válido."""
+    fp = _corpus_fingerprint()
+    cache_key = _coref_cache_key_standalone(config_base, fp)
+    result = load_cache(COREF_CHAINS_CACHE_PATH, cache_key)
+    return result or {}
+
+
+def save_coref_chains_to_disk(
+    config_base: "Config", chains: Dict[int, Dict[str, List]]
+) -> None:
+    """Persiste el cache completo de forma atómica. Nunca lanza."""
+    fp = _corpus_fingerprint()
+    cache_key = _coref_cache_key_standalone(config_base, fp)
+    doc = build_cache_document(cache_key, fp, chains)
+    try:
+        atomic_write_json(COREF_CHAINS_CACHE_PATH, doc)
+    except OSError as e:
+        logger.warning("No se pudo guardar el cache de cadenas coref: %s", e)
+
+
+def compute_coref_chains_for_ctx(
+    progressive_segmenter,
+    uces_por_doc: List[List["UCE"]],
+    ctx_values: Iterable[int],
+) -> Dict[int, Dict[str, List]]:
+    """
+    Réplica exacta del paso 3a–3c de DoubleClassifier._clasificar_umbral_coref,
+    pero standalone: extrae cadenas para cada ctx sin clasificar nada.
+
+    Se usa para precomputar el cache ANTES de Pass 1, replicando lo que el
+    Optimizador ya hace en _precompute_coref_chains (no podemos reusar el
+    método porque es instance method del Optimizador y aquí no lo tenemos).
+    """
+    ctx_values = {int(c) for c in ctx_values if int(c) > 0}
+    result: Dict[int, Dict[str, List]] = {c: {} for c in ctx_values}
+    if not ctx_values:
+        return result
+
+    ps = progressive_segmenter
+    for doc_uces in uces_por_doc:
+        if not doc_uces:
+            continue
+        doc_id = doc_uces[0].doc_id
+
+        # Pre-merge (recursive_segmentation + final_clustering), idéntico a
+        # _clasificar_umbral_coref paso 3a.
+        if len(doc_uces) > 1:
+            try:
+                rec_seg = ps.recursive_segmentation([u.texto for u in doc_uces])
+                prog_seg = ps.final_clustering(rec_seg)
+                premerged_groups = _remap_uces_to_segments(doc_uces, prog_seg)
+            except Exception as e:
+                logger.warning(
+                    "Pre-merge falló para doc %s en precompute: %s", doc_id, e
+                )
+                premerged_groups = [[u] for u in doc_uces]
+        else:
+            premerged_groups = [doc_uces]
+
+        # Guard: mismo colapso que en runtime
+        if len(premerged_groups) == 1 and len(doc_uces) > 50:
+            premerged_groups = [[u] for u in doc_uces]
+
+        # segments_info con offsets secuenciales
+        full_doc_text = ""
+        segments_info: List[Dict] = []
+        current_offset = 0
+        for group in premerged_groups:
+            group_text = " ".join(u.texto for u in group)
+            start = current_offset
+            end = start + len(group_text)
+            segments_info.append(
+                {
+                    "text": group_text,
+                    "start": start,
+                    "end": end,
+                    "uce_id": group[-1].id,
+                }
+            )
+            full_doc_text += group_text + " "
+            current_offset = end + 1
+
+        for ctx in ctx_values:
+            try:
+                chains = ps._extract_global_chains(
+                    segments_info, full_doc_text, context_units=ctx
+                )
+            except Exception as e:
+                logger.warning("Extracción falló doc %s ctx %d: %s", doc_id, ctx, e)
+                chains = []
+            result[ctx][doc_id] = chains
+
+    for ctx, by_doc in result.items():
+        total = sum(len(v) for v in by_doc.values())
+        print(
+            f"   [Coref] ctx={ctx}: {total} cadenas en {len(by_doc)} docs (precompute)"
+        )
+    return result
 
 
 def _corpus_total_words(corpus_raw) -> int:
@@ -4228,10 +4374,12 @@ class DoubleClassifier:
             #       recursive_segmentation → final_clustering → coref.
             #       Each resulting group becomes the atomic segment for coref.
             if len(doc_uces) > 1:
-                uce_texts = [u.texto for u in doc_uces]
                 try:
-                    rec_seg = ps.recursive_segmentation(uce_texts)
-                    prog_seg = ps.final_clustering(rec_seg)
+                    # premerge_cached es bit-equivalente a
+                    # final_clustering(recursive_segmentation(texts)); el
+                    # caché por contenido evita recomputar en B2, Pass 2 y
+                    # trials del optimizador. Ver ProgressiveSegmenter.
+                    prog_seg = ps.premerge_cached(doc_uces)
                     premerged_groups = _remap_uces_to_segments(doc_uces, prog_seg)
                     n_pre = len(premerged_groups)
                     print(
@@ -7660,7 +7808,7 @@ class Optimizador:
         n_clusters = int(len(np.unique(labels_primary)))
 
         # ── Gate duro: K fuera de rango útil ─────────────────────────────
-        if n_clusters < 2 or n_clusters > 8:
+        if n_clusters < 2 or n_clusters > 20:
             return _SENTINEL_TRIAL
 
         coverage_primary = len(primary_stable) / max(1, self.total_uces)
@@ -8664,6 +8812,7 @@ class WorkflowOrchestrator:
                     corpus_raw,
                     ppmi_builder=self.ppmi_builder,
                 )
+                print("== Mini-pass! No tomar estos resultados en serio == ")
                 retro_vecs_for_optimizer = self._compute_retrofitted_vectors(
                     mini_resultados, mini_voc
                 )
@@ -8704,10 +8853,60 @@ class WorkflowOrchestrator:
 
         # Restaurar embeddings para la corrida principal
         self.config.use_embeddings = True
+
+        # ── Precomputar / cargar cache de cadenas coref ────────────────────
+        # Sin esto, Pass 1 y Pass 2 re-extraen TODAS las cadenas vía HTTP,
+        # que es lo que se come 3–4 h del pipeline. El Optimizador ya guardó
+        # su cache en disco; aquí lo cargamos y solo computamos lo que falte.
+        precomputed_coref_chains: Dict[int, Dict[str, List]] = {}
+        if self.double_clf.progressive_segmenter is not None:
+            precomputed_coref_chains = load_coref_chains_from_disk(self.config)
+            if precomputed_coref_chains:
+                print(
+                    f"   [Coref] Cache en disco cargado: "
+                    f"ctx={sorted(precomputed_coref_chains.keys())}, "
+                    f"{sum(len(v) for v in precomputed_coref_chains.values())} cadenas."
+                )
+
+            ctx_needed = {
+                int(getattr(self.config, "coref_context_units_tight", 2)),
+                int(getattr(self.config, "coref_context_units_loose", 4)),
+            }
+            missing = ctx_needed - set(precomputed_coref_chains.keys())
+            if missing:
+                print(
+                    f"   [Coref] Cache incompleto. Computando ctx={sorted(missing)}..."
+                )
+                # Necesitamos uces_por_doc: del optimizador si lo tenemos,
+                # si no segmentamos aquí una vez (Pass 1 lo reutilizará).
+                if cached_uces_por_doc is not None:
+                    uces_for_coref = cached_uces_por_doc
+                else:
+                    print(
+                        "   [Coref] Segmentando para precomputar cadenas "
+                        "(Pass 1 reutilizará este resultado)..."
+                    )
+                    uces_for_coref, cached_doc_metadata_map = (
+                        self.segmentador.segmentar_en_uces(corpus_raw)
+                    )
+                    for doc_uces in uces_for_coref:
+                        self.segmentador.lematizar_uces(doc_uces)
+                    for doc_uces in uces_for_coref:
+                        for uce in doc_uces:
+                            uce.id = normalizar_id_uce(uce)
+                    cached_uces_por_doc = uces_for_coref
+
+                new_chains = compute_coref_chains_for_ctx(
+                    self.double_clf.progressive_segmenter,
+                    uces_for_coref,
+                    missing,
+                )
+                precomputed_coref_chains.update(new_chains)
+                save_coref_chains_to_disk(self.config, precomputed_coref_chains)
+
         # ── Main run — skip re-lemmatization if we have the cache ──────────
         if cached_uces_por_doc is not None:
             print("   Reutilizando cache de lematización del optimizador...")
-            # Patch the double classifier's segmenter
             original_seg = self.double_clf.segmentador.segmentar_en_uces
             original_lem = self.double_clf.segmentador.lematizar_uces
             self.double_clf.segmentador.segmentar_en_uces = lambda x: (
@@ -8717,6 +8916,7 @@ class WorkflowOrchestrator:
             self.double_clf.segmentador.lematizar_uces = lambda x: x
 
         print("=== Pass 1: CHD with generic vectors ===")
+
         (
             uces_est_p1,
             _,
@@ -8735,6 +8935,7 @@ class WorkflowOrchestrator:
             cached_doc_metadata_map=cached_doc_metadata_map,
             checkpoint_path=checkpoint_path,
             force=force,
+            precomputed_coref_chains=precomputed_coref_chains,  # ← NUEVO
         )
 
         # ── Retrofitting on pass-1 output ─────────────────────────────────────────
@@ -8764,6 +8965,7 @@ class WorkflowOrchestrator:
                 cached_doc_metadata_map=doc_metadata_map,
                 checkpoint_path=checkpoint_path,
                 force=force,
+                precomputed_coref_chains=precomputed_coref_chains,  # ← NUEVO
             )
 
             # ── Persist pairwise stability matrices ───────────────────────────────
@@ -9352,6 +9554,18 @@ if __name__ == "__main__":
         )
         print(f"   [CLI] classification_mode={_cli_mode} (--mode override)")
 
+    # ── Override CLI: --uce-target-size gana sobre ConfigStore y desactiva
+    #    la auto-calibración (el valor explícito manda) ──────────────────
+    _cli_uce = _parse_cli_uce_target_size()
+    if _cli_uce is not None:
+        alceste_config = dataclasses.replace(
+            alceste_config, uce_target_size=_cli_uce, auto_calibrate_uce_size=False
+        )
+        print(
+            f"   [CLI] uce_target_size={_cli_uce} "
+            "(--uce-target-size override; auto-calibración desactivada)"
+        )
+
     gram_config = GramConfig(
         min_tokens_por_uce=30,
         max_tokens_por_uce=200,
@@ -9434,12 +9648,23 @@ if __name__ == "__main__":
     # La forma más limpia: exponer uces_por_doc como atributo del orchestrator.
     # Por ahora, pasamos gram_pipeline directamente para que ejecutar()
     # llame a procesar_desde_uces() en el momento correcto.
+    # ── Checkpoint de coref: permite reanudar tras OOM o corte ─────────────
+    # _clasificar_umbral_coref deriva un archivo por ctx (B1, B2) y guarda
+    # tras cada documento. Si la corrida muere, la siguiente reanuda.
+    _coref_ckpt_path = os.path.join(
+        os.path.dirname(COREF_CHAINS_CACHE_PATH) or ".",
+        "coref_seg_checkpoint.json",
+    )
+    _force_from_cli = "--force" in sys.argv or "--reprocess" in sys.argv
+
     orchestrator.ejecutar(
-        corpus_raw=uwu,  # <--- Changed from uwu
+        corpus_raw=uwu,
         grammatical_pipeline=gram_pipeline,
         global_corpus=global_corpus,
         lex_analyzer=lex_analyzer,
         grammatical_dashboard_path=OUTPUT_DASHBOARD,
+        checkpoint_path=_coref_ckpt_path,
+        force=_force_from_cli,
     )
     # ── PHASE 2: Clustering de predicados (post-ALCESTE) ─────────────
     global_predicate_result = None
