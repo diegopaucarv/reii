@@ -209,6 +209,20 @@ STANZA_SERVER_TIMEOUT: float = float(os.environ.get("STANZA_SERVER_TIMEOUT", "90
 STANZA_SERVER_FALLBACK_LOCAL: bool = (
     os.environ.get("STANZA_SERVER_FALLBACK_LOCAL", "true").lower() == "true"
 )
+# Cuántos textos van en CADA petición a /v1/extract_coref. El servidor sigue
+# llamando nlp() UNA vez por texto (nunca los batchea entre sí — ver nota en
+# stanza_server.py), así que esto solo ahorra overhead de red/túnel por
+# texto, no tiempo de GPU. Default=1: comportamiento actual. Solo subir tras
+# migrar de cloudflared quick-tunnel (~100s de timeout) a un túnel propio.
+STANZA_SERVER_COREF_REMOTE_BATCH: int = int(
+    os.environ.get("STANZA_SERVER_COREF_REMOTE_BATCH", "1")
+)
+# Cuántas peticiones a /v1/extract_coref puede tener el cliente en vuelo al
+# mismo tiempo. Solo rinde si el servidor tiene REII_STANZA_N_REPLICAS>1 (si
+# no, todas las peticiones concurrentes se van a encolar igual detrás de la
+# única réplica del servidor — no hace daño, pero tampoco acelera nada).
+# Default=1: comportamiento actual (totalmente secuencial).
+STANZA_SERVER_CONCURRENCY: int = int(os.environ.get("STANZA_SERVER_CONCURRENCY", "1"))
 
 # ---------------------------------------------------------------------------
 # API keys / tokens

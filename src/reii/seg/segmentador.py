@@ -3,6 +3,7 @@ import hashlib
 import logging
 import re
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import hnswlib
@@ -27,6 +28,8 @@ from reii.config import (
     ROOTS_SKIP_COREF,
     SEGMENTER_EMBEDDING_MODEL,
     SPACY_MODEL,
+    STANZA_SERVER_COREF_REMOTE_BATCH,
+    STANZA_SERVER_CONCURRENCY,
     STANZA_SERVER_FALLBACK_LOCAL,
     STANZA_SERVER_TIMEOUT,
     STANZA_SERVER_TOKEN,
@@ -942,13 +945,26 @@ class ProgressiveSegmenter:
         if not pending:
             return
 
-        # Lotes pequeños por petición: el coref es lento (~11s por ~100 chars
-        # medido en T4) y el túnel de Cloudflare corta a los ~100s. Con 5 textos
-        # por request (cada uno de hasta 1500 chars) se superaba el timeout de
-        # 120s. 1 texto por request lo mantiene bajo el límite.
-        REMOTE_BATCH = 1
-        for i in range(0, len(pending), REMOTE_BATCH):
-            batch = pending[i : i + REMOTE_BATCH]
+        # Lotes por petición: el servidor sigue llamando nlp() UNA vez por
+        # texto dentro de cada batch (nunca los mezcla entre sí — ver nota en
+        # stanza_server.py), así que REMOTE_BATCH>1 solo ahorra overhead de
+        # red/túnel por texto, no tiempo de GPU. Default=1: comportamiento
+        # original. Subir tras migrar de cloudflared quick-tunnel (~100s de
+        # timeout) a un túnel propio — vigilar que
+        # REMOTE_BATCH × tiempo_por_texto < STANZA_SERVER_TIMEOUT.
+        REMOTE_BATCH = STANZA_SERVER_COREF_REMOTE_BATCH
+        batches = [pending[i : i + REMOTE_BATCH] for i in range(0, len(pending), REMOTE_BATCH)]
+
+        def _fetch_batch(batch):
+            """Solo la llamada de red — SIN tocar seen_chain_keys/global_chains.
+
+            Esas dos estructuras se mutan después, secuencialmente, en el
+            hilo principal: son sets/listas comunes, no thread-safe, y
+            mutarlas desde varios hilos (ThreadPoolExecutor) a la vez
+            reintroduciría exactamente el tipo de carrera que la dedupe por
+            fingerprint está pensada para evitar. Esta función solo decide
+            éxito/fracaso; el merge pasa por acá abajo, en orden, como antes.
+            """
             texts = [t for t, _ in batch]
             try:
                 resp = requests.post(
@@ -965,10 +981,30 @@ class ProgressiveSegmenter:
                         f"el servidor devolvió {len(results)} resultados para "
                         f"{len(texts)} textos"
                     )
+                return (batch, results, None)
             except Exception as e:
-                self._dprint(f"    ✗ Stanza remoto falló ({e!r}); usando Stanza local.")
-                logging.warning("Stanza remoto falló (%s); usando Stanza local", e)
+                return (batch, None, e)
+
+        concurrency = max(1, STANZA_SERVER_CONCURRENCY)
+        # Solo rinde si el servidor tiene >1 réplica (REII_STANZA_N_REPLICAS);
+        # si no, las peticiones concurrentes se encolan igual detrás de la
+        # única réplica remota — no hace daño, pero tampoco acelera nada.
+        if concurrency <= 1 or len(batches) <= 1:
+            fetched = [_fetch_batch(b) for b in batches]
+        else:
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                # executor.map preserva el orden de batches, igual que el
+                # for secuencial original — el merge de abajo no cambia.
+                fetched = list(executor.map(_fetch_batch, batches))
+
+        # ── Merge: SIEMPRE secuencial, en el orden original de `batches` ──
+        for batch, results, err in fetched:
+            if err is not None:
+                self._dprint(f"    ✗ Stanza remoto falló ({err!r}); usando Stanza local.")
+                logging.warning("Stanza remoto falló (%s); usando Stanza local", err)
                 if not STANZA_SERVER_FALLBACK_LOCAL:
+                    # Idéntico al comportamiento original: un fallo duro
+                    # aborta el resto de `pending`, no solo este batch.
                     return
                 stanza_pipe = self.get_stanza()
                 if stanza_pipe is None:
