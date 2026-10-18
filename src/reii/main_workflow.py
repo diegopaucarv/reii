@@ -854,10 +854,30 @@ class Config:
     classification_mode: str = "wc_only"
 
     # Method C — HDBSCAN on retrofitted UCE embedding space
-    hdbscan_uce_min_cluster_size: int = 5  # tight pass
-    hdbscan_uce_min_cluster_size_loose: int = 3  # loose pass (stability comparison)
+    #
+    # min_cluster_size solía ser un entero absoluto (5 / 3), igual en
+    # cualquier corpus. Methods A y B lo escalan al corpus vía
+    # min_cluster_size_cdh (fracción de n) y por eso producen K~7-16 sin
+    # importar n. Method C con un absoluto fijo sobre n=5809 producía
+    # K~243-534 clusters (>50% de ruido, persistence=1.0 en todos): una
+    # granularidad ~20-70x más fina que A/B, así que casi nada podía
+    # coincidir entre métodos (intersección triple ≈0.2%). Ahora se
+    # escala igual que A/B: min_cluster_size = frac * n_embeddable,
+    # con un piso absoluto para corpus chicos. Dejar *_frac en None
+    # restaura el comportamiento absoluto anterior (compatibilidad con
+    # configuraciones o best_params.json guardados antes de este cambio).
+    # ([hdbscan-scale-patch])
+    hdbscan_uce_min_cluster_frac: Optional[float] = 0.08  # tight pass
+    hdbscan_uce_min_cluster_frac_loose: Optional[float] = 0.05  # loose pass
+    hdbscan_uce_min_cluster_floor: int = 5  # piso absoluto (corpus chicos)
+    hdbscan_uce_min_cluster_size: int = 5  # tight pass — override absoluto (frac=None)
+    hdbscan_uce_min_cluster_size_loose: int = 3  # loose pass — override absoluto (frac=None)
     hdbscan_uce_epsilon: float = 0.0
-    hdbscan_uce_min_samples: Optional[int] = 1
+    # min_samples=1 (el default anterior) es muy permisivo: con min_cluster_size
+    # chico produce clusters triviales con persistence≈1.0. None → se deriva de
+    # min_samples_ratio; un int explícito sigue siendo un override manual.
+    hdbscan_uce_min_samples: Optional[int] = None
+    hdbscan_uce_min_samples_ratio: float = 0.25  # min_samples ≈ ratio · min_cluster_size
     hdbscan_uce_metric: str = "euclidean"  # "euclidean" | "cosine"
 
     # DSN de la base de datos (PostgreSQL). Si None, se deriva de db_local_path.
@@ -4693,11 +4713,43 @@ class DoubleClassifier:
     # ═══════════════════════════════════════════════════════════════════
     # METHOD 3 — HDBSCAN on retrofitted UCE embedding space
     # ═══════════════════════════════════════════════════════════════════
+    def _resolve_hdbscan_uce_params(
+        self, n_embeddable: int, variant: str
+    ) -> Tuple[int, int]:
+        """Deriva (min_cluster_size, min_samples) para Method C, escalados a
+        ``n_embeddable`` igual que ``min_cluster_size_cdh`` escala A/B. ([hdbscan-scale-patch])
+
+        variant: "tight" o "loose". Con *_frac en None, reproduce el
+        comportamiento absoluto anterior (compatibilidad hacia atrás).
+        """
+        if variant not in ("tight", "loose"):
+            raise ValueError(f"variant debe ser 'tight' o 'loose', no {variant!r}")
+        floor = max(2, int(getattr(self.config, "hdbscan_uce_min_cluster_floor", 5)))
+        if variant == "tight":
+            frac = getattr(self.config, "hdbscan_uce_min_cluster_frac", None)
+            absolute = getattr(self.config, "hdbscan_uce_min_cluster_size", 5)
+        else:
+            frac = getattr(self.config, "hdbscan_uce_min_cluster_frac_loose", None)
+            absolute = getattr(self.config, "hdbscan_uce_min_cluster_size_loose", 3)
+        if frac is not None:
+            min_cluster_size = max(floor, round(float(frac) * n_embeddable))
+        else:
+            min_cluster_size = max(floor, int(absolute))
+
+        min_samples = getattr(self.config, "hdbscan_uce_min_samples", None)
+        if min_samples is None:
+            ratio = float(getattr(self.config, "hdbscan_uce_min_samples_ratio", 0.25))
+            min_samples = max(2, round(ratio * min_cluster_size))
+        else:
+            min_samples = max(1, int(min_samples))
+        return min_cluster_size, min_samples
+
     def _clasificar_umbral_embedding(
         self,
         uces_por_doc: List[List[UCE]],
         min_cluster_size: int,
         retrofitted_vectors: Dict[str, np.ndarray],
+        min_samples: Optional[int] = None,  # ([hdbscan-scale-patch]) resuelto por el caller
     ) -> Optional[Dict]:
         """
         Method C: direct HDBSCAN clustering of all UCEs in retrofitted space.
@@ -4734,9 +4786,20 @@ class DoubleClassifier:
             )
             return None
 
+        # Si el caller no resolvió min_samples explícitamente (pasos nuevos
+        # SIEMPRE lo resuelven con _resolve_hdbscan_uce_params), cae al
+        # mismo criterio escalado — nunca al 1 fijo de antes. ([hdbscan-scale-patch])
+        if min_samples is None:
+            ratio = float(getattr(self.config, "hdbscan_uce_min_samples_ratio", 0.25))
+            explicit = getattr(self.config, "hdbscan_uce_min_samples", None)
+            min_samples = (
+                max(1, int(explicit))
+                if explicit is not None
+                else max(2, round(ratio * min_cluster_size))
+            )
         clusterer = hdbscan.HDBSCAN(
             min_cluster_size=min_cluster_size,
-            min_samples=getattr(self.config, "hdbscan_uce_min_samples", 1),
+            min_samples=min_samples,
             cluster_selection_epsilon=getattr(self.config, "hdbscan_uce_epsilon", 0.0),
             metric=getattr(self.config, "hdbscan_uce_metric", "euclidean"),
             gen_min_span_tree=True,
@@ -5488,19 +5551,25 @@ class DoubleClassifier:
             and retrofitted_vectors is not None
         )
         if _do_emb:
-            mcs_tight = getattr(self.config, "hdbscan_uce_min_cluster_size", 5)
-            mcs_loose = getattr(self.config, "hdbscan_uce_min_cluster_size_loose", 3)
+            # Escalado al corpus (mismo criterio que min_cluster_size_cdh en
+            # A/B), no un absoluto fijo — ver _resolve_hdbscan_uce_params.
+            # ([hdbscan-scale-patch])
+            _n_emb = sum(len(d) for d in uces_por_doc)
+            mcs_tight, ms_tight = self._resolve_hdbscan_uce_params(_n_emb, "tight")
+            mcs_loose, ms_loose = self._resolve_hdbscan_uce_params(_n_emb, "loose")
             print(
-                f"\n--- Classification C1: EMB tight (min_cluster_size={mcs_tight}) ---"
+                f"\n--- Classification C1: EMB tight (min_cluster_size={mcs_tight}, "
+                f"min_samples={ms_tight}) ---"
             )
             res_emb1 = self._clasificar_umbral_embedding(
-                uces_por_doc, mcs_tight, retrofitted_vectors
+                uces_por_doc, mcs_tight, retrofitted_vectors, min_samples=ms_tight
             )
             print(
-                f"--- Classification C2: EMB loose (min_cluster_size={mcs_loose}) ---"
+                f"--- Classification C2: EMB loose (min_cluster_size={mcs_loose}, "
+                f"min_samples={ms_loose}) ---"
             )
             res_emb2 = self._clasificar_umbral_embedding(
-                uces_por_doc, mcs_loose, retrofitted_vectors
+                uces_por_doc, mcs_loose, retrofitted_vectors, min_samples=ms_loose
             )
 
             if res_emb1 and res_emb2:
@@ -7663,8 +7732,10 @@ class Optimizador:
             "uc_window_size": [1, 2, 3, 4, 5],
             "coref_context_units_tight": [1, 2, 3],
             "coref_context_units_loose": [3, 4, 5],
-            "hdbscan_uce_min_cluster_size": [3, 5, 8, 12],
-            "hdbscan_uce_min_cluster_size_loose": [2, 3, 5, 8],
+            # Fracción de n_embeddable, no absoluto — ver _resolve_hdbscan_uce_params.
+            # ([hdbscan-scale-patch])
+            "hdbscan_uce_min_cluster_frac": [0.03, 0.05, 0.08, 0.12, 0.15],
+            "hdbscan_uce_min_cluster_frac_loose": [0.02, 0.03, 0.05, 0.08, 0.10],
         }
 
     @staticmethod
@@ -7776,17 +7847,21 @@ class Optimizador:
             "coref_context_units_loose",
             getattr(cfg, "coref_context_units_loose", 4),
         )
-        cfg.hdbscan_uce_min_cluster_size = params.get(
-            "hdbscan_uce_min_cluster_size",
-            getattr(cfg, "hdbscan_uce_min_cluster_size", 5),
+        cfg.hdbscan_uce_min_cluster_frac = params.get(
+            "hdbscan_uce_min_cluster_frac",
+            getattr(cfg, "hdbscan_uce_min_cluster_frac", 0.08),
         )
-        cfg.hdbscan_uce_min_cluster_size_loose = params.get(
-            "hdbscan_uce_min_cluster_size_loose",
-            getattr(cfg, "hdbscan_uce_min_cluster_size_loose", 3),
+        cfg.hdbscan_uce_min_cluster_frac_loose = params.get(
+            "hdbscan_uce_min_cluster_frac_loose",
+            getattr(cfg, "hdbscan_uce_min_cluster_frac_loose", 0.05),
         )
 
-        # ── Gate: tight debe ser estrictamente menor que loose ───────────
+        # ── Gate: tight debe ser estrictamente menor que loose (coref), y
+        # la fracción tight debe ser estrictamente MAYOR que la loose (más
+        # grande = clusters más grandes/pocos = "tight"). ([hdbscan-scale-patch]) ─────────
         if cfg.coref_context_units_tight >= cfg.coref_context_units_loose:
+            return _SENTINEL_TRIAL
+        if cfg.hdbscan_uce_min_cluster_frac <= cfg.hdbscan_uce_min_cluster_frac_loose:
             return _SENTINEL_TRIAL
 
         # ── Lazy: asegurar cadenas coref para los ctx de ESTE trial ──────
@@ -8727,13 +8802,29 @@ class WorkflowOrchestrator:
             self.config.coref_context_units_loose = bp.get(
                 "coref_context_units_loose", self.config.coref_context_units_loose
             )
-            self.config.hdbscan_uce_min_cluster_size = bp.get(
-                "hdbscan_uce_min_cluster_size", self.config.hdbscan_uce_min_cluster_size
-            )
-            self.config.hdbscan_uce_min_cluster_size_loose = bp.get(
-                "hdbscan_uce_min_cluster_size_loose",
-                self.config.hdbscan_uce_min_cluster_size_loose,
-            )
+            # [hdbscan-scale-patch]: best_params.json nuevos traen las fracciones
+            # (hdbscan_uce_min_cluster_frac*); un archivo viejo, guardado
+            # antes de este cambio, trae el absoluto — si aparece SOLO el
+            # absoluto, se respeta tal cual (frac se deja en None) para no
+            # reinterpretar silenciosamente un best_params.json ya validado.
+            if "hdbscan_uce_min_cluster_frac" in bp:
+                self.config.hdbscan_uce_min_cluster_frac = bp[
+                    "hdbscan_uce_min_cluster_frac"
+                ]
+            elif "hdbscan_uce_min_cluster_size" in bp:
+                self.config.hdbscan_uce_min_cluster_frac = None
+                self.config.hdbscan_uce_min_cluster_size = bp[
+                    "hdbscan_uce_min_cluster_size"
+                ]
+            if "hdbscan_uce_min_cluster_frac_loose" in bp:
+                self.config.hdbscan_uce_min_cluster_frac_loose = bp[
+                    "hdbscan_uce_min_cluster_frac_loose"
+                ]
+            elif "hdbscan_uce_min_cluster_size_loose" in bp:
+                self.config.hdbscan_uce_min_cluster_frac_loose = None
+                self.config.hdbscan_uce_min_cluster_size_loose = bp[
+                    "hdbscan_uce_min_cluster_size_loose"
+                ]
 
         cached_uces_por_doc = None
         cached_doc_metadata_map = None
