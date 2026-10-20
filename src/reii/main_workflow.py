@@ -541,7 +541,9 @@ def compute_coref_chains_for_ctx(
                     segments_info, full_doc_text, context_units=ctx
                 )
                 if getattr(ps, "last_extraction_incomplete", False):
-                    raise RuntimeError("extracción incompleta (Stanza/servidor no disponible)")
+                    raise RuntimeError(
+                        "extracción incompleta (Stanza/servidor no disponible)"
+                    )
             except Exception as e:
                 logger.warning("Extracción falló doc %s ctx %d: %s", doc_id, ctx, e)
                 # NO se guarda [] (se persistiría como "sin cadenas" para siempre):
@@ -879,13 +881,17 @@ class Config:
     hdbscan_uce_min_cluster_frac_loose: Optional[float] = 0.05  # loose pass
     hdbscan_uce_min_cluster_floor: int = 5  # piso absoluto (corpus chicos)
     hdbscan_uce_min_cluster_size: int = 5  # tight pass — override absoluto (frac=None)
-    hdbscan_uce_min_cluster_size_loose: int = 3  # loose pass — override absoluto (frac=None)
+    hdbscan_uce_min_cluster_size_loose: int = (
+        3  # loose pass — override absoluto (frac=None)
+    )
     hdbscan_uce_epsilon: float = 0.0
     # min_samples=1 (el default anterior) es muy permisivo: con min_cluster_size
     # chico produce clusters triviales con persistence≈1.0. None → se deriva de
     # min_samples_ratio; un int explícito sigue siendo un override manual.
     hdbscan_uce_min_samples: Optional[int] = None
-    hdbscan_uce_min_samples_ratio: float = 0.25  # min_samples ≈ ratio · min_cluster_size
+    hdbscan_uce_min_samples_ratio: float = (
+        0.25  # min_samples ≈ ratio · min_cluster_size
+    )
     hdbscan_uce_metric: str = "euclidean"  # "euclidean" | "cosine"
 
     # DSN de la base de datos (PostgreSQL). Si None, se deriva de db_local_path.
@@ -1489,7 +1495,9 @@ class UCBuilder:
         """Assembles a UC dataclass from a contiguous slice of UCEs."""
         segment = doc_uces[start : end + 1]
         doc_id = segment[0].doc_id
-        shared_meta = (doc_metadata_map or {}).get(doc_id, {})
+        # FIX: Convert doc_id to int to match the keys in doc_metadata_map
+        # (int(doc_data.get("indice_orden", ...))), causing UCs without doc_id.
+        shared_meta = (doc_metadata_map or {}).get(int(doc_id), {})
 
         uce_ids = [u.id for u in segment]
         lemmas, stems, bigrams, bigram_stems = [], [], [], []
@@ -4578,7 +4586,7 @@ class DoubleClassifier:
             uc_groups = _merge_small_uc_groups(uc_groups, min_forms)
 
             # 3f. Build UC objects
-            shared_meta = (doc_metadata_map or {}).get(doc_id, {})
+            shared_meta = (doc_metadata_map or {}).get(int(doc_id), {})
 
             for group_uces in uc_groups:
                 if not group_uces:
@@ -4831,7 +4839,9 @@ class DoubleClassifier:
         uces_por_doc: List[List[UCE]],
         min_cluster_size: int,
         retrofitted_vectors: Dict[str, np.ndarray],
-        min_samples: Optional[int] = None,  # ([hdbscan-scale-patch]) resuelto por el caller
+        min_samples: Optional[
+            int
+        ] = None,  # ([hdbscan-scale-patch]) resuelto por el caller
     ) -> Optional[Dict]:
         """
         Method C: direct HDBSCAN clustering of all UCEs in retrofitted space.
@@ -8417,7 +8427,7 @@ class WorkflowOrchestrator:
     ) -> None:
         for doc_uces in uces_por_doc:
             for uce in doc_uces:
-                shared = doc_metadata_map.get(uce.doc_id, {})
+                shared = doc_metadata_map.get(int(uce.doc_id), {})
                 uce.metadata.update(shared)
 
     def _save_all_uces(self, uces_est_list, uces_por_doc):
