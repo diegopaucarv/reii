@@ -987,6 +987,7 @@ class UCBuilderConfig:
 class UC:
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     texto: str = ""
+    doc_id: Optional[int] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     uce_ids: List[str] = field(default_factory=list)
     lemmas: List[str] = field(default_factory=list)
@@ -2453,13 +2454,14 @@ class SegmentadorALCESTE:
         for doc_uces in uces_por_doc:
             if not doc_uces:
                 continue
-
-            lemmas_por_uce = [uce.lemmas for uce in doc_uces]
+            doc_id = doc_uces[0].doc_id
+            shared_meta = (doc_metadata_map or {}).get(int(doc_id), {}) if doc_id is not None else {}            lemmas_por_uce = [uce.lemmas for uce in doc_uces]
             for start, end in agrupar_secuencial_por_umbral(lemmas_por_uce, min_forms):
                 grupo = doc_uces[start : end + 1]
                 uc = UC(
                     texto=" ".join(u.texto for u in grupo),
-                    metadata=doc_uces[0].metadata.copy(),
+                    doc_id=doc_id,
+                    metadata={**shared_meta, **doc_uces[0].metadata.copy()},
                     uce_ids=[u.id for u in grupo],
                     lemmas=[lema for u in grupo for lema in u.lemmas],
                     stems=[s for u in grupo for s in u.stems],
