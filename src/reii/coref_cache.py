@@ -172,3 +172,23 @@ def _release_file_lock(fd: int) -> None:
             fcntl.flock(fd, fcntl.LOCK_UN)
     except OSError:
         pass
+
+
+def get_doc_chains(by_doc: Optional[Dict[Any, List]], doc_id: Any) -> Optional[List]:
+    """Busca las cadenas de ``doc_id`` tolerando int vs str.
+
+    ``deserialize_chains`` fuerza las claves de documento a ``str`` (JSON), pero
+    ``UCE.doc_id`` es ``int``. Con ``doc_id in by_doc`` un cache recargado de disco
+    nunca acierta y cada trial re-extrae el coref. Devuelve None si no hay entrada
+    (distinto de una lista vacía, que es un resultado válido).
+    """
+    if not by_doc:
+        return None
+    for key in (doc_id, str(doc_id)):
+        if key in by_doc:
+            return by_doc[key]
+    try:
+        k = int(doc_id)
+    except (TypeError, ValueError):
+        return None
+    return by_doc.get(k)

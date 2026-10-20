@@ -73,6 +73,13 @@ def optimizador():
     opt.config_base = cfg
     opt.uc_config = uc_cfg
     opt.total_uces = 100
+    # __init__ normalmente fija estos atributos; al saltarlo hay que
+    # replicarlos a mano para que _evaluate_trial no reviente con
+    # AttributeError. Ambos tests ejercitan la etapa 1 (wc_only), que es
+    # donde se calcula el ARI sobre todas las UCEs (ver docstrings).
+    opt.progressive_segmenter = None
+    opt._last_pairwise = None
+    opt._current_stage_mode = "wc_only"
     opt._search_space_cached = {
         "min_forms_uc_1": (10, 14),
         "forms_gap": (2, 7),

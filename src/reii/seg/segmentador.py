@@ -308,8 +308,24 @@ class ProgressiveSegmenter:
         # sujetos raíz de COREF: None -> valores de config (REII_ROOTS_*)
         roots_skip_coref=None,
         roots_batch_size=None,
+        # piso de sustancia del pre-merge (antes 4 hardcodeado en detect_topic_shift)
+        min_content_tokens: int = 4,
+        min_segment_chars: int = 15,
     ):
         self.similarity_threshold = similarity_threshold
+        self.min_content_tokens = int(min_content_tokens)
+        self.min_segment_chars = int(min_segment_chars)
+        if self.min_content_tokens != 4:
+            import warnings
+
+            warnings.warn(
+                "min_content_tokens != 4 cambia el pre-merge, y por tanto los "
+                "grupos/ventanas del coref. La clave del caché de cadenas "
+                "(COREF_CHAINS_CACHE_PATH) NO incluye este parámetro: bórralo "
+                "antes de re-correr o se reutilizarán cadenas calculadas con "
+                "otra segmentación.",
+                stacklevel=2,
+            )
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         self.max_depth = max_depth
         self.index = None
@@ -325,6 +341,10 @@ class ProgressiveSegmenter:
         # GPU casi siempre y podía provocar OOM de VRAM en inferencia.
         self.stanza_use_gpu = STANZA_USE_GPU
         self.debug_coref = debug_coref  # toggle for coref debug prints
+        # True si la ÚLTIMA llamada a _extract_global_chains terminó antes de
+        # procesar todas las sub-ventanas (Stanza/servidor no disponible). Permite a
+        # los llamadores NO persistir ese resultado parcial como si fuera completo.
+        self.last_extraction_incomplete = False
 
         self.model = SentenceTransformer(model_name).to(self.device)
         self.classicseg = ClassicSegmenter(self.model, spacy_model=spacy_model)
@@ -548,9 +568,14 @@ class ProgressiveSegmenter:
 
         return [" ".join(seg) for seg in segments]
 
-    def detect_topic_shift(self, segment1, segment2, last_n=3, min_content_tokens=4):
+    def detect_topic_shift(
+        self, segment1, segment2, last_n=3, min_content_tokens=None
+    ):
         import math
         from collections import Counter
+
+        if min_content_tokens is None:
+            min_content_tokens = getattr(self, "min_content_tokens", 4)
 
         if not hasattr(self, "similarity_history"):
             self.similarity_history = []
@@ -621,6 +646,152 @@ class ProgressiveSegmenter:
         self.lex_sim_history.append(lex_sim)
 
         return (similarity < 0.6) or (syntactic_diff > 0.4)
+
+    # ── Sustancia mínima de un segmento (mismo filtro que detect_topic_shift) ──
+    def _content_token_count(self, text: str) -> int:
+        """Cuenta tokens VERB/NOUN/ADJ/ADV."""
+        if not text or not text.strip():
+            return 0
+        return sum(
+            1 for t in self.nlp(text) if t.pos_ in {"VERB", "NOUN", "ADJ", "ADV"}
+        )
+
+    def compact_segments(
+        self,
+        segments: list,
+        min_content_tokens: int = None,
+        min_chars: int = None,
+        debug_tag: str = "",
+    ) -> list:
+        """Fusiona todo segmento sin sustancia con su vecino más similar.
+
+        Cubre lo que ``progressive_clustering`` no valida (el primer segmento,
+        documentos de una sola oración). Solo fusiona segmentos ADYACENTES, así
+        que el resultado sigue siendo una concatenación en orden del input
+        (requisito de ``_remap_uces_to_segments``). Idempotente.
+
+        Coste: el conteo de content-tokens se calcula UNA vez por segmento y
+        solo se recalcula el segmento fusionado → n + F llamadas a spaCy
+        (F = nº de fusiones), no n·(F+1).
+        """
+        if not segments or len(segments) == 1:
+            return list(segments)
+        min_ct = self.min_content_tokens if min_content_tokens is None else min_content_tokens
+        min_ch = self.min_segment_chars if min_chars is None else min_chars
+
+        work = list(segments)
+        counts = [self._content_token_count(s) for s in work]
+
+        while len(work) > 1:
+            failing = [
+                i
+                for i in range(len(work))
+                if counts[i] < min_ct or len(work[i].strip()) < min_ch
+            ]
+            if not failing:
+                break
+            i = min(failing, key=lambda j: (counts[j], len(work[j])))
+
+            if i == 0:
+                j = 1
+            elif i == len(work) - 1:
+                j = i - 1
+            else:
+                embs = self.model.encode(
+                    [work[i - 1], work[i], work[i + 1]],
+                    convert_to_numpy=True,
+                    show_progress_bar=False,
+                )
+                sim_left = float(cosine_similarity([embs[1]], [embs[0]])[0][0])
+                sim_right = float(cosine_similarity([embs[1]], [embs[2]])[0][0])
+                j = i - 1 if sim_left >= sim_right else i + 1
+
+            lo, hi = min(i, j), max(i, j)
+            self._dprint(
+                f"  compact{debug_tag}: fusionados segs {lo + 1}+{hi + 1} "
+                f"(content={counts[i]})"
+            )
+            work[lo] = work[lo].rstrip() + " " + work[hi].lstrip()
+            counts[lo] = self._content_token_count(work[lo])
+            del work[hi]
+            del counts[hi]
+        return work
+
+    # ── Control duro de tamaño ────────────────────────────────────────────
+    def _special_tokens(self) -> int:
+        try:
+            return int(self.tokenizer.num_special_tokens_to_add(pair=False))
+        except Exception:
+            return 2
+
+    def _token_len(self, text: str) -> int:
+        """Longitud en tokens CON especiales, sin truncar (misma vara que el
+        chequeo de overflow de segment_text)."""
+        return len(self.tokenizer.encode(text, add_special_tokens=True))
+
+    def _balanced_split(
+        self,
+        text: str,
+        max_tokens: int,
+        min_content_tokens: int = None,
+        max_overflow_ratio: float = 1.0,
+    ) -> list:
+        """Parte ``text`` en piezas con ``_token_len(pieza) <= max_tokens``.
+
+        Rellena por límites de oración (greedy); una oración mayor que el
+        presupuesto se parte por tokens. Una cola sin sustancia se absorbe en la
+        pieza previa solo si el resultado cabe en ``max_tokens * max_overflow_ratio``
+        (1.0 = cota estricta: preferimos una cola corta a violar el límite).
+        """
+        min_ct = self.min_content_tokens if min_content_tokens is None else min_content_tokens
+        budget = max(1, max_tokens - self._special_tokens())
+        sentences = self.classicseg.robust_sentence_split(text)
+        if not sentences:
+            return [text]
+
+        expanded = []
+        for s in sentences:
+            ids = self.tokenizer.encode(s["text"], add_special_tokens=False)
+            if len(ids) <= budget:
+                expanded.append((s["text"], len(ids)))
+            else:  # oración desbordada: caso raro, corte por tokens
+                for k in range(0, len(ids), budget):
+                    chunk = ids[k : k + budget]
+                    expanded.append(
+                        (self.tokenizer.decode(chunk, skip_special_tokens=True), len(chunk))
+                    )
+
+        pieces, current, cur_tok = [], [], 0
+        for txt, n in expanded:
+            if current and cur_tok + n > budget:
+                pieces.append(" ".join(current))
+                current, cur_tok = [], 0
+            current.append(txt)
+            cur_tok += n
+        if current:
+            pieces.append(" ".join(current))
+
+        if len(pieces) >= 2:
+            tail = pieces[-1]
+            weak = (
+                self._content_token_count(tail) < min_ct
+                or len(tail.strip()) < self.min_segment_chars
+            )
+            merged = pieces[-2] + " " + tail
+            if weak and self._token_len(merged) <= int(max_tokens * max_overflow_ratio):
+                pieces[-2] = merged
+                pieces.pop()
+        return pieces
+
+    def _enforce_max_tokens(self, pieces: list, max_tokens: int) -> list:
+        """Garantía dura: toda pieza que siga excediendo max_tokens se re-parte."""
+        out = []
+        for piece in pieces:
+            if self._token_len(piece) > max_tokens:
+                out.extend(self._balanced_split(piece, max_tokens))
+            else:
+                out.append(piece)
+        return out
 
     def progressive_clustering(self, segments):
         if not segments:
@@ -797,6 +968,7 @@ class ProgressiveSegmenter:
         ``bulk_process``), respetando la ventana limitada. El pipeline local no se
         carga salvo que el fallback a local lo requiera.
         """
+        self.last_extraction_incomplete = False
         global_chains = []
         # FIX: track chain fingerprints to avoid adding the same chain from overlapping windows
         seen_chain_keys = set()
@@ -823,6 +995,7 @@ class ProgressiveSegmenter:
             stanza_pipe = self.get_stanza()
             if stanza_pipe is None:
                 self._dprint("✗ Stanza no disponible — saltando extracción de cadenas.")
+                self.last_extraction_incomplete = True
                 return global_chains
 
         # ── Pass 1: collect candidate sub-windows (windowing + candidate filter) ──
@@ -1005,12 +1178,14 @@ class ProgressiveSegmenter:
                 if not STANZA_SERVER_FALLBACK_LOCAL:
                     # Idéntico al comportamiento original: un fallo duro
                     # aborta el resto de `pending`, no solo este batch.
+                    self.last_extraction_incomplete = True
                     return
                 stanza_pipe = self.get_stanza()
                 if stanza_pipe is None:
                     self._dprint(
                         "✗ Stanza local no disponible — saltando sub-ventanas."
                     )
+                    self.last_extraction_incomplete = True
                     return
                 for sub_text, sub_start in batch:
                     self._process_coref_window(
@@ -1354,8 +1529,14 @@ class ProgressiveSegmenter:
         return [i]
 
     def segment_text(self, text, max_tokens=1024):
+        text = text or ""  # None → "" (contrato: entrada vacía devuelve [])
         print(f"\n[SegText] Iniciando segmentación. Texto: {len(text)} chars.")
         sentences = self.preprocess_text(text)
+        if not sentences:
+            # Entrada vacía / solo puntuación: contrato explícito de salida
+            stripped = text.strip()
+            print("[SegText] Sin oraciones tras preprocesado.")
+            return [stripped] if stripped else []
         print(f"[SegText] {len(sentences)} oraciones tras preprocesado.")
 
         all_segments = self.recursive_segmentation(sentences)
@@ -1367,6 +1548,13 @@ class ProgressiveSegmenter:
 
         clustered_segments = self.final_clustering(all_segments)
         print(f"[SegText] {len(clustered_segments)} segmentos tras clustering final.")
+
+        # Barrido de sustancia: valida lo que progressive_clustering no ve
+        # (primer segmento, docs de 1 oración). Solo afecta a segment_text; el
+        # pre-merge del pipeline REII (premerge_cached) NO pasa por aquí.
+        clustered_segments = self.compact_segments(
+            clustered_segments, debug_tag=" pre-coref"
+        )
 
         self.embeddings = self.generate_embeddings(clustered_segments)
         if len(self.embeddings) > 0:
@@ -1400,12 +1588,14 @@ class ProgressiveSegmenter:
             if token_count > max_tokens:
                 overflow_count += 1
 
-                # FIX: Calculate the strict minimum number of slices needed
-                # A 501 token block with a 500 max limit will result in exactly 2 pieces.
-                num_required_splits = (token_count // max_tokens) + 1
+                # token_count está TRUNCADO a max_tokens+1 (ver encode arriba), así
+                # que no sirve para dimensionar el corte: antes daba siempre 2
+                # piezas, aunque la UCE tuviera 3000 tokens. Se mide sin truncar.
+                real_tokens = self._token_len(i)
+                num_required_splits = max(2, -(-real_tokens // max_tokens))
 
                 print(
-                    f"[SegText] Overflow UCE ({token_count} tokens) → Corte quirúrgico en {num_required_splits} fragmento(s)."
+                    f"[SegText] Overflow UCE ({real_tokens} tokens) → Corte quirúrgico en {num_required_splits} fragmento(s)."
                 )
 
                 # Force the ClassicSegmenter to make ONLY the required cuts
@@ -1414,10 +1604,19 @@ class ProgressiveSegmenter:
                     max_segments=num_required_splits,
                     threshold=-1.0,  # -1.0 bypasses the strict score check, forcing a clean merge
                 )
+                # El corte semántico no controla tamaño: se re-mide y, si alguna
+                # pieza aún excede max_tokens, se re-parte por oraciones.
+                safe_segments = self._enforce_max_tokens(safe_segments, max_tokens)
                 segmentos.extend(safe_segments)
             else:
                 segmentos.append(i)
 
+        if self.debug_coref and segmentos:
+            _cc = [self._content_token_count(x) for x in segmentos]
+            print(
+                f"[SegText] Distribución: content-tokens min={min(_cc)} "
+                f"med={sorted(_cc)[len(_cc) // 2]} max={max(_cc)}"
+            )
         print(
             f"[SegText] Segmentación completada: {len(segmentos)} UCEs finales "
             f"({overflow_count} desbordamientos resueltos con cortes quirúrgicos)."

@@ -23,7 +23,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 # Versión del FORMATO del checkpoint de coref. Búmpala solo cuando cambie la
 # estructura del JSON (no cuando cambie el algoritmo: para eso está la huella).
-COREF_CHECKPOINT_VERSION = 2
+COREF_CHECKPOINT_VERSION = 3  # v3: añade input_fingerprint
 
 # Módulo cuyo código sella la huella del algoritmo de coref.
 _COREF_SOURCE_MODULE = "reii.seg.segmentador"
@@ -116,10 +116,78 @@ def _coref_code_fingerprint() -> str:
         return "unknown"
 
 
+def uces_fingerprint(uces_por_doc: Iterable[Iterable[Any]], extra: Optional[Dict] = None) -> str:
+    """Huella del CONTENIDO de entrada del pase de coref.
+
+    El checkpoint guarda UCs ya construidos, pero hasta ahora solo validaba
+    (version, context_units, min_forms, código). Un checkpoint de otro corpus, de
+    otro ``uce_target_size`` o de otra segmentación se reanudaba en silencio con la
+    misma ruta. Esta huella cubre (doc_id, id y texto de cada UCE) + ``extra``
+    (parámetros del pre-merge). Duck-typing: cualquier objeto con
+    ``doc_id``/``id``/``texto``.
+    """
+    h = hashlib.sha256()
+    for doc in uces_por_doc:
+        for u in doc:
+            h.update(f"{getattr(u, 'doc_id', '')}\x1f{getattr(u, 'id', '')}\x1f".encode("utf-8"))
+            h.update((getattr(u, "texto", "") or "").encode("utf-8"))
+            h.update(b"\x1e")
+        h.update(b"\x1d")
+    if extra:
+        h.update(json.dumps(extra, sort_keys=True, default=str).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+class CheckpointGuard:
+    """Estado de salud del checkpointing de UN pase (lógica pura, sin I/O).
+
+    * Un doc con extracción de cadenas INCOMPLETA no se persiste como completo y
+      CONGELA el checkpoint: los UCs de ese doc ya están en la lista acumulada, así
+      que guardar más docs dejaría un estado inconsistente (UCs sin su doc en
+      processed_doc_ids → duplicados al reanudar). Congelado, el archivo conserva
+      el último prefijo consistente y la reanudación rehace desde ese doc.
+    * Cuenta fallos de escritura/serialización para informar al final (antes solo
+      ``logger.warning`` y el log decía "Checkpoint guardado" aunque fallara).
+    """
+
+    def __init__(self) -> None:
+        self.frozen_at: Any = None
+        self.write_failures = 0
+        self.build_failures = 0
+        self.incomplete_docs: List[Any] = []
+
+    @property
+    def can_save(self) -> bool:
+        return self.frozen_at is None
+
+    def note_incomplete(self, doc_id: Any) -> bool:
+        """Registra un doc incompleto. True si este doc es el que congela."""
+        self.incomplete_docs.append(doc_id)
+        if self.frozen_at is None:
+            self.frozen_at = doc_id
+            return True
+        return False
+
+    def summary(self) -> List[str]:
+        out: List[str] = []
+        if self.incomplete_docs:
+            out.append(
+                f"{len(self.incomplete_docs)} doc(s) con extracción de coref INCOMPLETA "
+                f"(primero: {self.incomplete_docs[0]}); checkpoint congelado en ese punto."
+            )
+        if self.write_failures:
+            out.append(f"{self.write_failures} fallo(s) al ESCRIBIR el checkpoint.")
+        if self.build_failures:
+            out.append(f"{self.build_failures} fallo(s) al CONSTRUIR el estado del checkpoint.")
+        return out
+
+
 def _cargar_checkpoint_coref(
     checkpoint_path: str,
     context_units: Optional[int] = None,
     min_forms: Optional[int] = None,
+    input_fingerprint: Optional[str] = None,
+    reason_sink: Optional[List[str]] = None,
 ) -> Optional[Dict]:
     """Carga un checkpoint de ``_clasificar_umbral_coref``.
 
@@ -127,35 +195,43 @@ def _cargar_checkpoint_coref(
     desconocida, fue generado con otros parámetros (context_units/min_forms)
     o con otra versión del algoritmo (code_fingerprint). En todos esos casos
     se empieza de cero, sin abortar el pipeline.
+
+    ``input_fingerprint`` (ver :func:`uces_fingerprint`) valida el contenido de
+    entrada; ``reason_sink`` recibe el motivo del rechazo para que el llamador lo
+    muestre con print (el logger puede no estar configurado).
     """
+    def _reject(msg: str) -> None:
+        logger.warning(msg)
+        if reason_sink is not None:
+            reason_sink.append(msg)
+
     if not os.path.exists(checkpoint_path):
         return None
     try:
         with open(checkpoint_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
         if data.get("version") != COREF_CHECKPOINT_VERSION:
-            logger.warning(
-                "Checkpoint con versión desconocida (%s) — ignorado.",
-                data.get("version"),
-            )
+            _reject(f"Checkpoint con versión desconocida ({data.get('version')}) — ignorado.")
             return None
         if context_units is not None and data.get("context_units") != context_units:
-            logger.warning(
-                "Checkpoint con context_units distinto (%s vs %s) — ignorado.",
-                data.get("context_units"),
-                context_units,
+            _reject(
+                f"Checkpoint con context_units distinto ({data.get('context_units')} "
+                f"vs {context_units}) — ignorado."
             )
             return None
         if min_forms is not None and data.get("min_forms") != min_forms:
-            logger.warning(
-                "Checkpoint con min_forms distinto (%s vs %s) — ignorado.",
-                data.get("min_forms"),
-                min_forms,
+            _reject(
+                f"Checkpoint con min_forms distinto ({data.get('min_forms')} "
+                f"vs {min_forms}) — ignorado."
             )
             return None
         if data.get("code_fingerprint") != _coref_code_fingerprint():
-            logger.warning(
-                "Checkpoint con algoritmo distinto (code_fingerprint) — ignorado."
+            _reject("Checkpoint con algoritmo distinto (code_fingerprint) — ignorado.")
+            return None
+        if input_fingerprint is not None and data.get("input_fingerprint") != input_fingerprint:
+            _reject(
+                "Checkpoint de OTRA entrada (corpus / uce_target_size / pre-merge "
+                "distintos: input_fingerprint no coincide) — ignorado."
             )
             return None
         return data
@@ -164,11 +240,11 @@ def _cargar_checkpoint_coref(
         return None
 
 
-def _guardar_checkpoint_coref(checkpoint_path: str, state: Dict) -> None:
+def _guardar_checkpoint_coref(checkpoint_path: str, state: Dict) -> bool:
     """Escribe el checkpoint de forma atómica (tmp + os.replace).
 
-    Un fallo de escritura solo se registra en el log: nunca debe romper el
-    pipeline de clasificación.
+    Un fallo de escritura no rompe el pipeline, pero ahora DEVUELVE False para que
+    el llamador no anuncie "guardado" (antes siempre lo hacía, aunque fallara).
     """
     try:
         d = os.path.dirname(checkpoint_path)
@@ -178,5 +254,7 @@ def _guardar_checkpoint_coref(checkpoint_path: str, state: Dict) -> None:
         with open(tmp_path, "w", encoding="utf-8") as fh:
             json.dump(state, fh, ensure_ascii=False, cls=_NumpyEncoder)
         os.replace(tmp_path, checkpoint_path)
+        return True
     except Exception as e:
         logger.warning("No se pudo escribir el checkpoint %s: %s", checkpoint_path, e)
+        return False

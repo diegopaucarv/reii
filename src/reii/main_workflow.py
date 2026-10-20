@@ -96,10 +96,12 @@ from reii.gram.gramatical_analyzer import (
 )
 from reii.seg.coref_checkpoint import (
     COREF_CHECKPOINT_VERSION,
+    CheckpointGuard,
     _cargar_checkpoint_coref,
     _coref_code_fingerprint,
     _guardar_checkpoint_coref,
     checkpoint_path_for_pass,
+    uces_fingerprint,
 )
 from reii.seg.forms_merging import agrupar_secuencial_por_umbral, formas_distintas
 from reii.seg.root_cache import RootSubjectCache, boundary_tails, root_context
@@ -434,6 +436,7 @@ def _corpus_fingerprint() -> str:
 from reii.coref_cache import (
     atomic_write_json,
     build_cache_document,
+    get_doc_chains,
     load_cache,
     missing_ctx_values,
 )
@@ -537,9 +540,14 @@ def compute_coref_chains_for_ctx(
                 chains = ps._extract_global_chains(
                     segments_info, full_doc_text, context_units=ctx
                 )
+                if getattr(ps, "last_extraction_incomplete", False):
+                    raise RuntimeError("extracción incompleta (Stanza/servidor no disponible)")
             except Exception as e:
                 logger.warning("Extracción falló doc %s ctx %d: %s", doc_id, ctx, e)
-                chains = []
+                # NO se guarda [] (se persistiría como "sin cadenas" para siempre):
+                # el doc queda ausente y se re-extrae bajo demanda.
+                print(f"   [Coref] ⚠ doc {doc_id} ctx={ctx} NO se cachea: {e}")
+                continue
             result[ctx][doc_id] = chains
 
     for ctx, by_doc in result.items():
@@ -4346,11 +4354,33 @@ class DoubleClassifier:
         # ── 3'. Checkpointing: reanudar desde un checkpoint previo ──────────
         processed_doc_ids: List[str] = []
         processed_doc_set: Set[str] = set()
+        # Huella del CONTENIDO de entrada (corpus, uce_target_size, pre-merge):
+        # sin ella, otro corpus/segmentación con la misma ruta se reanudaba en silencio.
+        input_fp = uces_fingerprint(
+            uces_por_doc_local,
+            extra={
+                k: getattr(ps, k, None)
+                for k in (
+                    "similarity_threshold",
+                    "max_depth",
+                    "window_size",
+                    "min_content_tokens",
+                    "min_segment_chars",
+                    "stanza_lang",
+                )
+            },
+        )
+        guard = CheckpointGuard()
+        _coref_hits = 0  # docs servidos desde el caché de cadenas
+        _coref_misses = 0  # docs extraídos con Stanza en ESTA llamada
+        _ckpt_reasons: List[str] = []
         if checkpoint_path and not force:
             ckpt = _cargar_checkpoint_coref(
                 checkpoint_path,
                 context_units=context_units,
                 min_forms=min_forms,
+                input_fingerprint=input_fp,
+                reason_sink=_ckpt_reasons,
             )
             if ckpt is not None:
                 processed_doc_ids = ckpt["processed_doc_ids"]
@@ -4370,6 +4400,8 @@ class DoubleClassifier:
                     f"{len(ucs)} UCs — reanudando."
                 )
             else:
+                for _r in _ckpt_reasons:
+                    print(f"   [COREF] ⚠ {_r}")
                 print(
                     f"   [COREF] No hay checkpoint válido en {checkpoint_path} — "
                     "empezando de cero."
@@ -4462,22 +4494,37 @@ class DoubleClassifier:
                 f"   [COREF] Extrayendo cadenas globales para doc {doc_id} "
                 f"({len(premerged_groups)} grupos)..."
             )
+            doc_incomplete = False
             try:
-                if precomputed_chains is not None and doc_id in precomputed_chains:
-                    global_chains = precomputed_chains[doc_id]
+                # get_doc_chains tolera int/str: un cache recargado de disco trae
+                # claves str y `doc_id in precomputed_chains` fallaba siempre,
+                # re-extrayendo el coref (Stanza) en cada trial.
+                _pre = (
+                    get_doc_chains(precomputed_chains, doc_id)
+                    if precomputed_chains is not None
+                    else None
+                )
+                if _pre is not None:
+                    global_chains = _pre
+                    _coref_hits += 1
                 else:
+                    _coref_misses += 1
                     global_chains = ps._extract_global_chains(
                         segments_info,
                         full_doc_text,
                         context_units=context_units,
                     )
+                    if getattr(ps, "last_extraction_incomplete", False):
+                        doc_incomplete = True
             except Exception as e:
                 logger.warning(
                     "COREF chain extraction failed for doc %s: %s",
                     doc_uces[0].doc_id,
                     e,
                 )
+                print(f"   [COREF] ⚠ extracción falló en doc {doc_id}: {e}")
                 global_chains = []
+                doc_incomplete = True
             print(
                 f"   [COREF] Cadenas globales extraídas: {len(global_chains)} "
                 f"para doc {doc_id}."
@@ -4581,7 +4628,18 @@ class DoubleClassifier:
             #       (fuera de su try/except), así que un fallo de serialización
             #       (p. ej. un campo no serializable en uc.to_dict()) rompía el
             #       pipeline sin mensaje.
-            if checkpoint_path:
+            if doc_incomplete:
+                _first = guard.note_incomplete(doc_id)
+                print(
+                    f"   [COREF] ⚠ doc {doc_id}: extracción de cadenas INCOMPLETA "
+                    "(Stanza/servidor no disponible); sus UCs usan cadenas parciales."
+                )
+                if checkpoint_path and _first:
+                    print(
+                        "   [COREF] ⚠ checkpoint CONGELADO en este doc: no se persiste "
+                        "como completo; al reanudar se rehace desde aquí."
+                    )
+            if checkpoint_path and guard.can_save:
                 processed_doc_ids.append(doc_id)
                 processed_doc_set.add(doc_id)
                 try:
@@ -4590,6 +4648,7 @@ class DoubleClassifier:
                         "context_units": context_units,
                         "min_forms": min_forms,
                         "code_fingerprint": _coref_code_fingerprint(),
+                        "input_fingerprint": input_fp,
                         "processed_doc_ids": processed_doc_ids,
                         "ucs": [uc.to_dict() for uc in ucs],
                         "uce_to_uc": uce_to_uc,
@@ -4609,18 +4668,38 @@ class DoubleClassifier:
                         checkpoint_path,
                         e,
                     )
+                    guard.build_failures += 1
+                    if guard.build_failures == 1:
+                        print(
+                            f"   [COREF] ⚠ No se pudo CONSTRUIR el checkpoint: {e} "
+                            "(no se guardará progreso hasta que se corrija)."
+                        )
                 else:
-                    _guardar_checkpoint_coref(checkpoint_path, state)
-                    print(
-                        f"   [COREF] Checkpoint guardado ({checkpoint_path}): "
-                        f"{len(processed_doc_ids)} docs, {len(ucs)} UCs."
-                    )
+                    if _guardar_checkpoint_coref(checkpoint_path, state):
+                        print(
+                            f"   [COREF] Checkpoint guardado ({checkpoint_path}): "
+                            f"{len(processed_doc_ids)} docs, {len(ucs)} UCs."
+                        )
+                    else:
+                        guard.write_failures += 1
+                        if guard.write_failures == 1:
+                            print(
+                                f"   [COREF] ⚠ NO se pudo escribir el checkpoint "
+                                f"({checkpoint_path}); el progreso de este pase no está a salvo."
+                            )
 
         print(
             f"   [COREF context={context_units}] roots: "
             f"{rcache.misses - _calls0} Stanza calls for {total_boundaries} boundaries "
             f"({len(rcache)} contexts cached)"
         )
+
+        print(
+            f"   [COREF context={context_units}] cadenas: {_coref_hits} docs desde "
+            f"caché, {_coref_misses} extraídos con Stanza en esta llamada."
+        )
+        for _line in guard.summary():
+            print(f"   [COREF] ⚠ {_line}")
 
         # ── 4. Strip suffix from all uce_ids (restore bare IDs for Hungarian) ─
         for uc in ucs:
@@ -4734,7 +4813,10 @@ class DoubleClassifier:
         if frac is not None:
             min_cluster_size = max(floor, round(float(frac) * n_embeddable))
         else:
-            min_cluster_size = max(floor, int(absolute))
+            # frac=None → modo absoluto legacy: NO se aplica el piso, para
+            # reproducir exactamente el comportamiento anterior al patch de
+            # escalado (hdbscan_uce_min_cluster_size / _loose tal cual).
+            min_cluster_size = int(absolute)
 
         min_samples = getattr(self.config, "hdbscan_uce_min_samples", None)
         if min_samples is None:
@@ -7402,6 +7484,10 @@ class Optimizador:
                     chains = ps._extract_global_chains(
                         segments_info, full_doc_text, context_units=ctx
                     )
+                    if getattr(ps, "last_extraction_incomplete", False):
+                        raise RuntimeError(
+                            "extracción incompleta (Stanza/servidor no disponible)"
+                        )
                     result[ctx][doc_id] = chains
                 except Exception as e:
                     logger.warning(
@@ -7410,7 +7496,11 @@ class Optimizador:
                         ctx,
                         e,
                     )
-                    result[ctx][doc_id] = []
+                    # NO se guarda [] (quedaría persistido como "sin cadenas"):
+                    # el doc queda ausente y se re-extrae bajo demanda.
+                    print(
+                        f"   [Optimizador] ⚠ doc {doc_id} ctx={ctx} NO se cachea: {e}"
+                    )
 
         for ctx, by_doc in result.items():
             total_chains = sum(len(v) for v in by_doc.values())
@@ -8126,11 +8216,22 @@ class Optimizador:
             )
 
         # ── Warm start: enqueue de trials previos (y copias perturbadas) ─
+        # Sin duplicados ni puntos infactibles (gates tight<loose / frac_t>frac_l):
+        # cada uno consumiría un trial del presupuesto para devolver el centinela.
+        _seen_enq = set()
+
+        def _enqueue(pr):
+            key = tuple(sorted(pr.items()))
+            if key in _seen_enq or not self._params_feasible(pr):
+                return
+            _seen_enq.add(key)
+            study.enqueue_trial(pr)
+
         for prev_trial in warm_start_trials:
-            study.enqueue_trial(prev_trial.params)
+            _enqueue(dict(prev_trial.params))
             if perturb_warm_start:
-                for _ in range(2):
-                    study.enqueue_trial(self._perturb_params(prev_trial.params))
+                for _salt in range(2):
+                    _enqueue(self._perturb_params(prev_trial.params, salt=_salt))
 
         print(f"\n=== Optuna · {n_trials} trials (mode={mode}) ===")
         print(f"   Sampler    : {self.config_base.optimize_sampler}")
@@ -8189,10 +8290,29 @@ class Optimizador:
 
         return dict(best_trial.params), best_trials
 
-    def _perturb_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    @staticmethod
+    def _params_feasible(p: Dict[str, Any]) -> bool:
+        """Mismos gates estructurales que _evaluate_trial (sin coste de evaluación)."""
+        t, l = p.get("coref_context_units_tight"), p.get("coref_context_units_loose")
+        if t is not None and l is not None and t >= l:
+            return False
+        a, b = (
+            p.get("hdbscan_uce_min_cluster_frac"),
+            p.get("hdbscan_uce_min_cluster_frac_loose"),
+        )
+        if a is not None and b is not None and a <= b:
+            return False
+        return True
+
+    def _perturb_params(self, params: Dict[str, Any], salt: int = 0) -> Dict[str, Any]:
         import random
 
-        rng = random.Random(self.config_base.random_state)
+        # Semilla derivada de (random_state, salt, params): reproducible pero
+        # distinta por copia. Antes: Random(random_state) idéntico en cada
+        # llamada → las 2 copias "perturbadas" de un trial eran duplicados.
+        rng = random.Random(
+            f"{self.config_base.random_state}:{salt}:{sorted(params.items())}"
+        )
         perturbed = dict(params)
         space = self._search_space_cached
         for k, v in params.items():
