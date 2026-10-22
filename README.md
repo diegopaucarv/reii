@@ -113,7 +113,7 @@ flowchart TD
     end
 
     subgraph Layer4_Optional ["Optional Modules"]
-        O1[AI Discourse Agent (Together AI)]
+        O1[AI Discourse Agent]
         O2[Summary Generation]
         O3[Thematic Proposal]
         O4[Relationship Suggestion]
