@@ -120,7 +120,7 @@ flowchart TD
         O1 --- O2
         O1 --- O3
         O1 --- O4
-        O5[Batch Interview Processor (guide + extraction)]
+        O5[Batch Interview Processor - guide + extraction]
     end
 
     %% Vertical Connections between Layers
