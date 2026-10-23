@@ -2455,7 +2455,12 @@ class SegmentadorALCESTE:
             if not doc_uces:
                 continue
             doc_id = doc_uces[0].doc_id
-            shared_meta = (doc_metadata_map or {}).get(int(doc_id), {}) if doc_id is not None else {}            lemmas_por_uce = [uce.lemmas for uce in doc_uces]
+            shared_meta = (
+                (doc_metadata_map or {}).get(int(doc_id), {})
+                if doc_id is not None
+                else {}
+            )
+            lemmas_por_uce = [uce.lemmas for uce in doc_uces]
             for start, end in agrupar_secuencial_por_umbral(lemmas_por_uce, min_forms):
                 grupo = doc_uces[start : end + 1]
                 uc = UC(
@@ -8035,6 +8040,20 @@ class Optimizador:
 
         # ── Etapa 2 (all): veredicto final vía agreement simétrico ───────
         pairwise = self._last_pairwise or {}
+
+        # ── Gate: Method C (embeddings) debe producir ≥2 clusters en AMBOS
+        # pases (C1 tight, C2 loose). Sin este gate, cuando Method C falla
+        # (p.ej. hdbscan_uce_min_cluster_frac demasiado grande para el
+        # corpus), _triple_stability_verdicts degrada 'all' a 'wc_coref' en
+        # silencio: coverage_primary y n_clusters quedan basados en A↔B
+        # (ninguno de los dos objetivos "ve" el fallo de C). Solo
+        # agreement_sym se resiente (ari_bc=ari_ac=0.0), y promediado con
+        # ari_ab eso no basta para dominar el trial de forma consistente.
+        if not pairwise.get("emb_persistence_c1") or not pairwise.get(
+            "emb_persistence_c2"
+        ):
+            return _SENTINEL_TRIAL
+
         ari_ab = float(pairwise.get("ari_cross_ab", 0.0))
         ari_bc = float(pairwise.get("ari_cross_bc", 0.0))
         ari_ac = float(pairwise.get("ari_cross_ac", 0.0))
