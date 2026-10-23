@@ -7972,7 +7972,12 @@ class Optimizador:
             return _SENTINEL_TRIAL
 
         # ── Lazy: asegurar cadenas coref para los ctx de ESTE trial ──────
-        if self.progressive_segmenter is not None:
+        # Solo si el modo del trial realmente usa Method B — en wc_only
+        # (etapa 1) _do_coref es False más abajo en _evaluacion_rapida, así
+        # que precomputar aquí es trabajo puro desperdiciado (premerge CPU +
+        # Stanza remoto por cada (tight, loose) nuevo que Optuna muestree).
+        _mode_needs_coref = mode in ("coref_only", "wc_coref", "coref_emb", "all")
+        if _mode_needs_coref and self.progressive_segmenter is not None:
             self._ensure_coref_chains(
                 [cfg.coref_context_units_tight, cfg.coref_context_units_loose]
             )
