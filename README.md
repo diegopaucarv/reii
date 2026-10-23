@@ -8,6 +8,9 @@ REII is a production‑grade NLP pipeline for Spanish discourse analysis, implem
 ![spaCy](https://img.shields.io/badge/spaCy-3.x-green)
 ![Stanza](https://img.shields.io/badge/Stanza-1.x-purple)
 
+![1](docs/img/1.png)
+
+
 ## 🧠 Core NLP Capabilities
 
 ### Advanced Text Segmentation with Sliding Window
@@ -137,6 +140,8 @@ flowchart TD
     class D1 dash
 ```
 
+![3](docs/img/3.svg)
+
 ## 📦 Quick Start
 
 ### Using Docker (Recommended)
@@ -206,6 +211,8 @@ reii/
 ```
 
 ## 🔬 Methodology
+
+![2](docs/img/2.png)
 
 REII is inspired by the ALCESTE (Analyse des Lexèmes Co‑occurrents dans un Ensemble de Segments de Texte) method, adapted for Spanish discourse analysis. Key principles:
 
