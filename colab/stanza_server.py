@@ -25,7 +25,7 @@ import uvicorn
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-os.environ["HF_TOKEN"] = "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"
+os.environ["HF_TOKEN"] = ""
 os.environ["REII_STANZA_FP16"] = "0"
 
 

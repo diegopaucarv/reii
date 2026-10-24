@@ -77,9 +77,9 @@ def rebuild_corpus_raw() -> Dict[str, Any]:
     )
     meta_dict: Dict[str, Dict] = {}
     for _, row in df_meta.iterrows():
-        llave = obtener_llave_maestra(row["Documento Fuente"])
+        llave = obtener_llave_maestra(row["id"])
         meta_dict[llave] = row[
-            ["Edad_Cat", "Sexo", "Dependientes_Cat", "Ocupacion_Cat", "Procedencia_Cat"]
+            ["Edad_Cat", "Sexo", "Ocupacion_Cat", "Procedencia_Cat"]
         ].to_dict()
 
     json_input_dir = os.path.join(REII_DATA_DIR, "txt_outputs", "tmp")
@@ -266,7 +266,7 @@ def main() -> int:
         min_forms_uc=[10, 14],
         tsj=3,
         use_cdh=True,
-        uce_target_size=26,  # 26 palabras/UCE como ALCESTE original (era 18)
+        uce_target_size=18,  # 26 palabras/UCE como ALCESTE original (era 18)
         pseudocount=0.0,
         use_cah_per_class=True,
         cah_per_class_top_terms=20,

@@ -1,29 +1,30 @@
-Documento Fuente;Edad_Cat;Sexo;Dependientes_Cat;Ocupacion_Cat;Procedencia_Cat
-Arturo 1;22 años;Femenino;;No trabaja, solo estudia;Ciudad de Huamanga
-Arturo 2;23 años;Femenino;;Estudiante;Ciudad de Huamanga, distrito de Ocros
-Cecilia 1;26 años;Femenino;;Ventas;Huamanga
-Cecilia 2.m4a;24 años;;;Auxiliar en la Institución Educativa Mariscal Sucre;Distrito de Independencia, provincia Vincas Oman
-Cecilia 3.m4a;22 años;;;Trabaja en una institución, en una guardería y también haciendo reforzamientos;Distrito de Quinoa
-Cecilia 4.m4a;24 años;;;Estudiante;Guamanga (Huamanga)
-Cecilia 6.m4a;23 años;;;Trabaja en una institución educativa privada llamada Javier Pérez de Cuéllar;Huamanga (huamanguina)
-Diego01.mp3;23 años;Femenino;;Trabaja en los pasamientos (posibilito infantil);El mismo Guamán
-Diego02.mp3;23 años;Masculino;;Estudiante (no trabaja);Distrito de Paras, región de Ayacucho
-Diego03.mp3;26;Femenino;;Profesora;Pichari
-Diego04.mp3;25;Mujer;;No trabaja, es estudiante;Tarma, Junín
-Diego05;29;;;Estudiante;Nacida en una selva, registrada en la zona de Huamanguilla (parte sierra), criada desde los 8 años en Huamanga
-Diego06;24;;;Estudia y trabaja en la feria;Juan Manga
-Gladys Clavel Negro Miriam;;;;;
-Iris Dalia_;;;;;
-Iris01.m4a;24;Femenino;;Estudiante;Cangallo
-Iris02;23 años;Femenino;;"Estudia y trabaja; refuerzo a los niños por la tarde";Huanta
-Iris03;27;Masculino;;Estudiante;Lima
-L-IRIS Rosa AMARILLA (1);;;;;
-MJA 5.  ROSA BLANCA;;;;Profesora (docente) y estudiante de educación;
-MJA1.mp3;26 años;;;Estudiante y trabaja como recepcionista en un hospedaje (de lunes a sábado de noche y los domingos todo el día);Huamanga
-MJA2.mp3;25;;;Cantante en un grupo musical (música variada, principalmente cumbia), además de ser estudiante de educación primaria;Ciudad de Huamanga (Ayacucho)
-MJA3.mp3;23;;;Estudiante (no trabaja aparte de estudiar);Provincia de Cangallo, departamento de Ayacucho, distrito de los Morochucos
-MJA4.mp3;24 años;;;"Estudiante de educación primaria de serie 500 de la Universidad Nacional San Cristóbal de Huamanga; trabaja los fines de semana en comercio y en reforzamiento escolar a niños con dificultades de aprendizaje";Selva (región de la selva, cerca de Ayacucho)
-Miriam 01.mp3;25;;;Vendedor en una tienda de pinturas;Anco La Mar (provincia)
-Miriam 02;24 años;;;"No trabaja; se dedica únicamente al estudio";Ciudad de Ayacucho
-Miriam Tulipan rojos txt;;;;;
-TULIPANES BLANCOS MJA;;;;;
+﻿id;listed_db_doc_id;listed_source_file;vocab_overlap_pct;edad;Edad_Cat;Sexo;Ocupacion_Cat;Procedencia_Cat
+uci_1;0;Arturo 1.txt;53.8;22;23;Femenino;Estudia;Huamanga
+uci_2;1;Arturo 2.txt;58.1;23;23;Femenino;Estudia;Huamanga
+uci_3;3;Cecilia 2.m4a.txt;53;24;23;Femenino;Trabaja;Ayacucho rural
+uci_4;4;Cecilia 3.m4a.txt;49.5;22;23;Femenino;Trabaja;Ayacucho rural
+uci_5;12;Diego06.txt;42.1;24;23;Femenino;Estudia y Trabaja (propio);Huamanga
+uci_6;13;Gladys Clavel Negro Miriam.txt;51.4;;;Femenino;;
+uci_7;15;Iris01.m4a.txt;41.3;24;23;Femenino;Estudia;Otras ciudades
+uci_8;16;Iris02.txt;40.9;23;23;Femenino;Estudia y trabaja;Otras ciudades
+uci_9;14;Iris Dalia_.txt;45.5;;;Femenino;;
+uci_10;;"UNRESOLVED (not MJA4; candidate Miriam 02.txt)";38.4;;;Femenino;;
+uci_11;2;Cecilia 1.txt;69;26;26;Femenino;Estudia y Trabaja (propio);Huamanga
+uci_12;5;Cecilia 4.m4a.txt;27.8;24;23;Femenino;Estudiante;Huamanga
+uci_13;7;Diego01.mp3.txt;53.3;23;23;Femenino;Estudia y Trabaja (propio);Huamanga
+uci_14;8;Diego02.mp3.txt;70.8;23;23;Masculino;Estudiante (no trabaja);Ayacucho rural
+uci_15;6;Cecilia 6.m4a.txt;67.7;23;23;Femenino;Trabaja;Huamanga
+uci_16;9;Diego03.mp3.txt;60.9;26;26;Femenino;Trabaja;Otras ciudades
+uci_17;10;Diego04.mp3.txt;61.9;25;26;Femenino;Estudiante;Otras ciudades
+uci_18;11;Diego05.txt;59.2;29;26;Femenino;Estudiante;Ayacucho rural
+uci_19;18;L-IRIS Rosa AMARILLA (1).txt;74.2;;;Femenino;;
+uci_20;24;Miriam 01.mp3.txt;56.8;25;25;Femenino;Estudia y Trabaja (propio);Ayacucho rural
+uci_21;17;Iris03.txt;34.5;27;26;Masculino;Estudiante;Huamanga
+uci_22;26;Miriam Tulipan rojos txt.txt;60;;;Femenino;;
+uci_23;25;Miriam 02.txt;48.5;24;23;Femenino;Estudiante;Huamanga
+uci_24;23;MJA4.mp3.txt;57.9;24;23;Femenino;Estudia y trabaja;Ayacucho rural
+uci_25;19;MJA 5.  ROSA BLANCA.txt;46.9;;;Femenino;Estudia y trabaja;
+uci_26;20;MJA1.mp3.txt;52.7;26;26;Femenino;Estudia y Trabaja (propio);Huamanga
+uci_27;21;MJA2.mp3.txt;57.1;25;26;Femenino;Estudia y Trabaja (propio);Huamanga
+uci_28;22;MJA3.mp3.txt;42.9;23;23;Femenino;Estudiante;Ayacucho rural
+uci_29;27;TULIPANES BLANCOS MJA.txt;47.9;;;Femenino;;

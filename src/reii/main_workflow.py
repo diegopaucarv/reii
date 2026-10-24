@@ -228,9 +228,9 @@ df_meta = (
 meta_dict = {}
 
 for _, row in df_meta.iterrows():
-    llave = obtener_llave_maestra(row["Documento Fuente"])
+    llave = obtener_llave_maestra(row["id"])
     meta_dict[llave] = row[
-        ["Edad_Cat", "Sexo", "Dependientes_Cat", "Ocupacion_Cat", "Procedencia_Cat"]
+        ["Edad_Cat", "Sexo", "Ocupacion_Cat", "Procedencia_Cat"]
     ].to_dict()
 
 # 1. Ubicamos los JSONs y aseguramos el orden alfabético
@@ -2613,7 +2613,7 @@ class EmbeddingSpecializationPipeline:
             random_state=42,
         )
         # Weight by sqrt(Sigma) — standard for word vector tasks
-        term_embeddings = U * np.sqrt(Sigma)  # (n_terms, n_components)
+        term_embeddings = Vt.T * np.sqrt(Sigma)  # (n_terms, n_components)
         return {w: term_embeddings[i] for i, w in enumerate(vocab)}
 
     # ── Stage 8b ─────────────────────────────────────────────────────────────
@@ -9081,6 +9081,7 @@ class WorkflowOrchestrator:
                     "   [Optimizador] Mini pass-1 (retrofitting) falló; "
                     "el optimizador degradará a 'wc_coref': %s",
                     e,
+                    exc_info=True,
                 )
                 retro_vecs_for_optimizer = None
             finally:
