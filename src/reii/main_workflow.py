@@ -3370,6 +3370,58 @@ class MatrizBuilder:
 # ══════════════════════════════════════════════════════════════════════
 
 
+def _debug_emb_matrix(
+    mat: np.ndarray, zero_rows: int, n_total: int, label: str = "pre-PCA"
+) -> None:
+    """Diagnóstico de REII_EMB_DEBUG=1: ¿la matriz tiene estructura real?
+
+    No cambia ningún comportamiento — solo imprime. Pensado para responder
+    una pregunta concreta cuando Method C da clusters=0 en toda la grilla:
+    ¿es que no hay estructura de densidad en estos vectores, o se rompió
+    algo antes de llegar a HDBSCAN (duplicados, varianza colapsada, etc)?
+    """
+    import hdbscan as _hdbscan_mod
+
+    n, d = mat.shape
+    print(f"   [EMB-DEBUG {label}] shape={n}x{d}, zero_rows={zero_rows}/{n_total}")
+
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    norms[norms == 0] = 1e-9
+    unit = mat / norms
+    sim = unit @ unit.T
+    np.fill_diagonal(sim, 0.0)
+    near_dup_pairs = int((sim > 0.999).sum() // 2)
+    print(f"   [EMB-DEBUG {label}] pares casi-duplicados (cos>0.999): {near_dup_pairs}")
+
+    var_per_dim = mat.var(axis=0)
+    dead_dims = int((var_per_dim < 1e-6).sum())
+    print(
+        f"   [EMB-DEBUG {label}] dims con varianza~0: {dead_dims}/{d} · "
+        f"varianza total={var_per_dim.sum():.4f}"
+    )
+
+    from scipy.spatial.distance import pdist
+
+    d_sample = mat if n <= 2000 else mat[np.random.default_rng(42).choice(n, 2000, replace=False)]
+    dists = pdist(d_sample, metric="euclidean")
+    p5, p50, p95 = np.percentile(dists, [5, 50, 95])
+    print(
+        f"   [EMB-DEBUG {label}] distancias euclid. p5={p5:.3f} "
+        f"p50={p50:.3f} p95={p95:.3f} (ratio p95/p5={p95 / max(p5, 1e-9):.2f})"
+    )
+
+    probe = _hdbscan_mod.HDBSCAN(min_cluster_size=5, min_samples=3, metric="euclidean")
+    labels = probe.fit_predict(mat)
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    max_pers = (
+        max(probe.cluster_persistence_) if len(probe.cluster_persistence_) else 0.0
+    )
+    print(
+        f"   [EMB-DEBUG {label}] sonda min_cluster_size=5 → clusters={n_clusters}, "
+        f"noise={(labels == -1).sum()}/{n}, max_persistence={max_pers:.4f}"
+    )
+
+
 def _compute_uce_centroids_from_retro(
     uces: List["UCE"],
     retrofitted_vectors: Dict[str, np.ndarray],
@@ -4884,6 +4936,38 @@ class DoubleClassifier:
                 "too many OOV UCEs, skipping Method C."
             )
             return None
+
+        # ── DEBUG: diagnóstico de la matriz antes de PCA/HDBSCAN ──────────
+        # Actívalo con REII_EMB_DEBUG=1. No cambia nada del comportamiento
+        # normal — solo imprime estadísticas para decidir si clusters=0 es
+        # "no hay estructura real" o "algo rompió la matriz antes de llegar
+        # aquí" (duplicados, varianza colapsada, etc).
+        if os.environ.get("REII_EMB_DEBUG") == "1":
+            _debug_emb_matrix(mat, zero_rows, len(all_uces))
+
+        # ── PCA antes de HDBSCAN ──────────────────────────────────────────
+        # mat vive en el espacio de fastText (~300 dims). Con corpus chicos
+        # (cientos de UCEs, no miles) eso es maldición de la dimensionalidad
+        # pura para un clusterer de densidad: las distancias se vuelven casi
+        # uniformes y HDBSCAN no encuentra estructura sin importar
+        # min_cluster_size (clusters=0, noise=todo, cualquier frac).
+        # Reducimos a un número de componentes acorde al tamaño real de la
+        # muestra antes de clusterizar.
+        n_samples, n_dims = mat.shape
+        target_dims = max(2, min(30, n_samples // 10, n_dims))
+        if target_dims < n_dims:
+            from sklearn.decomposition import PCA
+
+            _pca = PCA(n_components=target_dims, random_state=42)
+            mat = _pca.fit_transform(mat)
+            print(
+                f"   [EMB] PCA {n_dims}→{target_dims} dims "
+                f"({n_samples} UCEs) antes de HDBSCAN."
+            )
+            if os.environ.get("REII_EMB_DEBUG") == "1":
+                var_pct = 100 * _pca.explained_variance_ratio_.sum()
+                print(f"   [EMB-DEBUG] PCA explica {var_pct:.1f}% de la varianza.")
+                _debug_emb_matrix(mat, zero_rows, n_samples, label="post-PCA")
 
         # Si el caller no resolvió min_samples explícitamente (pasos nuevos
         # SIEMPRE lo resuelven con _resolve_hdbscan_uce_params), cae al
@@ -7841,8 +7925,15 @@ class Optimizador:
             "coref_context_units_loose": [3, 4, 5],
             # Fracción de n_embeddable, no absoluto — ver _resolve_hdbscan_uce_params.
             # ([hdbscan-scale-patch])
-            "hdbscan_uce_min_cluster_frac": [0.03, 0.05, 0.08, 0.12, 0.15],
-            "hdbscan_uce_min_cluster_frac_loose": [0.02, 0.03, 0.05, 0.08, 0.10],
+            # Grilla angostada: REII_EMB_DEBUG confirmó que con corpus chicos
+            # (cientos de UCEs) la estructura real de Method C solo aparece
+            # en min_cluster_size≈5-20 (sonda a mcs=5: post-PCA 3 clusters,
+            # 13% ruido, max_persistence=0.054). El grid anterior
+            # (0.03-0.15 → mcs≈16-79 en un corpus de 528) nunca entraba en
+            # ese rango — de ahí el clusters=0 sistemático en toda la grilla
+            # vieja pese a que la matriz sí tenía densidad real.
+            "hdbscan_uce_min_cluster_frac": [0.01, 0.015, 0.02, 0.03, 0.04],
+            "hdbscan_uce_min_cluster_frac_loose": [0.005, 0.01, 0.015, 0.02, 0.03],
         }
 
     @staticmethod
