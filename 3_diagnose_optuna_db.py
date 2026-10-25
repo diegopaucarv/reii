@@ -1,222 +1,270 @@
 #!/usr/bin/env python3
 """
-Script 3: Diagnostica la base de Optuna (reii_optuna.db).
-Reporta: trials centinela, duplicados, Pareto, distribución de parámetros.
+Script 3 — Diagnóstico de la BD de Optuna (SQLite) del optimizador REII.
+
+Errores de la versión anterior, corregidos aquí:
+  * Leía `trials.value`. El estudio es MULTIOBJETIVO (3 objetivos): esa columna es NULL
+    y los valores viven en `trial_values(trial_id, objective, value)`.
+  * Buscaba user attrs 'pass'/'stage'/'result_code' que el código nunca escribe
+    (solo coverage_primary, agreement_sym, n_clusters, bottleneck_method, y solo en
+    etapa 2). Resultado: siempre decía "sin centinelas".
+  * El centinela real es _SENTINEL_TRIAL = (-2.0, -1.0, 0.0), no -999.
+  * Ahora el espacio de búsqueda se lee de `trial_params.distribution_json` (la verdad
+    del estudio), no de suposiciones.
+
+Etapa 1 (study *_stage1_wc_*): objetivos = (ARI, coverage, -K)
+Etapa 2 (study *_stage2_all_*): objetivos = (coverage, agreement_sym, -K)
+Direcciones: maximize, maximize, minimize  (minimize sobre -K  ==> PREMIA más clases).
 
 Uso:
-  python 3_diagnose_optuna_db.py --db /ruta/a/reii/reii_optuna.db --out report.md
-
-Comprueba mis hipótesis con datos reales:
-  - ¿Hay trials que devolvieron centinela (inválidos)?
-  - ¿Hay duplicados en warm-start (antes del fix)?
-  - ¿Cuántos trials válidos en etapa 2 vs etapa 1?
+  python 3_diagnose_optuna_db.py [--db data/reii_optuna.db] [--study NOMBRE]
 """
 
+from __future__ import annotations
+
+import argparse
+import glob
 import json
 import sqlite3
-from argparse import ArgumentParser
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from diag_common import DATA_DIR, REPO, SENTINEL
 
-def diagnose(db_path):
-    """Lee la base de Optuna y reporta."""
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-    except sqlite3.DatabaseError as e:
-        print(f"✗ Error al abrir la base: {e}")
-        print(f"  ¿El archivo es una base SQLite válida?")
-        return {}
+DIRS = {
+    0: "MINIMIZE?",
+    1: "MINIMIZE",
+    2: "MAXIMIZE",
+}  # enum de Optuna: MINIMIZE=1, MAXIMIZE=2
 
-    # Tabla: studies, trials, trial_params, trial_user_attributes
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    tables = {row[0] for row in cursor.fetchall()}
 
-    if not tables:
-        print("✗ Base de datos vacía (sin tablas)")
-        return {}
+def find_db(explicit):
+    if explicit:
+        return Path(explicit)
+    cands = [Path(p) for p in glob.glob(str(DATA_DIR / "**" / "*.db"), recursive=True)]
+    cands += [Path(p) for p in glob.glob(str(REPO / "*.db"))]
+    for c in cands:
+        try:
+            con = sqlite3.connect(c)
+            ok = con.execute(
+                "SELECT name FROM sqlite_master WHERE name='trial_values'"
+            ).fetchone()
+            con.close()
+            if ok:
+                return c
+        except sqlite3.Error:
+            continue
+    return None
 
-    print(f"Tablas encontradas: {', '.join(sorted(tables))}\n")
 
-    if "trials" not in tables:
-        print("✗ No hay tabla 'trials' en la base (formato incorrecto?)")
-        return {}
+def rank(xs):
+    order = sorted(range(len(xs)), key=lambda i: xs[i])
+    r = [0.0] * len(xs)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and xs[order[j + 1]] == xs[order[i]]:
+            j += 1
+        for k in range(i, j + 1):
+            r[order[k]] = (i + j) / 2
+        i = j + 1
+    return r
 
-    # Leer trials
-    try:
-        cursor.execute(
-            """
-            SELECT id, state, value, datetime_start, datetime_complete
-            FROM trials ORDER BY id
-            """
+
+def spearman(a, b):
+    if len(a) < 4 or len(set(a)) < 2 or len(set(b)) < 2:
+        return None
+    ra, rb = rank(a), rank(b)
+    ma, mb = sum(ra) / len(ra), sum(rb) / len(rb)
+    num = sum((x - ma) * (y - mb) for x, y in zip(ra, rb))
+    den = (sum((x - ma) ** 2 for x in ra) * sum((y - mb) ** 2 for y in rb)) ** 0.5
+    return num / den if den else None
+
+
+def dominates(a, b, dirs):
+    better = False
+    for x, y, d in zip(a, b, dirs):
+        if d == 2:  # maximize
+            if x < y:
+                return False
+            better |= x > y
+        else:
+            if x > y:
+                return False
+            better |= x < y
+    return better
+
+
+def diagnose_study(con, sid, name):
+    print("\n" + "=" * 72 + f"\nESTUDIO {sid}: {name}\n" + "=" * 72)
+    dirs = [
+        d
+        for (d,) in con.execute(
+            "SELECT direction FROM study_directions WHERE study_id=? ORDER BY objective",
+            (sid,),
         )
-        trials = cursor.fetchall()
-    except sqlite3.OperationalError as e:
-        print(f"✗ Error al leer trials: {e}")
-        return {}
-
-    print(f"Total de trials: {len(trials)}")
-
-    # Estados
-    states = Counter(t[1] for t in trials)
-    print(f"\nEstados de trials:")
-    for state, count in sorted(states.items()):
-        print(f"  {state}: {count}")
-
-    # Trials completados (COMPLETE/FAIL/PRUNED)
-    completed = [t for t in trials if t[1] in ("COMPLETE", "FAIL", "PRUNED")]
-    print(f"\nTrials completados: {len(completed)}")
-
-    # Valores
-    values = [t[2] for t in completed if t[2] is not None]
-    if values:
-        print(f"Utilidad:")
-        print(f"  Media: {sum(values) / len(values):.4f}")
-        print(f"  Min: {min(values):.4f}")
-        print(f"  Max: {max(values):.4f}")
-        print(f"  # NaN/None: {len([v for v in values if v is None])}")
-
-    # Detectar centinelas (trials devueltos sin completar la etapa 2)
-    cursor.execute(
-        """
-        SELECT t.id, t.state, t.value, ua.key, ua.value
-        FROM trials t
-        LEFT JOIN trial_user_attributes ua ON t.id = ua.trial_id
-        WHERE ua.key IN ('pass', 'stage', 'result_code')
-        ORDER BY t.id
-        """
+    ]
+    dirs = [2 if str(d).upper().startswith("MAX") or d == 2 else 1 for d in dirs]
+    stage = (
+        "etapa 1 (wc_only): (ARI, coverage, -K)"
+        if "stage1" in name
+        else "etapa 2 (all): (coverage, agreement_sym, -K)"
+        if "stage2" in name
+        else "etapa desconocida"
     )
-    trial_attrs = defaultdict(dict)
-    for trial_id, state, value, key, val in cursor.fetchall():
-        trial_attrs[trial_id][key] = val
-
-    centinels = []
-    for t in completed:
-        trial_id = t[0]
-        if trial_attrs[trial_id].get("pass") == "2":
-            if t[2] is None or (
-                isinstance(t[2], float) and abs(t[2] - (-999.0)) < 0.01
-            ):
-                centinels.append(trial_id)
-
-    if centinels:
-        print(f"\n⚠ Trials centinela (etapa 2 inválida): {len(centinels)}")
-        print(f"  IDs: {centinels[:10]}{'...' if len(centinels) > 10 else ''}")
-    else:
-        print(f"\n✓ Sin trials centinela detectados")
-
-    # Duplicados en warm-start
-    cursor.execute(
-        """
-        SELECT tp.trial_id, tp.param_name, tp.param_value
-        FROM trial_params tp
-        ORDER BY tp.trial_id, tp.param_name
-        """
+    print(f"Direcciones: {['MAX' if d == 2 else 'MIN' for d in dirs]} · {stage}")
+    states = Counter(
+        s for (s,) in con.execute("SELECT state FROM trials WHERE study_id=?", (sid,))
     )
-    trial_param_sets = defaultdict(dict)
-    for trial_id, param_name, param_value in cursor.fetchall():
-        try:
-            trial_param_sets[trial_id][param_name] = json.loads(param_value)
-        except:
-            trial_param_sets[trial_id][param_name] = param_value
+    print(f"Trials por estado: {dict(states)}")
 
-    param_hashes = {}
-    for trial_id, params in trial_param_sets.items():
-        h = json.dumps(params, sort_keys=True)
-        if h not in param_hashes:
-            param_hashes[h] = []
-        param_hashes[h].append(trial_id)
-
-    duplicates = {h: ids for h, ids in param_hashes.items() if len(ids) > 1}
-    if duplicates:
-        dup_count = sum(len(ids) - 1 for ids in duplicates.values())
-        print(f"\n⚠ Parámetros duplicados: {dup_count} trials innecesarios")
-        for h, ids in sorted(duplicates.items(), key=lambda x: len(x[1]), reverse=True)[
-            :3
-        ]:
-            print(
-                f"  Aparece {len(ids)}× en trials {ids[:3]}{'...' if len(ids) > 3 else ''}"
-            )
-    else:
-        print(f"\n✓ Sin duplicados detectados")
-
-    # Distribucion de parámetros en cada etapa
-    cursor.execute(
-        """
-        SELECT tp.trial_id, tp.param_name, tp.param_value, ua.value as stage
-        FROM trial_params tp
-        JOIN trial_user_attributes ua ON tp.trial_id = ua.trial_id
-        WHERE ua.key = 'stage'
-        """
+    vals = defaultdict(dict)
+    for tid, obj, v, vt in con.execute(
+        "SELECT tv.trial_id, tv.objective, tv.value, tv.value_type FROM trial_values tv "
+        "JOIN trials t ON t.trial_id=tv.trial_id WHERE t.study_id=?",
+        (sid,),
+    ):
+        vals[tid][obj] = float(v) if v is not None else float("nan")
+    params = defaultdict(dict)
+    dists = {}
+    for tid, pn, pv, dj in con.execute(
+        "SELECT p.trial_id, p.param_name, p.param_value, p.distribution_json FROM trial_params p "
+        "JOIN trials t ON t.trial_id=p.trial_id WHERE t.study_id=?",
+        (sid,),
+    ):
+        d = json.loads(dj)
+        dists[pn] = d
+        attrs = d.get("attributes", d)
+        if "choices" in attrs:
+            pv = attrs["choices"][int(pv)]
+        params[tid][pn] = pv
+    num = {tid: tuple(v[i] for i in sorted(v)) for tid, v in vals.items()}
+    if not num:
+        print("  (sin valores: ¿estudio vacío o aún corriendo?)")
+        return
+    n_obj = len(next(iter(num.values())))
+    sent = [t for t, v in num.items() if tuple(v) == SENTINEL]
+    valid = [t for t in num if t not in sent]
+    print(
+        f"Centinelas {SENTINEL}: {len(sent)}/{len(num)} ({100 * len(sent) / len(num):.0f}%) "
+        f"— presupuesto desperdiciado en trials inviables"
     )
-    params_by_stage = defaultdict(lambda: defaultdict(list))
-    for trial_id, param_name, param_value, stage in cursor.fetchall():
-        try:
-            val = json.loads(param_value)
-        except:
-            val = param_value
-        params_by_stage[stage][param_name].append(val)
 
-    print(f"\nDistribución de parámetros por etapa:")
-    for stage in sorted(params_by_stage.keys()):
-        print(f"  Etapa {stage}:")
-        for param, vals in sorted(params_by_stage[stage].items()):
-            if isinstance(vals[0], (int, float)):
-                print(
-                    f"    {param}: [{min(vals):.2f}, {max(vals):.2f}] (n={len(vals)})"
-                )
-            else:
-                unique = set(str(v) for v in vals)
-                print(f"    {param}: {len(unique)} valores únicos de {len(vals)}")
-
-    # Frente de Pareto (si hay objetivos múltiples)
-    cursor.execute(
-        """
-        SELECT id, value FROM trials
-        WHERE state = 'COMPLETE' AND value IS NOT NULL
-        ORDER BY value DESC
-        """
+    # Causa de los centinelas inferible desde parámetros (gates baratos)
+    inf_gate = 0
+    for t in sent:
+        p = params[t]
+        if p.get("coref_context_units_tight", 0) >= p.get(
+            "coref_context_units_loose", 99
+        ) or p.get("hdbscan_uce_min_cluster_frac", 1) <= p.get(
+            "hdbscan_uce_min_cluster_frac_loose", 0
+        ):
+            inf_gate += 1
+    print(
+        f"  de los cuales, infactibles por gates tight<loose / frac>frac_loose: {inf_gate} "
+        f"(se evitan filtrando el espacio, no evaluando)"
     )
-    valid_trials = list(cursor.fetchall())
-    if valid_trials:
-        best_value = max(t[1] for t in valid_trials)
-        near_pareto = [t for t in valid_trials if t[1] >= best_value * 0.95]
-        print(f"\nFrente de Pareto (últimos 5% del mejor):")
-        print(f"  Mejor: {best_value:.4f}")
-        print(f"  Trials en frente (>95%): {len(near_pareto)}")
-        if near_pareto:
-            print(f"  Trials: {[t[0] for t in near_pareto[:10]]}")
 
-    conn.close()
-    return trial_attrs
+    if not valid:
+        print("  Ningún trial válido.")
+        return
+    K = Counter(int(-num[t][-1]) for t in valid)
+    print(f"Distribución de K (clases) en trials válidos: {dict(sorted(K.items()))}")
+    for i in range(n_obj):
+        col = [num[t][i] for t in valid]
+        print(
+            f"  objetivo[{i}]: min={min(col):+.3f} media={sum(col) / len(col):+.3f} max={max(col):+.3f}"
+        )
+
+    # Frente de Pareto propio
+    front = [
+        t
+        for t in valid
+        if not any(dominates(num[o], num[t], dirs) for o in valid if o != t)
+    ]
+    uniq = {tuple(round(x, 6) for x in num[t]) for t in front}
+    print(
+        f"Frente de Pareto: {len(front)} trials, {len(uniq)} puntos distintos en objetivo-espacio"
+    )
+    for pt in sorted(uniq, reverse=True):
+        print(f"   {pt}")
+
+    # Parámetros ganadores vs bordes (leídos de distribution_json)
+    best = max(valid, key=lambda t: (num[t][0], num[t][1]))
+    print(f"\nTrial #{best} (mejor 1er objetivo) — ¿en el borde del espacio?")
+    for pn, v in sorted(params[best].items()):
+        a = dists[pn].get("attributes", dists[pn])
+        lo, hi = a.get("low"), a.get("high")
+        flag = ""
+        if lo is not None and (v == lo or v == hi):
+            flag = "   ◄ BORDE"
+        elif (
+            "choices" in a and a["choices"] and v in (a["choices"][0], a["choices"][-1])
+        ):
+            flag = "   ◄ extremo de la lista"
+        rng = f"[{lo}, {hi}]" if lo is not None else f"opciones={a.get('choices')}"
+        print(f"   {pn:38s} {v!s:>8}   {rng}{flag}")
+
+    # Plateaus y parámetros inertes
+    by_vals = defaultdict(list)
+    for t in valid:
+        by_vals[tuple(round(x, 6) for x in num[t])].append(t)
+    dup = {k: v for k, v in by_vals.items() if len(v) > 1}
+    print(
+        f"\nPuntos de objetivo repetidos por ≥2 trials con parámetros distintos: {len(dup)}"
+    )
+    print(
+        "Correlación de Spearman parámetro↔objetivo (|ρ|<0.10 en todos = parámetro probablemente INERTE):"
+    )
+    for pn in sorted(dists):
+        xs = [float(params[t][pn]) for t in valid if pn in params[t]]
+        if len(set(xs)) < 2:
+            print(f"   {pn:38s} sin variación")
+            continue
+        rhos = []
+        for i in range(n_obj):
+            ys = [num[t][i] for t in valid if pn in params[t]]
+            r = spearman(xs, ys)
+            rhos.append("  n/a " if r is None else f"{r:+.2f}")
+        inert = all(
+            r.strip() != "n/a" and abs(float(r)) < 0.10
+            for r in rhos
+            if r.strip() != "n/a"
+        ) and any(r.strip() != "n/a" for r in rhos)
+        print(f"   {pn:38s} ρ={rhos}{'   ◄ inerte' if inert else ''}")
+
+    ua = Counter(
+        k
+        for (k,) in con.execute(
+            "SELECT key FROM trial_user_attributes ua JOIN trials t ON t.trial_id=ua.trial_id WHERE t.study_id=?",
+            (sid,),
+        )
+    )
+    print(f"\nUser attrs presentes: {dict(ua) or 'ninguno (normal en etapa 1)'}")
 
 
 def main():
-    parser = ArgumentParser(description=__doc__)
-    parser.add_argument("--db", required=True, help="Ruta a reii_optuna.db")
-    parser.add_argument("--out", help="Guardar reporte en fichero (opcional)")
-    args = parser.parse_args()
-
-    db_path = Path(args.db)
-    if not db_path.exists():
-        print(f"✗ Base no existe: {db_path}")
-        return
-
-    print("=" * 70)
-    print("SCRIPT 3: Diagnosticar base de Optuna")
-    print("=" * 70)
-    print(f"DB: {db_path}\n")
-
-    diagnose(db_path)
-
-    print("\n" + "=" * 70)
-    print("INTERPRETACIÓN:")
-    print("  Centinelas > 0: el problema de no persistir docs incompletos existe")
-    print(
-        "  Duplicados > 0: warm-start estaba tirando parámetros duplicados (bug fix P2)"
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    print("  Distribución: ¿explora bien o se queda en rincones?")
+    ap.add_argument("--db", default=None)
+    ap.add_argument("--study", default=None, help="subcadena del nombre del estudio")
+    a = ap.parse_args()
+    db = find_db(a.db)
+    if not db or not db.exists():
+        print("✗ No encuentro una BD de Optuna. Pasa --db data/<archivo>.db")
+        sys.exit(1)
+    print(f"BD: {db}")
+    con = sqlite3.connect(db)
+    studies = con.execute(
+        "SELECT study_id, study_name FROM studies ORDER BY study_id"
+    ).fetchall()
+    print(f"Estudios: {[s[1] for s in studies]}")
+    for sid, name in studies:
+        if a.study and a.study not in name:
+            continue
+        diagnose_study(con, sid, name)
 
 
 if __name__ == "__main__":

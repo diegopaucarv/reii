@@ -1,144 +1,120 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
 """
-Script 5 (OPCIONAL): Análisis de potencia para S2.
-Re-corre el benchmark con más semillas (16-32 en lugar de 8) para decidir
-si S2 es significativamente mejor que S1.
+Script 5 (OPCIONAL) — Potencia estadística S2 vs S1 sobre el benchmark MOCK.
 
-SOLO lo ejecutes si:
-  1. El script 2 muestra que sí converge con 300 trials
-  2. Quieres gastar tiempo en decidir S2
+Aclaración importante: tests/reii_optimizer_report.py NO mide tu corpus. Simula el
+TPESampler de Optuna sobre paisajes sintéticos para comparar dos estrategias de
+búsqueda (S1 = fix de lookup; S2 = + factibilidad exacta por pares). Sirve para decidir
+una mejora de INGENIERÍA del optimizador; no explica por qué tus clases salen mal.
+
+Correcciones:
+  * Ruta por defecto: tests/reii_optimizer_report.py (antes: /mnt/user-data/outputs/...,
+    ruta de otra sesión que no existe en tu máquina).
+  * El benchmark escribe un .json junto al --out; el script viejo buscaba JSON en
+    stdout con un regex y nunca lo encontraba.
+  * Añade --skip-tests (si no, corre también la batería de unit tests) y --scenarios.
+  * La condición "script 2 converge" no tiene relación lógica con este benchmark: se quitó.
+  * Convierte tipos numpy antes de json.dump (np.int64 rompía la serialización).
+  * Tiempo: ~65 s por paisaje y escenario -> 32 semillas x 3 escenarios ≈ 105 min.
 
 Uso:
-  python 5_s2_power_analysis.py --bench-script /path/to/reii_optimizer_report.py \
-    --seeds 32 --out s2_results.json
+  python 5_s2_power_analysis.py --seeds 32 --scenarios 30:0.7,100:0.7,30:0.3
 """
+
+from __future__ import annotations
+
 import json
 import subprocess
 import sys
-from argparse import ArgumentParser
+from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from pathlib import Path
 
 import numpy as np
 
+REPO = Path(__file__).resolve().parent
+KEY_REF = "T=coste90_con_fix|S1 fix lookup"
+KEY_S2 = "T=coste90_con_fix|S2 +factible exacto (pares)"
 
-def run_benchmark(script_path, seeds=32):
-    """Ejecuta el script de benchmark con N semillas."""
+
+def run_benchmark(script, seeds, scenarios, out_md, timeout):
     cmd = [
         sys.executable,
-        str(script_path),
+        str(script),
         "--workdir",
-        ".",
+        str(REPO),
+        "--skip-tests",
         "--seeds",
         str(seeds),
+        "--scenarios",
+        scenarios,
         "--out",
-        "bench_output.md",
+        str(out_md),
     ]
-
-    print(f"→ Corriendo benchmark con {seeds} semillas...")
-    print(f"  Comando: {' '.join(cmd)}")
-    print("  Esto puede tomar 30+ minutos...")
-
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
-
-    if result.returncode != 0:
-        print("✗ Benchmark falló")
-        print("STDERR:", result.stderr[-500:])
+    print("→ " + " ".join(cmd))
+    r = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        print("✗ Benchmark falló\n" + r.stderr[-800:])
         return None
-
-    return result.stdout
-
-
-def analyze_results(output):
-    """Extrae resultados del output de benchmark."""
-    # El output tiene JSON al final
-    try:
-        # Buscar el último JSON en el output
-        import re
-
-        match = re.search(r'\{.*"benchmark".*\}', output, re.DOTALL)
-        if match:
-            data = json.loads(match.group(0))
-            return data
-    except:
-        pass
-    return None
+    return Path(out_md).with_suffix(".json")
 
 
 def main():
-    parser = ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--bench-script",
-        default="/mnt/user-data/outputs/reii_optimizer_report.py",
-        help="Ruta al script de benchmark",
+    ap = ArgumentParser(
+        description=__doc__, formatter_class=RawDescriptionHelpFormatter
     )
-    parser.add_argument("--seeds", type=int, default=32, help="Número de semillas")
-    parser.add_argument("--out", default="s2_results.json", help="Salida")
-    args = parser.parse_args()
+    ap.add_argument(
+        "--bench-script", default=str(REPO / "tests" / "reii_optimizer_report.py")
+    )
+    ap.add_argument("--seeds", type=int, default=32)
+    ap.add_argument("--scenarios", default="30:0.7,100:0.7,30:0.3")
+    ap.add_argument("--out", default="s2_results.json")
+    ap.add_argument("--bench-out", default="bench_output.md")
+    ap.add_argument("--timeout", type=int, default=4 * 3600)
+    ap.add_argument(
+        "--reuse-json", default=None, help="analiza un .json ya generado sin re-correr"
+    )
+    a = ap.parse_args()
 
-    print("=" * 70)
-    print("SCRIPT 5 (OPCIONAL): Análisis de potencia para S2")
-    print("=" * 70)
-
-    # Verificar que el script existe
-    bench_script = Path(args.bench_script)
-    if not bench_script.exists():
-        print(f"✗ Script de benchmark no existe: {bench_script}")
-        print(f"  Descargalo: https://... o usa reii_optimizer_report.py")
-        sys.exit(1)
-
-    output = run_benchmark(bench_script, args.seeds)
-    if not output:
-        sys.exit(1)
-
-    data = analyze_results(output)
-    if not data:
-        print("✗ No se pudo extraer resultados del benchmark")
-        print("Output:", output[-1000:])
-        sys.exit(1)
-
-    print("\n" + "=" * 70)
-    print("ANÁLISIS CON N=32 SEMILLAS:")
-
-    # Re-analizar
-    res = {}
-    for sc, bench_data in data.get("benchmark", {}).items():
-        print(f"\n{sc}:")
-        # Régimen C (más ajustado)
-        ref = np.array([r[0] for r in bench_data[f"T=coste90_con_fix|S1 fix lookup"]])
-        s2 = np.array(
-            [r[0] for r in bench_data[f"T=coste90_con_fix|S2 +factible exacto (pares)"]]
-        )
-
-        d = s2 - ref
-        ci = 1.96 * d.std(ddof=1) / np.sqrt(len(d))
-
-        print(f"  S2 vs S1 en régimen C (más información):")
-        print(f"    Δ = {d.mean():+.4f} ± {ci:.4f}")
-        print(f"    Gana: {(d > 0).sum()}/{len(d)} paisajes")
-
-        sig = "SÍ" if ci > 0 and d.mean() - ci > 0 else "NO"
-        print(f"    ¿Significativo (IC no cruza 0)? {sig}")
-
-        res[sc] = {"delta": d.mean(), "ci": ci, "wins": (d > 0).sum(), "n": len(d)}
-
-    with open(args.out, "w") as fh:
-        json.dump(res, fh, indent=2)
-
-    print(f"\n→ Resultados en: {args.out}")
-    print("\nRECOMENDACIÓN:")
-    all_sig = all(r["ci"] > 0 and r["delta"] - r["ci"] > 0 for r in res.values())
-    if all_sig:
-        print("  ✓ S2 es significativo en TODOS los escenarios → adopta S2")
+    if a.reuse_json:
+        js = Path(a.reuse_json)
     else:
-        any_sig = any(r["ci"] > 0 and r["delta"] - r["ci"] > 0 for r in res.values())
-        if any_sig:
-            print(
-                "  ~ S2 es significativo en ALGUNOS escenarios → usa criterios de negocio"
-            )
-        else:
-            print("  ✗ S2 no es significativo → NO lo adoptes, usa S1")
+        if not Path(a.bench_script).exists():
+            sys.exit(f"✗ No existe {a.bench_script}")
+        js = run_benchmark(a.bench_script, a.seeds, a.scenarios, a.bench_out, a.timeout)
+    if not js or not js.exists():
+        sys.exit("✗ No se generó el JSON del benchmark")
+    data = json.loads(js.read_text(encoding="utf-8")).get("benchmark", {})
+    if not data:
+        sys.exit("✗ JSON sin sección 'benchmark'")
+
+    res = {}
+    for sc, bd in data.items():
+        if KEY_REF not in bd or KEY_S2 not in bd:
+            print(f"{sc}: faltan claves {KEY_REF!r}/{KEY_S2!r}")
+            continue
+        d = np.array([r[0] for r in bd[KEY_S2]]) - np.array([r[0] for r in bd[KEY_REF]])
+        ci = 1.96 * d.std(ddof=1) / np.sqrt(len(d)) if len(d) > 1 else float("nan")
+        sig = bool(len(d) > 1 and d.mean() - ci > 0)
+        print(
+            f"\n{sc}: Δ(S2-S1)={d.mean():+.4f} ± {ci:.4f}  gana {int((d > 0).sum())}/{len(d)}  significativo={sig}"
+        )
+        res[sc] = {
+            "delta": float(d.mean()),
+            "ci": float(ci),
+            "wins": int((d > 0).sum()),
+            "n": int(len(d)),
+            "significant": sig,
+        }
+    Path(a.out).write_text(json.dumps(res, indent=2), encoding="utf-8")
+    sigs = [r["significant"] for r in res.values()]
+    print(
+        "\nRECOMENDACIÓN:",
+        "adopta S2"
+        if sigs and all(sigs)
+        else "mixto: decide por coste/complejidad"
+        if any(sigs)
+        else "sin evidencia: queda S1",
+    )
 
 
 if __name__ == "__main__":

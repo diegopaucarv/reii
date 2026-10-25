@@ -1,236 +1,149 @@
 #!/usr/bin/env python3
 """
-Script 2: Corre 300 trials del optimizador y ve si converge.
-Compara 2-3 semillas de Optuna para medir estabilidad.
+Script 2 — Estabilidad del optimizador entre semillas.
 
-NOTA: Este script modifica temporalmente main_workflow.py para cambiar optimize_trials.
-Asume que Config() está en main_workflow.py cerca de "optimize_trials=".
+Pregunta: con distinto seed de TPE, ¿el optimizador llega a los mismos parámetros
+(punto fijo) o explora? ¿Los ganadores caen en los bordes del espacio?
+
+Qué cambió respecto a la versión anterior (todo verificado en main_workflow.py):
+  1. No parchea el código fuente con regex. El viejo regex `random_state\\s*=\\s*\\d+`
+     reescribía también randomized_svd (l.2613) y PCA (l.4961) y NO tocaba el campo
+     `random_state: int = 42` del dataclass. Ahora usa --seed/--trials/--study-name.
+  2. No ejecuta todo el pipeline: usa --optimize-only (se detiene tras el optimizador).
+  3. Mueve best_params.json a un lado: si existe, ejecutar() SALTA el optimizador.
+  4. Cada semilla usa su propio study (sqlite) -> sin warm-start cruzado.
+  5. Lee el resultado de la línea [OPTIMIZER-RESULT] y de best_params.json; el viejo
+     regex buscaba "best utility", texto que no existe en el código.
+  6. Va por Docker (como tu comando habitual), con --force.
 
 Uso:
-  python 2_run_300_trials.py --reii-dir /ruta/a/reii --seeds 3 --out results.tsv
-
-Reporta:
-  - Mejor utilidad por semilla
-  - Estabilidad (σ del óptimo)
-  - ¿Se va a un valor fijo o explora?
+  python 2_run_300_trials.py --seeds 0 1 2 --trials 300
+  python 2_run_300_trials.py --analyze-only        # re-analiza data/diag/best_params_seed*.json
+  python 2_run_300_trials.py --dry-run
 """
 
+from __future__ import annotations
+
+import argparse
 import json
-import re
-import subprocess
-import sys
-from argparse import ArgumentParser
-from datetime import datetime
+import shutil
+import statistics as st
 from pathlib import Path
 
-
-def patch_optimize_trials(reii_dir, new_value):
-    """Modifica optimize_trials en main_workflow.py."""
-    mw_path = Path(reii_dir) / "src" / "reii" / "main_workflow.py"
-    if not mw_path.exists():
-        print(f"✗ No encontré main_workflow.py en {mw_path}")
-        return False
-
-    content = mw_path.read_text(encoding="utf-8")
-    # Buscar optimize_trials=NNN (cualquier número)
-    original = content
-    content = re.sub(r"(optimize_trials\s*=\s*)\d+", f"\\1{new_value}", content)
-
-    if content == original:
-        print(f"⚠ No encontré optimize_trials en main_workflow.py")
-        return False
-
-    mw_path.write_text(content, encoding="utf-8")
-    print(f"  ✓ optimize_trials seteado a {new_value}")
-    return True
+from diag_common import (
+    BEST_PARAMS,
+    DIAG_DIR,
+    at_boundary,
+    detect_runner,
+    parse_optimizer_results,
+    run_to_log,
+    workflow_cmd,
+)
 
 
-def restore_optimize_trials(reii_dir, original_value):
-    """Restaura el valor original de optimize_trials."""
-    mw_path = Path(reii_dir) / "src" / "reii" / "main_workflow.py"
-    content = mw_path.read_text(encoding="utf-8")
-    content = re.sub(r"(optimize_trials\s*=\s*)\d+", f"\\1{original_value}", content)
-    mw_path.write_text(content, encoding="utf-8")
-
-
-def run_optimizer(reii_dir, seed, seed_arg_name="optimize_seed"):
-    """Corre Optuna con semilla fija y retorna best_params."""
-    reii_dir = Path(reii_dir)
-
-    # Leer main_workflow.py para encontrar dónde setear la semilla
-    mw_path = reii_dir / "src" / "reii" / "main_workflow.py"
-    content = mw_path.read_text(encoding="utf-8")
-
-    # Buscar donde se setea la semilla de Optuna
-    # Posibles nombres: optimize_seed, random_state, sampler_seed, etc.
-    possible_names = ["optimize_seed", "random_state", "optuna_seed", "sampler_seed"]
-    found = None
-    for name in possible_names:
-        if name in content:
-            found = name
-            break
-
-    if found:
-        content = re.sub(f"({found}\\s*=\\s*)\\d+", f"\\1{seed}", content)
-        mw_path.write_text(content, encoding="utf-8")
-        print(f"  ✓ Semilla seteada a {seed} ({found})")
-    else:
-        print(f"  ⚠ No encontré variable de semilla en main_workflow.py")
-
-    print(f"→ Seed {seed}: Corriendo (esto toma ~30-60 min)...")
-    result = subprocess.run(
-        [sys.executable, "src/reii/main_workflow.py"],
-        cwd=reii_dir,
-        capture_output=True,
-        text=True,
-        timeout=3600 * 4,
+def run_seed(seed, trials, runner, timeout, dry):
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    study = f"reii_search_v2_seed{seed}"
+    cmd = workflow_cmd(
+        runner,
+        "--force",
+        "--optimize-only",
+        "--trials",
+        str(trials),
+        "--seed",
+        str(seed),
+        "--study-name",
+        study,
     )
+    text = run_to_log(cmd, DIAG_DIR / f"seed{seed}.log", timeout, dry)
+    if dry:
+        return None
+    if text is None:
+        return None
+    res = parse_optimizer_results(text)
+    if not BEST_PARAMS.exists():
+        print(f"  ✗ no se generó {BEST_PARAMS}")
+        return None
+    dest = DIAG_DIR / f"best_params_seed{seed}.json"
+    shutil.copy(BEST_PARAMS, dest)
+    if res:
+        print(
+            f"  ✓ etapa final={res[-1]['stage_mode']} trial=#{res[-1]['trial']} values={res[-1]['values']}"
+        )
+    return dest
 
-    # Buscar best_value/best_params en el output
-    output = result.stdout + result.stderr
 
-    # Buscar "best utility: 0.XXX" o "Best params:" en el output
-    utility_match = re.search(r"best.*utility[:\s]+([0-9.]+)", output, re.I)
-    params_match = re.search(r"Best params[:\s]*\{[^}]+\}", output, re.I)
-
-    utility = None
-    params = None
-    if utility_match:
-        try:
-            utility = float(utility_match.group(1))
-        except:
-            pass
-
-    if params_match:
-        try:
-            params_str = params_match.group(0)
-            params = json.loads(
-                params_str.split(":", 1)[1].strip() if ":" in params_str else params_str
-            )
-        except:
-            pass
-
-    return {
-        "seed": seed,
-        "utility": utility,
-        "params": params,
-        "output_sample": output[-500:] if output else "",
-        "passed": utility is not None,
-    }
+def analyze(files):
+    rows = [json.loads(Path(f).read_text(encoding="utf-8")) for f in files]
+    if not rows:
+        print("Sin resultados que analizar.")
+        return
+    print("\n" + "=" * 70 + f"\nANÁLISIS ({len(rows)} semillas)\n" + "=" * 70)
+    params = sorted({k for r in rows for k in r["params"]})
+    print(f"{'parámetro':38s} {'valores por semilla':34s} borde  ¿fijo?")
+    for k in params:
+        vals = [r["params"].get(k) for r in rows]
+        edge = sum(at_boundary(k, v) for v in vals if v is not None)
+        fixed = len(set(vals)) == 1
+        print(f"{k:38s} {str(vals):34s} {edge}/{len(vals)}   {'SÍ' if fixed else 'no'}")
+    for i, name in enumerate(rows[0].get("objectives", ["obj0", "obj1", "obj2"])):
+        v = [r["best_values"][i] for r in rows]
+        sd = st.pstdev(v) if len(v) > 1 else 0.0
+        print(
+            f"objetivo {name:10s}: media={st.mean(v):+.3f} sd={sd:.3f} min={min(v):+.3f} max={max(v):+.3f}"
+        )
+    print(
+        "\nLectura: parámetros 'fijo=SÍ' = el sampler converge ahí; muchos en 'borde' = "
+        "el espacio es demasiado estrecho; objetivo con sd alta = el ruido supera la señal."
+    )
 
 
 def main():
-    parser = ArgumentParser(description=__doc__)
-    parser.add_argument("--reii-dir", required=True, help="Ruta al directorio de REII")
-    parser.add_argument(
-        "--seeds", type=int, default=3, help="Cuántas semillas (default 3)"
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument(
-        "--max-trials", type=int, default=300, help="Trials por semilla"
+    ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
+    ap.add_argument("--trials", type=int, default=300)
+    ap.add_argument("--runner", choices=["docker", "local"], default=None)
+    ap.add_argument(
+        "--timeout", type=int, default=6 * 3600, help="segundos por semilla"
     )
-    parser.add_argument(
-        "--out", default="results_300trials.tsv", help="Fichero de salida"
-    )
-    args = parser.parse_args()
 
-    reii_dir = Path(args.reii_dir)
-    if not reii_dir.exists():
-        print(f"✗ Directorio REII no existe: {reii_dir}")
-        sys.exit(1)
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
+    ap.add_argument("--trials", type=int, default=300)
+    ap.add_argument("--runner", choices=["docker", "local"], default=None)
+    ap.add_argument("--timeout", type=int, default=6 * 3600, help="segundos por semilla")
+    ap.add_argument("--analyze-only", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
 
-    print("=" * 70)
-    print(f"SCRIPT 2: Optimizador con {args.max_trials} trials × {args.seeds} semillas")
-    print("=" * 70)
-    print(f"REII: {reii_dir}\n")
-
-    # Leer el valor original de optimize_trials
-    mw_path = reii_dir / "src" / "reii" / "main_workflow.py"
-    original_content = mw_path.read_text(encoding="utf-8")
-    match = re.search(r"optimize_trials\s*=\s*(\d+)", original_content)
-    original_trials = int(match.group(1)) if match else 100
-
+    if a.analyze_only:
+        analyze(sorted(DIAG_DIR.glob("best_params_seed*.json")))
+        return
+    runner = detect_runner(a.runner)
+    print(f"runner={runner}; semillas={a.seeds}; trials={a.trials}")
+    backup = None
+    if BEST_PARAMS.exists() and not a.dry_run:
+        backup = BEST_PARAMS.with_suffix(".json.pre_script2")
+        shutil.move(BEST_PARAMS, backup)  # si existe, ejecutar() omite el optimizador
+        print(f"  (best_params.json respaldado en {backup.name})")
+    done = []
     try:
-        # Setear optimize_trials
-        if not patch_optimize_trials(reii_dir, args.max_trials):
-            print("✗ No se pudo setear optimize_trials. Verifica main_workflow.py")
-            sys.exit(1)
-
-        results = []
-        for seed in range(args.seeds):
-            print(f"\n[{seed + 1}/{args.seeds}]")
-            res = run_optimizer(reii_dir, seed)
-            results.append(res)
-            if res["passed"]:
-                print(f"  ✓ Seed {seed}: utility={res['utility']:.4f}")
-                if res["params"]:
-                    print(f"    Parámetros: {res['params']}")
-            else:
-                print(f"  ✗ Seed {seed}: no se encontró best_utility en output")
-                if res["output_sample"]:
-                    print(f"    Últimas líneas: {res['output_sample']}")
-
-        print("\n" + "=" * 70)
-        print("RESUMEN:")
-        passed = [r for r in results if r["passed"]]
-        if not passed:
-            print("✗ Ninguna corrida pasó (no se encontró best_utility en output)")
-            print(
-                "  Verifica que la salida de main_workflow.py incluya 'best utility: X'"
-            )
-            sys.exit(1)
-
-        utils = [r["utility"] for r in passed]
-        print(f"Utilidades: {[f'{u:.4f}' for u in utils]}")
-        print(f"  Media: {sum(utils) / len(utils):.4f}")
-        if len(utils) > 1:
-            var = sum((u - sum(utils) / len(utils)) ** 2 for u in utils) / len(utils)
-            sd = var**0.5
-            print(f"  Desv estándar: {sd:.4f}")
-        print(f"  Rango: {min(utils):.4f} → {max(utils):.4f}")
-
-        print("\n¿CONVERGE?")
-        if max(utils) - min(utils) < 0.01:
-            print("  ✓ SÍ: todas las semillas dan resultados muy similares")
-        elif max(utils) - min(utils) < 0.05:
-            print("  ~ Parcialmente: algo de variación pero razonable")
-        else:
-            print("  ✗ No: hay mucha variación entre semillas")
-
-        print("\n¿SE VA A UN VALOR FIJO?")
-        param_sets = [
-            json.dumps(r["params"], sort_keys=True) for r in passed if r["params"]
-        ]
-        if param_sets:
-            unique_params = set(param_sets)
-            if len(unique_params) == 1:
-                print("  ✓ SÍ: todos convergen al mismo parámetro")
-                print(f"    {passed[0]['params']}")
-            else:
-                print(
-                    f"  ~ NO: {len(unique_params)} parámetros distintos entre {len(param_sets)}"
-                )
-        else:
-            print("  ⚠ No se extrajeron parámetros del output")
-
-        # Guardar
-        with open(args.out, "w") as fh:
-            fh.write(f"# Corrida {datetime.now()}\n")
-            fh.write(f"# max_trials={args.max_trials}\n")
-            fh.write("seed\tutility\tpassed\tparams\n")
-            for r in results:
-                fh.write(
-                    f"{r['seed']}\t"
-                    f"{r['utility'] or 'NA'}\t"
-                    f"{r['passed']}\t"
-                    f"{json.dumps(r['params']) if r['params'] else 'NA'}\n"
-                )
-
-        print(f"\n→ Resultados guardados en: {args.out}")
-
+        for s in a.seeds:
+            print(f"\n── semilla {s} ──")
+            if BEST_PARAMS.exists() and not a.dry_run:
+                BEST_PARAMS.unlink()
+            f = run_seed(s, a.trials, runner, a.timeout, a.dry_run)
+            if f:
+                done.append(f)
     finally:
-        # Restaurar
-        restore_optimize_trials(reii_dir, original_trials)
-        print(f"  ✓ Restaurado optimize_trials a {original_trials}")
+        if backup and backup.exists():
+            shutil.move(backup, BEST_PARAMS)
+            print(f"\n(best_params.json original restaurado)")
+    if not a.dry_run:
+        analyze(done)
 
 
 if __name__ == "__main__":

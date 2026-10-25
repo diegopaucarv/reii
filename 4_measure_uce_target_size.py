@@ -1,195 +1,115 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
 """
-Script 4: Mide coste de uce_target_size.
-Ejecuta segmentación + coref para 5-7 valores distintos de uce_target_size
-y reporta:
-  - Segundos de segmentación por valor
-  - Segundos de pase de coref (ctx=2) por valor
-  - Varianza entre corridas idénticas
-  - Estimación de coste de búsqueda: k·(seg + coref·ctx_count)
+Script 4 — Coste y forma de la segmentación según uce_target_size.
+
+Hechos verificados que cambian el diseño original:
+  * main_workflow.py NO tiene --corpus, --pass ni --bench (argv manual: los flags
+    desconocidos se ignoraban en silencio y corría el pipeline COMPLETO con el corpus
+    por defecto). Se añadió --bench / --bench-coref en el parche.
+  * --uce-target-size SÍ existe y desactiva la auto-calibración (calibrar_uce_target_size).
+  * El corpus sale de data/txt_outputs/tmp/*.json (nivel de módulo) y se omiten los
+    documentos ya en PostgreSQL salvo --force: aquí siempre se pasa --force.
+  * La caché de coref está indexada por uce_target_size (`fp:uce_target:min_words`):
+    cada tamaño nuevo implica recomputar coref -> ese es el coste real a medir.
+
+Salida: tabla tamaño -> n_UCE, palabras/UCE, tiempos; ajuste lineal coste~n_UCE y
+extrapolación; y comparación con ALCESTE 2012 (26 ocurrencias/UCE -> 376 UCE).
 
 Uso:
-  python 4_measure_uce_target_size.py --reii-dir . --corpus corpus.txt \
-    --uce-values "18,22,26,30,34" --repeats 2 --out timing.tsv
+  python 4_measure_uce_target_size.py --sizes 18 22 26 30 --coref
+  python 4_measure_uce_target_size.py --sizes 18 26 --extrapolate 5809 --dry-run
 """
-import re
-import subprocess
-import sys
-import time
-from argparse import ArgumentParser
-from collections import defaultdict
-from pathlib import Path
+
+from __future__ import annotations
+
+import argparse
+import json
+
+from diag_common import DIAG_DIR, detect_runner, parse_bench, run_to_log, workflow_cmd
+
+ALCESTE_REF = {"uce_size": 26, "n_uce": 376, "words_per_uce_analyzed": 13.95}
 
 
-def extract_timing(output):
-    """Busca en stdout '[BENCH]' líneas con tiempos."""
-    times = {}
-    for line in output.split("\n"):
-        if "[BENCH]" in line or "[COREF]" in line or "[TIEMPO]" in line:
-            # Buscar patrones como "seg_time=1.23" o "coref_ctx=2_time=4.56"
-            m_seg = re.search(r"seg(?:ment)?.*time[=:]?\s*([\d.]+)", line, re.I)
-            m_coref = re.search(r"coref.*time[=:]?\s*([\d.]+)", line, re.I)
-            if m_seg:
-                times["segmentation"] = float(m_seg.group(1))
-            if m_coref:
-                times["coref"] = float(m_coref.group(1))
-    return times
-
-
-def run_with_uce_value(reii_dir, corpus_path, uce_target_size, repeat=1):
-    """Corre el pipeline con un valor fijo de uce_target_size."""
-    reii_dir = Path(reii_dir)
-    corpus_path = Path(corpus_path)
-
-    all_times = []
-    for rep in range(repeat):
-        cmd = [
-            sys.executable,
-            "-m",
-            "reii.main_workflow",
-            "--corpus",
-            str(corpus_path),
-            "--uce-target-size",
-            str(uce_target_size),
-            "--pass",
-            "1",  # Solo etapa barata
-            "--bench",  # Si soporta flag de benchmark
-        ]
-
-        start = time.time()
-        result = subprocess.run(
-            cmd,
-            cwd=reii_dir,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-        elapsed = time.time() - start
-
-        times = extract_timing(result.stdout + result.stderr)
-        times["total"] = elapsed
-        all_times.append(times)
-
-        print(f"  Rep {rep + 1}/{repeat}: {elapsed:.1f}s total", end="")
-        if "segmentation" in times:
-            print(
-                f" (seg={times['segmentation']:.1f}s, coref={times.get('coref', '?')}s)",
-                end="",
-            )
-        print()
-
-    return all_times
+def linfit(x, y):
+    n = len(x)
+    if n < 2 or len(set(x)) < 2:
+        return None
+    mx, my = sum(x) / n, sum(y) / n
+    b = sum((a - mx) * (c - my) for a, c in zip(x, y)) / sum((a - mx) ** 2 for a in x)
+    return b, my - b * mx
 
 
 def main():
-    parser = ArgumentParser(description=__doc__)
-    parser.add_argument("--reii-dir", default=".", help="Ruta a REII")
-    parser.add_argument("--corpus", required=True, help="Ruta al corpus")
-    parser.add_argument(
-        "--uce-values",
-        default="18,22,26,30,34",
-        help="Valores de uce_target_size (CSV)",
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--repeats", type=int, default=2, help="Repeticiones por valor")
-    parser.add_argument("--out", default="timing.tsv", help="Fichero de salida")
-    args = parser.parse_args()
-
-    uce_values = [int(v.strip()) for v in args.uce_values.split(",")]
-
-    print("=" * 70)
-    print("SCRIPT 4: Medir coste de uce_target_size")
-    print("=" * 70)
-    print(f"Corpus: {args.corpus}")
-    print(f"Valores de uce_target_size: {uce_values}")
-    print(f"Repeticiones por valor: {args.repeats}\n")
-
-    results = defaultdict(list)
-    for uce_val in uce_values:
-        print(f"→ uce_target_size={uce_val}:")
-        times = run_with_uce_value(args.reii_dir, args.corpus, uce_val, args.repeats)
-        results[uce_val] = times
-
-    print("\n" + "=" * 70)
-    print("RESUMEN:")
-    print(
-        f"{'uce_target_size':<15} {'seg (s)':<10} {'coref (s)':<10} {'total (s)':<10} {'var total':<10}"
+    ap.add_argument("--sizes", type=int, nargs="+", default=[18, 22, 26, 30])
+    ap.add_argument(
+        "--coref",
+        action="store_true",
+        help="mide también coref (lento; requiere Stanza)",
     )
-    print("-" * 60)
+    ap.add_argument("--runner", choices=["docker", "local"], default=None)
+    ap.add_argument("--timeout", type=int, default=4 * 3600)
+    ap.add_argument(
+        "--extrapolate", type=int, default=None, help="nº de UCE de un corpus mayor"
+    )
+    ap.add_argument("--out", default=str(DIAG_DIR / "uce_size_bench.json"))
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
 
-    seg_times = {}
-    coref_times = {}
-    for uce_val in uce_values:
-        times_list = results[uce_val]
-        seg = [t.get("segmentation", 0) for t in times_list if "segmentation" in t]
-        coref = [t.get("coref", 0) for t in times_list if "coref" in t]
-        total = [t.get("total", 0) for t in times_list]
-
-        seg_avg = sum(seg) / len(seg) if seg else 0
-        coref_avg = sum(coref) / len(coref) if coref else 0
-        total_avg = sum(total) / len(total)
-        total_var = (
-            (sum((t - total_avg) ** 2 for t in total) / len(total)) ** 0.5
-            if len(total) > 1
-            else 0
+    runner = detect_runner(a.runner)
+    rows = []
+    for s in a.sizes:
+        print(f"\n── uce_target_size={s} ──")
+        flags = ["--force", "--bench", "--uce-target-size", str(s)] + (
+            ["--bench-coref"] if a.coref else []
         )
+        text = run_to_log(
+            workflow_cmd(runner, *flags),
+            DIAG_DIR / f"bench_uce{s}.log",
+            a.timeout,
+            a.dry_run,
+        )
+        if a.dry_run or text is None:
+            continue
+        b = parse_bench(text)
+        if "n_uces" not in b:
+            print("  ✗ sin líneas [BENCH]: ¿se aplicó el parche a main_workflow.py?")
+            continue
+        rows.append({"size": s, **b})
+        print("  " + ", ".join(f"{k}={v:g}" for k, v in b.items()))
+    if not rows:
+        return
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(a.out, "w", encoding="utf-8") as fh:
+        json.dump(rows, fh, indent=1)
 
+    print("\n" + "=" * 72)
+    print(
+        f"{'size':>5} {'n_UCE':>6} {'pal/UCE':>8} {'seg_s':>7} {'lem_s':>7} {'coref_s':>8}"
+    )
+    for r in rows:
         print(
-            f"{uce_val:<15} {seg_avg:<10.1f} {coref_avg:<10.1f} {total_avg:<10.1f} {total_var:<10.2f}"
+            f"{r['size']:5d} {r['n_uces']:6.0f} {r['mean_words_per_uce']:8.1f} "
+            f"{r.get('seg_seconds', 0):7.1f} {r.get('lemmatize_seconds', 0):7.1f} {r.get('coref_seconds', float('nan')):8.1f}"
         )
-        seg_times[uce_val] = seg_avg
-        coref_times[uce_val] = coref_avg
-
-    print("\n" + "=" * 70)
-    print("ANÁLISIS:")
-
-    # ¿Crece lineal el coste de seg?
-    if len(seg_times) >= 2:
-        sorted_vals = sorted(seg_times.items())
-        delta_uce = sorted_vals[-1][0] - sorted_vals[0][0]
-        delta_seg = sorted_vals[-1][1] - sorted_vals[0][1]
-        if delta_seg > 0:
-            rate = delta_seg / delta_uce
-            print(f"Tasa de crecimiento (segmentación): {rate:.3f}s per uce_unit")
-
-    # ¿El ruido es significativo?
-    all_vars = []
-    for uce_val in uce_values:
-        times_list = results[uce_val]
-        total = [t.get("total", 0) for t in times_list]
-        if len(total) > 1:
-            avg = sum(total) / len(total)
-            var = (sum((t - avg) ** 2 for t in total) / len(total)) ** 0.5
-            all_vars.append(var)
-            if var / avg > 0.05:  # >5% CV
-                print(f"⚠ Ruido alto en uce={uce_val}: CV={100 * var / avg:.1f}%")
-
-    if all_vars:
-        avg_var = sum(all_vars) / len(all_vars)
-        print(f"Ruido promedio: {avg_var:.1f}s (CV={100 * avg_var / 20:.1f}%)")
-
-    # Guardar
-    with open(args.out, "w") as fh:
-        fh.write("uce_target_size\trepeat\tseg_time\tcoref_time\ttotal_time\n")
-        for uce_val in uce_values:
-            for rep, times in enumerate(results[uce_val]):
-                fh.write(
-                    f"{uce_val}\t{rep}\t"
-                    f"{times.get('segmentation', 'NA')}\t"
-                    f"{times.get('coref', 'NA')}\t"
-                    f"{times.get('total', 'NA')}\n"
+    print(
+        f"\nALCESTE 2012 (mismo corpus): size={ALCESTE_REF['uce_size']} -> {ALCESTE_REF['n_uce']} UCE."
+    )
+    near = min(rows, key=lambda r: abs(r["n_uces"] - ALCESTE_REF["n_uce"]))
+    print(
+        f"Tamaño cuyo nº de UCE se parece más al de ALCESTE: {near['size']} ({near['n_uces']:.0f} UCE)."
+    )
+    if a.extrapolate:
+        for key in ("seg_seconds", "lemmatize_seconds", "coref_seconds"):
+            pts = [(r["n_uces"], r[key]) for r in rows if key in r]
+            f = linfit([p[0] for p in pts], [p[1] for p in pts])
+            if f:
+                print(
+                    f"  {key}: ~{f[0] * a.extrapolate + f[1]:.0f}s para {a.extrapolate} UCE (ajuste lineal, ≥2 puntos)"
                 )
-
-    print(f"\n→ Datos completos en: {args.out}")
-    print("\nPara modelar uce_target_size en el optimizador:")
-    print(
-        f"  - Coste unitario de segmentación: ~{seg_times.get(sorted(seg_times.keys())[0], 0):.1f}s"
-    )
-    print(
-        f"  - Coste unitario de coref: ~{coref_times.get(sorted(coref_times.keys())[0], 0):.1f}s/ctx"
-    )
-    print(f"  - Ruido de proceso: ~{all_vars[0] if all_vars else 0:.1f}s")
+    print(f"\nResultados: {a.out}")
 
 
 if __name__ == "__main__":

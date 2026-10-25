@@ -26,8 +26,8 @@ COPY requirements.txt .
 RUN pip install --upgrade pip setuptools wheel \
     && pip install -r requirements.txt
 
-# ── spaCy model ───────────────────────────────────────────────────────
-RUN python -m spacy download es_core_news_lg
+# ── spaCy model ───────────────────────────────────────────────
+RUN python -m spacy download es_core_news_lg==3.7.0
 
 # ── NLTK data ─────────────────────────────────────────────────────────
 RUN python -c "import nltk; nltk.download('punkt', quiet=True)"
@@ -46,4 +46,4 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
     CMD python -c "import reii" || exit 1
 
 CMD ["streamlit", "run", "src/reii/dashboard.py", \
-     "--server.address=0.0.0.0", "--server.port=8501"]
+    "--server.address=0.0.0.0", "--server.port=8501"]

@@ -1174,7 +1174,7 @@ def _cached_corpus_search(
                     "matched_terms": [],
                     "match_count": 0,
                     "positions": {},
-                    "phi": _uce_phi_dict.get(uce.get("id", ""), 0.0),
+                    "phi": _uce_phi_dict.get(uce.get("id", "")) or 0.0,
                 }
             )
             continue
@@ -1197,7 +1197,7 @@ def _cached_corpus_search(
                 "matched_terms": matched,
                 "match_count": mc,
                 "positions": positions,
-                "phi": _uce_phi_dict.get(uce.get("id", ""), 0.0),
+                "phi": _uce_phi_dict.get(uce.get("id", "")) or 0.0,
             }
         )
     if not terms:
@@ -7225,10 +7225,13 @@ def build_isotopy_data(
                 tl = u.get("texto", "").lower()
                 hits = [t for t in it if t.lower() in ll or t.lower() in tl]
                 if hits:
+                    phi_val = _uce_phi_dict.get(u["id"])
                     mc.append(
                         {
                             "id": u["id"][:12],
-                            "phi": round(_uce_phi_dict.get(u["id"], 0.0), 3),
+                            "phi": round(float(phi_val), 3)
+                            if phi_val is not None
+                            else 0.0,
                             "txt": u.get("texto", ""),
                             "hits": hits,
                         }
@@ -7258,10 +7261,13 @@ def build_isotopy_data(
                     continue
                 hits = [t for t in ev_t if t.lower() in u.get("texto", "").lower()]
                 if hits:
-                    mu.append(
+                    phi_val = _uce_phi_dict.get(u["id"])
+                    mc.append(
                         {
                             "id": u["id"][:12],
-                            "phi": round(_uce_phi_dict.get(u["id"], 0.0), 3),
+                            "phi": round(float(phi_val), 3)
+                            if phi_val is not None
+                            else 0.0,
                             "txt": u.get("texto", ""),
                             "hits": hits,
                         }
@@ -7450,7 +7456,7 @@ def unified_kwic_search(uces_list, filter_terms, cluster_id, color):
             continue
         txt = u.get("texto", "")
         uid = u.get("id", "?")[:8]
-        phi = uce_phi_dict.get(u.get("id", ""), 0.0)
+        phi = uce_phi_dict.get(u.get("id", "")) or 0.0
         for term in filter_terms:
             for m in re.finditer(re.escape(term), txt, re.IGNORECASE):
                 left_ctx = txt[max(0, m.start() - 80) : m.start()]
@@ -11699,7 +11705,7 @@ def _render_tab_c():
                     continue
                 max_phi = max(
                     [
-                        uce_phi_dict.get(u["id"], 0.0)
+                        uce_phi_dict.get(u["id"]) or 0.0
                         for u in uc_uces
                         if u.get("cluster_id") == cur_c
                     ],
@@ -11729,7 +11735,7 @@ def _render_tab_c():
                     """
                     for u in uc_uces:
                         c = u.get("cluster_id")
-                        phi = uce_phi_dict.get(u["id"], 0.0)
+                        phi = uce_phi_dict.get(u["id"]) or 0.0
                         raw_text = u.get("texto", "")
                         if c == cur_c:
                             hl_terms = (
@@ -11833,7 +11839,7 @@ def _render_tab_c():
                 for idx, uid in enumerate(doc_uce_ids):
                     u = uce_lookup.get(uid, {})
                     cid = u.get("cluster_id")
-                    phi = uce_phi_dict.get(uid, 0.0)
+                    phi = uce_phi_dict.get(uid) or 0.0
                     if cid is not None and cid >= 0:
                         flat_colors.append(class_colors.get(cid, T["accent"]))
                         flat_hover.append(
@@ -11899,7 +11905,7 @@ def _render_tab_c():
                     if not u:
                         continue
                     cid = u.get("cluster_id")
-                    phi = uce_phi_dict.get(uid, 0.0)
+                    phi = uce_phi_dict.get(uid) or 0.0
                     txt = u.get("texto", "")
                     # Choose border and text color based on cluster (or neutral for unclassified)
                     if cid is not None and cid >= 0:
