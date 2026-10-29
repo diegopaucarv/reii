@@ -1,0 +1,998 @@
+#!/usr/bin/env python3
+"""
+Script 9 - Auditor de la seleccion de metodo (A / B / C) persistida.
+
+Pregunta 1 (heredada): la eleccion automatica de metodo, SE MANTIENE? Si con el
+mismo corpus el ganador cambia al mover uce_target_size, la eleccion no es
+identificable: es un artefacto de la segmentacion, no una propiedad de los
+datos.
+
+Pregunta 2 (contrato audit-v4): el payload persistido es COHERENTE con la regla
+vigente y con las metricas que lo justifican? Se verifican siete invariantes y
+cada una se marca [ok] / [!] / [X]:
+
+  1. reproducibilidad   recalcular select_method desde all_metrics da el ganador
+  2. motivo de descarte el motivo persistido coincide con _feasibility vigente
+  3. denominador        a sobre UCEs asignadas; n_assigned/n_total cuadran
+  4. backend            method_c_backend valido; hdbscan (diagnostico) no gana
+  5. abstencion         winner=None es legitimo; abstained=true con winner no
+  6. no interseccion    sin campos de estabilidad conjunta (agreement_sym, ...)
+  7. trazabilidad       fingerprint + n_uces + written_at + best_params.json
+
+La regla NO se reimplementa aqui: la viabilidad y el umbral de dominancia se
+importan de reii.method_selection (_feasibility / select_method). El umbral
+efectivo se lee del payload y su escala ('corpus' = c, 'assigned' = a) se
+deduce por capacidad del modulo (MethodMetrics.dominance_corpus), no por una
+copia de la formula. Ver docs/design_v5/AUDIT_V4.md.
+
+Fuente de datos (no recalcula particiones):
+  * data/method_selection_log.jsonl  -> una linea JSON por corrida.
+  * data/method_selection.json       -> snapshot de la ultima corrida.
+  * data/best_params.json            -> solo mtime/size, para trazar el origen.
+
+Uso (dentro del contenedor: necesita data/ montado, no la raiz):
+  docker compose --profile batch run --rm workflow python -u src/9_selection_audit.py
+  ... --history data/method_selection_log.jsonl --json data/diag/selection_audit.json
+  ... --json              # maquina: solo JSON a stdout (exit != 0 con --strict)
+  ... --strict            # sale con 1 si hay [X] o el ganador cambia por corpus
+
+Salida: tabla ASCII + veredicto. Sin emojis ni box-drawing (consola cp1252).
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import math
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from reii.config import BEST_PARAMS_PATH, DATA_DIR
+from reii.method_selection import (
+    RULE_VERSION,
+    MethodMetrics,
+    Selection,
+    _feasibility,
+    audit_history,
+    audit_text,
+    read_history,
+    select_method,
+)
+
+#: Marca de contrato: audit_smoke.py la usa para saber si el diff esta aplicado.
+AUDIT_CONTRACT = "audit-v4"
+
+DEFAULT_HISTORY = DATA_DIR / "method_selection_log.jsonl"
+DEFAULT_SNAPSHOT = DATA_DIR / "method_selection.json"
+DEFAULT_BEST_PARAMS = Path(BEST_PARAMS_PATH)
+
+#: Backends del paso denso de Method C (docs/design_v5/BACKEND_C.md, seccion 1).
+ALLOWED_BACKENDS = ("hdbscan", "dense_cdh", "ward", "kmeans_spherical")
+#: Backends sin -1 por contrato: n_noise == 0 y n_assigned == len(uce_ids).
+DENSE_BACKENDS = ("dense_cdh", "ward", "kmeans_spherical")
+
+#: Campos que la regla ya no usa. Si aparecen, el payload es de la epoca de las
+#: intersecciones y hay que avisar (no es un error de esta regla).
+LEGACY_KEYS = (
+    "agreement_sym",
+    "triple_intersection",
+    "n_intersection",
+    "intersection_size",
+    "votes",
+)
+LEGACY_MODES = ("all", "two_of_three", "wc_coref", "wc_emb", "coref_emb", "sim_emb")
+
+INVARIANT_ORDER = (
+    "reproducibility",
+    "discard_reason",
+    "denominator",
+    "backend_coherente",
+    "abstention",
+    "no_intersection",
+    "traceability",
+)
+INVARIANT_SHORT = {
+    "reproducibility": "repro",
+    "discard_reason": "motivo",
+    "denominator": "denom",
+    "backend_coherente": "back",
+    "abstention": "abst",
+    "no_intersection": "inter",
+    "traceability": "traza",
+}
+
+#: Tolerancia de la aritmetica del denominador (redondeo de serializacion).
+DENOM_TOL = 2e-3
+
+_RANK = {"ok": 0, "warn": 1, "fail": 2}
+_TAG = {"ok": "[ok]", "warn": "[!]", "fail": "[X]"}
+_CELL = {"ok": "ok", "warn": "!", "fail": "X"}
+
+_METRIC_FIELDS = tuple(f.name for f in dataclasses.fields(MethodMetrics))
+
+#: Escala del umbral de dominancia segun lo que EXPONE el modulo, no segun una
+#: copia de la formula: con select-v4 (GATE_NOISE.md) existe
+#: MethodMetrics.dominance_corpus y el umbral aplica sobre c (fraccion del
+#: corpus); con select-v3 el umbral persistido aplica sobre a (asignadas).
+_THRESHOLD_SCALE = "corpus" if hasattr(MethodMetrics, "dominance_corpus") else "assigned"
+
+
+def _utf8_stdout() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
+def _load_snapshot(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _as_float(value: Any, default: float = float("nan")) -> float:
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _finite(value: float) -> bool:
+    return isinstance(value, float) and math.isfinite(value)
+
+
+def _worst(statuses: Sequence[str]) -> str:
+    out = "ok"
+    for status in statuses:
+        if _RANK.get(status, 0) > _RANK[out]:
+            out = status
+    return out
+
+
+def _threshold_scale() -> str:
+    return _THRESHOLD_SCALE
+
+
+def _default_gate() -> float:
+    """Umbral de dominancia por defecto del modulo (no se cablea aqui)."""
+    blank = Selection(None, float("nan"), float("nan"), 0)
+    return float(blank.max_class_share_max)
+
+
+def _metric_from_row(row: Any) -> Optional[MethodMetrics]:
+    """Reconstruye MethodMetrics desde una fila persistida.
+
+    Filtra por los campos reales del dataclass, asi que es compatible con
+    payloads de select-v3 (sin diagnostic_only) y de select-v4 (con el).
+    """
+    if not isinstance(row, dict) or not row.get("method"):
+        return None
+    data = {k: v for k, v in row.items() if k in _METRIC_FIELDS}
+    data["k"] = _as_int(data.get("k")) or 0
+    data["ari"] = _as_float(data.get("ari"))
+    data["coverage"] = _as_float(data.get("coverage"), 0.0)
+    for key in ("noise_frac", "tiny_frac", "max_class_share", "median_class_size"):
+        data[key] = _as_float(data.get(key), 0.0)
+    if data.get("assigned_frac") is not None:
+        data["assigned_frac"] = _as_float(data.get("assigned_frac"))
+    if "min_class_size" in data:
+        data["min_class_size"] = _as_int(data.get("min_class_size")) or 0
+    if "diagnostic_only" in data:
+        data["diagnostic_only"] = bool(data["diagnostic_only"])
+    data["available"] = bool(data.get("available", True))
+    data["perturbation"] = str(data.get("perturbation") or "")
+    try:
+        return MethodMetrics(**data)
+    except TypeError:
+        return None
+
+
+def _thresholds(sel: Dict[str, Any]) -> Dict[str, Any]:
+    raw = sel.get("k_bounds") or (3, 20)
+    if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+        lo, hi = _as_int(raw[0]), _as_int(raw[1])
+    else:
+        lo, hi = 3, 20
+    return {
+        "margin": _as_float(sel.get("margin"), 0.02),
+        "coverage_floor": _as_float(sel.get("coverage_floor"), 0.15),
+        "k_bounds": (lo if lo is not None else 3, hi if hi is not None else 20),
+        "min_class_share": _as_float(sel.get("min_class_share"), 0.01),
+        "noise_max": _as_float(sel.get("noise_max"), 0.50),
+        "max_class_share_max": _as_float(sel.get("max_class_share_max")),
+    }
+
+
+def _dominance_value(metric: MethodMetrics) -> float:
+    """c = clase mayor / n_total, tal como lo expone el modulo (no se copia)."""
+    try:
+        return _as_float(getattr(metric, "dominance_corpus", None))
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _replay(
+    sel: Dict[str, Any],
+    thresholds: Dict[str, Any],
+    same_rule: bool,
+) -> Optional[Selection]:
+    """Recalcula la regla con las metricas persistidas. None si no se puede."""
+    rows = sel.get("all_metrics") or []
+    metrics = [m for m in (_metric_from_row(r) for r in rows) if m is not None]
+    if not metrics:
+        return None
+    kwargs: Dict[str, Any] = {
+        "margin": thresholds["margin"],
+        "coverage_floor": thresholds["coverage_floor"],
+        "k_bounds": thresholds["k_bounds"],
+        "min_class_share": thresholds["min_class_share"],
+        "noise_max": thresholds["noise_max"],
+    }
+    gate = thresholds["max_class_share_max"]
+    # Solo se reutiliza el umbral persistido si el payload es de esta misma
+    # generacion de regla; si no, manda el default del modulo.
+    if same_rule and _finite(gate):
+        kwargs["max_class_share_max"] = gate
+    return select_method(metrics, **kwargs)
+
+
+def _reason_family(text: str) -> str:
+    """Familia del motivo, para comparar texto persistido con texto vigente."""
+    low = str(text or "").lower()
+    if "domin" in low:
+        return "dominance"
+    if "ruido" in low or "noise" in low:
+        return "noise"
+    if "fuera de [" in low or low.startswith("k="):
+        return "k_bounds"
+    if "coverage" in low:
+        return "coverage"
+    if "ari" in low:
+        return "ari"
+    if "particion" in low:
+        return "unavailable"
+    return "other"
+
+
+def _backend_of(
+    ctx: Dict[str, Any], sel: Dict[str, Any], row: Dict[str, Any]
+) -> Tuple[Optional[str], str]:
+    """Backend de Method C en orden de autoridad: fila > selection > context."""
+    candidates = (
+        ("metric.backend", row.get("backend")),
+        ("metric.method_c_backend", row.get("method_c_backend")),
+        ("selection.method_c_backend", sel.get("method_c_backend")),
+        ("context.method_c_backend", ctx.get("method_c_backend")),
+    )
+    for source, value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower(), source
+    return None, ""
+
+
+def _best_params_info(path: Path) -> Dict[str, Any]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return {"path": str(path), "exists": False, "mtime": None, "size": None}
+    return {
+        "path": str(path),
+        "exists": True,
+        "mtime": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+        "size": int(stat.st_size),
+    }
+
+
+def _iso(value: Any) -> Optional[datetime]:
+    try:
+        out = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return out if out.tzinfo else out.replace(tzinfo=timezone.utc)
+
+
+def _check_record(
+    record: Dict[str, Any],
+    best_params: Path,
+    gate_default: float,
+) -> Dict[str, Any]:
+    """Verifica las siete invariantes de UNA corrida persistida."""
+    if not isinstance(record, dict):
+        record = {}
+    ctx = record.get("context")
+    ctx = ctx if isinstance(ctx, dict) else {}
+    sel = record.get("selection")
+    sel = sel if isinstance(sel, dict) else {}
+    rows = [r for r in (sel.get("all_metrics") or []) if isinstance(r, dict)]
+    metrics = [m for m in (_metric_from_row(r) for r in rows) if m is not None]
+    by_method = {m.method: m for m in metrics}
+    row_by_method: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        if row.get("method"):
+            row_by_method.setdefault(str(row["method"]), row)
+    c_row = row_by_method.get("C") or {}
+
+    checks: List[Dict[str, str]] = []
+
+    def add(ident: str, status: str, detail: str = "") -> None:
+        checks.append({"id": ident, "status": status, "detail": detail})
+
+    stored_rule = str(sel.get("rule_version") or record.get("rule_version") or "")
+    same_rule = bool(stored_rule) and stored_rule == RULE_VERSION
+    thresholds = _thresholds(sel)
+    persisted_gate = thresholds["max_class_share_max"]
+    gate = persisted_gate if (same_rule and _finite(persisted_gate)) else float(gate_default)
+
+    winner_raw = sel.get("winner")
+    winner = None if winner_raw in (None, "", "null") else str(winner_raw)
+    abstained = bool(sel.get("abstained"))
+    reason = str(sel.get("reason") or "")
+
+    # ── 4. backend coherente ─────────────────────────────────────────────
+    backend, backend_source = _backend_of(ctx, sel, c_row)
+    diag_raw = c_row.get("diagnostic_only")
+    if isinstance(diag_raw, bool):
+        diagnostic: Optional[bool] = diag_raw
+    elif diag_raw is not None:
+        diagnostic = str(diag_raw).strip().lower() in ("1", "true", "yes", "si")
+    else:
+        diagnostic = None
+    effective_diag = diagnostic if diagnostic is not None else (
+        backend == "hdbscan" if backend else None
+    )
+    if backend is None:
+        add(
+            "backend_coherente",
+            "warn",
+            "sin method_c_backend/backend: coherencia no verificable (claves nuevas)",
+        )
+    elif backend not in ALLOWED_BACKENDS:
+        add(
+            "backend_coherente",
+            "fail",
+            f"backend '{backend}' no esta en {list(ALLOWED_BACKENDS)}",
+        )
+    else:
+        detail = (
+            f"backend={backend} ({backend_source}) "
+            f"diagnostic_only={str(bool(effective_diag)).lower()}"
+        )
+        dense_noise = _as_float(c_row.get("noise_frac"), 0.0)
+        if winner == "C" and effective_diag:
+            add(
+                "backend_coherente",
+                "fail",
+                detail
+                + ": ganador C con backend de diagnostico"
+                " (hdbscan no puede ganar; ver BACKEND_C.md)",
+            )
+        elif winner == "C" and backend in DENSE_BACKENDS:
+            add("backend_coherente", "ok", detail + ": ganador C con backend denso")
+        elif backend in DENSE_BACKENDS and dense_noise > 0.0:
+            add(
+                "backend_coherente",
+                "warn",
+                detail
+                + f": backend denso con noise_frac={dense_noise:.3f}"
+                " (contrato: n_noise=0)",
+            )
+        else:
+            add("backend_coherente", "ok", detail)
+
+    # ── 1. reproducibilidad ──────────────────────────────────────────────
+    replay = _replay(sel, thresholds, same_rule)
+    if replay is None:
+        add(
+            "reproducibility",
+            "warn",
+            "sin all_metrics reconstruibles: no se puede recalcular select_method",
+        )
+    elif same_rule:
+        if replay.winner == winner:
+            add(
+                "reproducibility",
+                "ok",
+                f"{winner or 'abstencion'} reproducido con las metricas persistidas",
+            )
+        else:
+            why = "; ".join(
+                f"{d.get('method')}: {d.get('why')}" for d in (replay.discarded or [])
+            )
+            add(
+                "reproducibility",
+                "fail",
+                f"persistido={winner or 'abstencion'}"
+                f" -> recalculado={replay.winner or 'abstencion'}"
+                + (f" (descartes recalculados: {why})" if why else ""),
+            )
+    else:
+        msg = (
+            f"payload {stored_rule or '?'} auditado con {RULE_VERSION}:"
+            f" persistido={winner or 'abstencion'}"
+            f" actual={replay.winner or 'abstencion'}"
+        )
+        if replay.winner != winner:
+            msg += "; la decision NO se sostiene con la regla vigente"
+        add("reproducibility", "warn", msg)
+
+    # ── 2. motivo de descarte consistente ────────────────────────────────
+    persisted_disc: Dict[str, str] = {}
+    for item in sel.get("discarded") or []:
+        if isinstance(item, dict) and item.get("method"):
+            persisted_disc[str(item["method"])] = str(item.get("why") or "")
+    issues: List[Tuple[str, str]] = []
+    if not metrics:
+        add("discard_reason", "warn", "sin all_metrics: motivos no verificables")
+    else:
+        for method in sorted(by_method):
+            why_now = _feasibility(
+                by_method[method],
+                thresholds["coverage_floor"],
+                thresholds["k_bounds"],
+                thresholds["noise_max"],
+                gate,
+            )
+            why_saved = persisted_disc.get(method)
+            if why_now and why_saved:
+                if _reason_family(why_now) != _reason_family(why_saved):
+                    issues.append(
+                        (
+                            "warn",
+                            f"{method}: motivo persistido '{why_saved}'"
+                            f" != vigente '{why_now}'",
+                        )
+                    )
+            elif why_now and not why_saved:
+                issues.append(
+                    (
+                        "warn",
+                        f"{method}: la regla vigente lo descartaria ({why_now});"
+                        " el payload no lo registro",
+                    )
+                )
+            elif why_saved and not why_now:
+                issues.append(
+                    (
+                        "fail",
+                        f"{method}: descartado en el payload ('{why_saved}')"
+                        " pero viable para la regla vigente",
+                    )
+                )
+        for method in sorted(persisted_disc):
+            if _reason_family(persisted_disc[method]) != "dominance":
+                continue
+            metric = by_method.get(method)
+            if metric is None:
+                issues.append(
+                    ("warn", f"{method}: descarte por dominancia sin metricas")
+                )
+                continue
+            scale = _threshold_scale()
+            value = (
+                _dominance_value(metric)
+                if scale == "corpus"
+                else _as_float(metric.max_class_share, 0.0)
+            )
+            label = "c" if scale == "corpus" else "a"
+            if not _finite(value):
+                issues.append(
+                    ("warn", f"{method}: descarte por dominancia sin {label} calculable")
+                )
+            elif _finite(gate) and value <= gate:
+                issues.append(
+                    (
+                        "fail",
+                        f"{method}: descartado por dominancia pero"
+                        f" {label}={value:.3f} <= umbral {gate:.2f}",
+                    )
+                )
+        add(
+            "discard_reason",
+            _worst([s for s, _ in issues]),
+            "; ".join(m for _, m in issues)
+            if issues
+            else "motivos persistidos consistentes con la regla vigente",
+        )
+
+    # ── 3. denominador ───────────────────────────────────────────────────
+    n_total = _as_int(ctx.get("n_uces"))
+    denom: List[Tuple[str, str]] = []
+    verifiable = False
+    for method in sorted(by_method):
+        metric = by_method[method]
+        row = row_by_method.get(method) or {}
+        a = _as_float(metric.max_class_share, 0.0)
+        nu = _as_float(metric.noise_frac, 0.0)
+        assigned_frac = _as_float(metric.assigned_frac)
+        if _finite(assigned_frac) and abs(assigned_frac - (1.0 - nu)) > DENOM_TOL:
+            denom.append(
+                (
+                    "fail",
+                    f"{method}: assigned_frac={assigned_frac:.3f}"
+                    f" != 1-noise_frac={1.0 - nu:.3f}",
+                )
+            )
+        n_assigned = _as_int(row.get("n_assigned"))
+        n_noise = _as_int(row.get("n_noise"))
+        s_max = _as_int(row.get("max_class_size"))
+        if s_max is None:
+            s_max = _as_int(row.get("s_max"))
+        if n_assigned is None and s_max is None:
+            continue
+        verifiable = True
+        if n_assigned is not None:
+            if n_assigned <= 0:
+                denom.append(("fail", f"{method}: n_assigned={n_assigned} <= 0"))
+            if n_total:
+                if n_noise is not None and n_assigned + n_noise != n_total:
+                    if n_assigned + n_noise == n_total - 1:
+                        denom.append(
+                            (
+                                "fail",
+                                f"{method}: n_assigned+n_noise={n_assigned + n_noise}"
+                                f" != n_total={n_total}"
+                                " (denominador resta un -1 de mas)",
+                            )
+                        )
+                    else:
+                        denom.append(
+                            (
+                                "fail",
+                                f"{method}: n_assigned+n_noise={n_assigned + n_noise}"
+                                f" != n_total={n_total}",
+                            )
+                        )
+                expected = int(round(n_total * (1.0 - nu)))
+                if abs(n_assigned - expected) > 1:
+                    denom.append(
+                        (
+                            "fail",
+                            f"{method}: n_assigned={n_assigned}"
+                            f" != round(n_total*(1-noise))={expected}",
+                        )
+                    )
+        if s_max is not None and n_assigned:
+            a_assigned = s_max / float(n_assigned)
+            if abs(a - a_assigned) > DENOM_TOL:
+                if n_total and abs(a - s_max / float(n_total)) <= DENOM_TOL:
+                    denom.append(
+                        (
+                            "fail",
+                            f"{method}: a={a:.4f}=s_max/n_total; el gate divide"
+                            f" por asignadas ({s_max}/{n_assigned}={a_assigned:.4f})",
+                        )
+                    )
+                else:
+                    denom.append(
+                        (
+                            "fail",
+                            f"{method}: a={a:.4f} != s_max/n_assigned={a_assigned:.4f}",
+                        )
+                    )
+            if n_total:
+                c_identity = a * (1.0 - nu)
+                c_true = s_max / float(n_total)
+                if abs(c_identity - c_true) > DENOM_TOL:
+                    denom.append(
+                        (
+                            "fail",
+                            f"{method}: c=a*(1-nu)={c_identity:.4f}"
+                            f" != s_max/n_total={c_true:.4f}"
+                            " (identidad rota: particiones distintas)",
+                        )
+                    )
+    if not verifiable:
+        add(
+            "denominator",
+            "warn",
+            "sin n_assigned/n_noise/max_class_size: aritmetica del denominador"
+            " no verificable (claves nuevas)",
+        )
+    else:
+        add(
+            "denominator",
+            _worst([s for s, _ in denom]),
+            "; ".join(m for _, m in denom)
+            if denom
+            else "a sobre UCEs asignadas; n_assigned+n_noise=n_total",
+        )
+
+    # ── 5. abstencion ────────────────────────────────────────────────────
+    if winner is None and abstained:
+        if reason:
+            add("abstention", "ok", f"abstencion legitima: {reason}")
+        else:
+            add("abstention", "warn", "abstencion sin motivo declarado: no auditable")
+    elif winner is None:
+        add(
+            "abstention",
+            "warn",
+            "winner=null sin abstained=true (payload legado o inconsistente)",
+        )
+    elif abstained:
+        add("abstention", "fail", f"abstained=true con winner={winner}: contradiccion")
+    else:
+        add("abstention", "ok", f"winner={winner}, abstained=false")
+
+    # ── 6. no interseccion ───────────────────────────────────────────────
+    legacy = {k for k in LEGACY_KEYS if k in sel or k in ctx or k in record}
+    for blob in [sel] + rows:
+        legacy |= {
+            str(k)
+            for k in blob
+            if str(k) in LEGACY_KEYS or str(k).startswith("stable_cross")
+        }
+    mode = str(ctx.get("mode") or record.get("mode") or "")
+    if legacy:
+        add(
+            "no_intersection",
+            "warn",
+            f"campos legados {sorted(legacy)}: el pipeline ya no exige"
+            " estabilidad conjunta (se elige UN metodo)",
+        )
+    elif mode in LEGACY_MODES:
+        add(
+            "no_intersection",
+            "warn",
+            f"mode='{mode}' es un modo de interseccion legado",
+        )
+    else:
+        add("no_intersection", "ok", "sin campos de interseccion; un solo metodo")
+
+    # ── 7. trazabilidad ──────────────────────────────────────────────────
+    fingerprint = ctx.get("corpus_fingerprint") or ctx.get("spec") or record.get("spec")
+    spec_hash = (
+        ctx.get("spec_hash")
+        or ctx.get("params_hash")
+        or ctx.get("best_params_sha256")
+    )
+    written_at = ctx.get("written_at")
+    trace: List[Tuple[str, str]] = []
+    if not fingerprint:
+        trace.append(
+            ("fail", "sin corpus_fingerprint ni spec: corrida no atribuible")
+        )
+    if not n_total:
+        trace.append(("warn", "sin n_uces en el context"))
+    if not written_at:
+        trace.append(("warn", "sin written_at en el context"))
+    if not spec_hash:
+        trace.append(("warn", "sin spec_hash: la corrida no se identifica por spec"))
+    bp_info = _best_params_info(best_params)
+    if not bp_info.get("exists"):
+        trace.append(("warn", f"{best_params.name} no existe: origen no trazable"))
+    else:
+        stamp = _iso(bp_info.get("mtime"))
+        when = _iso(written_at)
+        if stamp and when and stamp > when:
+            trace.append(
+                (
+                    "warn",
+                    f"{best_params.name} es MAS NUEVO que la seleccion"
+                    f" ({bp_info.get('mtime')} > {written_at}): decision obsoleta",
+                )
+            )
+    if trace:
+        add("traceability", _worst([s for s, _ in trace]), "; ".join(m for _, m in trace))
+    else:
+        add(
+            "traceability",
+            "ok",
+            f"fingerprint={fingerprint} n_uces={n_total}"
+            f" best_params={bp_info.get('mtime')}",
+        )
+
+    statuses = {c["id"]: c["status"] for c in checks}
+    if "fail" in statuses.values():
+        verdict = "violation"
+    elif winner is None and abstained:
+        verdict = "abstain"
+    else:
+        verdict = "select"
+
+    return {
+        "corpus": str(fingerprint or "?"),
+        "target": ctx.get("uce_target_size"),
+        "mode": ctx.get("mode"),
+        "written_at": written_at,
+        "rule_version": stored_rule or RULE_VERSION,
+        "winner": winner,
+        "backend": backend,
+        "diagnostic_only": effective_diag,
+        "threshold": {"value": gate, "scale": _threshold_scale()},
+        "dominance_corpus": _dominance_value(by_method["C"]) if "C" in by_method else None,
+        "checks": checks,
+        "verdict": verdict,
+    }
+
+
+def _snapshot_report(
+    path: Path, best_params: Path, gate_default: float
+) -> Dict[str, Any]:
+    snap = _load_snapshot(path)
+    info: Dict[str, Any] = {
+        "path": str(path),
+        "exists": snap is not None,
+        "context": {},
+        "selection": {},
+        "checks": [],
+        "verdict": None,
+        "backend": None,
+        "diagnostic_only": None,
+        "threshold": {"value": gate_default, "scale": _threshold_scale()},
+        "best_params": _best_params_info(best_params),
+    }
+    if not snap:
+        return info
+    ctx = snap.get("context") or {}
+    sel = snap.get("selection") or {}
+    info["context"] = dict(ctx) if isinstance(ctx, dict) else {}
+    if isinstance(sel, dict):
+        info["selection"] = {
+            k: sel.get(k)
+            for k in (
+                "winner",
+                "winner_k",
+                "winner_ari",
+                "winner_coverage",
+                "winner_usable_coverage",
+                "abstained",
+                "reason",
+                "rule_version",
+                "max_class_share_max",
+            )
+        }
+    checked = _check_record(snap, best_params, gate_default)
+    info["checks"] = checked["checks"]
+    info["verdict"] = checked["verdict"]
+    info["backend"] = checked["backend"]
+    info["diagnostic_only"] = checked["diagnostic_only"]
+    info["threshold"] = checked["threshold"]
+    return info
+
+
+def _build_report(
+    records: Sequence[Dict[str, Any]],
+    snapshot_path: Path,
+    best_params: Path,
+    gate_default: float,
+) -> Dict[str, Any]:
+    report = audit_history(records)
+    checked = [_check_record(rec, best_params, gate_default) for rec in records]
+    snap = _snapshot_report(snapshot_path, best_params, gate_default)
+    n_fail = sum(
+        1 for r in checked if any(c["status"] == "fail" for c in r["checks"])
+    )
+    n_warn = sum(
+        1 for r in checked if any(c["status"] == "warn" for c in r["checks"])
+    )
+    snap_fail = sum(1 for c in snap["checks"] if c.get("status") == "fail")
+    if n_fail or snap_fail:
+        verdict = "violation"
+    elif checked and all(r["verdict"] == "abstain" for r in checked):
+        verdict = "abstain"
+    else:
+        verdict = "select"
+    report.update(
+        {
+            "audit_contract": AUDIT_CONTRACT,
+            "rule_version": RULE_VERSION,
+            "threshold_scale": _threshold_scale(),
+            "effective_threshold": float(gate_default),
+            "records": checked,
+            "snapshot": snap,
+            "summary": {
+                "n_records": len(checked),
+                "n_fail": n_fail,
+                "n_warn": n_warn,
+                "snapshot_fail": snap_fail,
+                "verdict": verdict,
+            },
+        }
+    )
+    return report
+
+
+def _sanitize(value: Any) -> Any:
+    """NaN/Inf no son JSON valido: se emiten como null (igual que Selection)."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(k): _sanitize(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize(v) for v in value]
+    return value
+
+
+def _render_invariants(report: Dict[str, Any], limit: int) -> List[str]:
+    gate = report["effective_threshold"]
+    records = report["records"]
+    lines = [
+        "",
+        f"INVARIANTES ({AUDIT_CONTRACT} | regla vigente {report['rule_version']}"
+        f" | umbral efectivo {gate:.2f} sobre '{report['threshold_scale']}')",
+        "  {:>3}  {:16}  {:>4}  {:3}  {:14}  {:5} {:6} {:5} {:4} {:4} {:5} {:5}  {}".format(
+            "#",
+            "corpus",
+            "tgt",
+            "met",
+            "backend",
+            INVARIANT_SHORT["reproducibility"],
+            INVARIANT_SHORT["discard_reason"],
+            INVARIANT_SHORT["denominator"],
+            INVARIANT_SHORT["backend_coherente"],
+            INVARIANT_SHORT["abstention"],
+            INVARIANT_SHORT["no_intersection"],
+            INVARIANT_SHORT["traceability"],
+            "veredicto",
+        ),
+    ]
+    for idx, rec in enumerate(records[:limit], 1):
+        status = {c["id"]: c["status"] for c in rec["checks"]}
+        lines.append(
+            "  {:>3}  {:16}  {:>4}  {:3}  {:14}  {:5} {:6} {:5} {:4} {:4} {:5} {:5}  {}".format(
+                idx,
+                str(rec["corpus"])[:16],
+                str(rec["target"] if rec["target"] is not None else "?"),
+                str(rec["winner"] or "-"),
+                str(rec["backend"] or "-")[:14],
+                _CELL.get(status.get("reproducibility", "ok"), "?"),
+                _CELL.get(status.get("discard_reason", "ok"), "?"),
+                _CELL.get(status.get("denominator", "ok"), "?"),
+                _CELL.get(status.get("backend_coherente", "ok"), "?"),
+                _CELL.get(status.get("abstention", "ok"), "?"),
+                _CELL.get(status.get("no_intersection", "ok"), "?"),
+                _CELL.get(status.get("traceability", "ok"), "?"),
+                rec["verdict"],
+            )
+        )
+    details: List[str] = []
+    for idx, rec in enumerate(records[:limit], 1):
+        for check in rec["checks"]:
+            if check["status"] != "ok":
+                details.append(
+                    f"  {_TAG[check['status']]} #{idx} {check['id']}: {check['detail']}"
+                )
+    if len(records) > limit:
+        details.append(
+            f"  [!] {len(records) - limit} corrida(s) no mostradas (--limit {limit})"
+        )
+    lines.extend(details)
+    summary = report["summary"]
+    tag = "[X]" if summary["n_fail"] else ("[ok]" if not summary["n_warn"] else "[!]")
+    lines.append(
+        f"  {tag} {summary['n_fail']} [X] / {summary['n_warn']} [!]"
+        f" en {summary['n_records']} corrida(s); veredicto={summary['verdict']}"
+    )
+    return lines
+
+
+def _print_snapshot(info: Dict[str, Any]) -> None:
+    if not info.get("exists"):
+        return
+    ctx = info.get("context") or {}
+    sel = info.get("selection") or {}
+    threshold = info.get("threshold") or {}
+    gate = _as_float(threshold.get("value"))
+    gate_text = f"{gate:.2f}" if _finite(gate) else "?"
+    bp = info.get("best_params") or {}
+    print("")
+    print(f"ULTIMA CORRIDA ({ctx.get('written_at') or '?'})")
+    print(
+        f"  corpus={ctx.get('corpus_fingerprint')}  "
+        f"target={ctx.get('uce_target_size')}  n_uces={ctx.get('n_uces')}"
+    )
+    print(
+        f"  ganador={sel.get('winner')}  K={sel.get('winner_k')}  "
+        f"ARI={sel.get('winner_ari')}  coverage={sel.get('winner_coverage')}"
+    )
+    print(
+        f"  regla={sel.get('rule_version')}  backend={info.get('backend') or '?'}  "
+        f"diagnostico={str(bool(info.get('diagnostic_only'))).lower()}  "
+        f"umbral={gate_text} sobre '{threshold.get('scale')}'"
+    )
+    print(
+        "  best_params.json: "
+        + (f"mtime={bp.get('mtime')}" if bp.get("exists") else "no existe")
+        + f"  spec_hash={ctx.get('spec_hash') or '?'}"
+        + f"  invariantes={info.get('verdict') or '?'}"
+    )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    _utf8_stdout()
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--history", default=str(DEFAULT_HISTORY))
+    ap.add_argument("--snapshot", default=str(DEFAULT_SNAPSHOT))
+    ap.add_argument("--best-params", default=str(DEFAULT_BEST_PARAMS))
+    ap.add_argument(
+        "--json",
+        nargs="?",
+        const="-",
+        default=None,
+        help="sin valor (o '-') -> JSON a stdout; con ruta -> escribe el informe",
+    )
+    ap.add_argument(
+        "--limit", type=int, default=20, help="maximo de corridas impresas"
+    )
+    ap.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit 1 si hay [X] o el ganador cambia dentro de un mismo corpus",
+    )
+    args = ap.parse_args(list(argv) if argv is not None else None)
+
+    history = Path(args.history)
+    records = read_history(str(history))
+    if not records:
+        print(f"[X] sin historial en {history}")
+        print(
+            "    se llena al correr con --mode select "
+            "(una linea por corrida, append-only)"
+        )
+        return 2
+
+    report = _build_report(
+        records,
+        Path(args.snapshot),
+        Path(args.best_params),
+        _default_gate(),
+    )
+    machine = args.json == "-"
+    if not machine:
+        print(audit_text(records))
+        _print_snapshot(report["snapshot"])
+        print("\n".join(_render_invariants(report, max(1, int(args.limit)))))
+
+    if args.json:
+        text = json.dumps(
+            _sanitize(report), indent=2, ensure_ascii=True, sort_keys=True
+        )
+        if machine:
+            print(text)
+        else:
+            out = Path(args.json)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(text, encoding="utf-8")
+            print(f"\nResultados: {out}")
+
+    unstable = bool(report["instability"])
+    summary = report["summary"]
+    broken = int(summary["n_fail"]) + int(summary["snapshot_fail"])
+    if not machine:
+        print("")
+        if unstable:
+            print("VEREDICTO: la eleccion NO es estable -> no se persiste como decision.")
+        else:
+            print("VEREDICTO: eleccion estable en todos los targets medidos.")
+        if broken:
+            print(
+                f"[X] {summary['n_fail']} corrida(s) con invariantes rotas"
+                f" ({summary['snapshot_fail']} en el snapshot)."
+            )
+    if args.strict and (unstable or broken):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

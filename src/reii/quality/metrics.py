@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import warnings
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -647,4 +648,646 @@ def external_coherence(
             warnings.simplefilter("ignore")
             out["nmi"] = float(normalized_mutual_info_score(x, y))
             out["ari"] = float(adjusted_rand_score(x, y))
+    return out
+
+
+# ── Coherencia interna, diversidad de particion y RMSD de proporciones ──────
+
+
+def _row_normalize(X):
+    """Normaliza filas a norma unitaria (densa o dispersa), respetando ceros."""
+    if sparse.issparse(X):
+        X = X.tocsr().astype(float)
+        norms = np.sqrt(np.asarray(X.multiply(X).sum(axis=1)).ravel())
+        return sparse.diags(1.0 / np.where(norms > 0, norms, 1.0)) @ X
+    X = np.asarray(X, float)
+    norms = np.linalg.norm(X, axis=1)
+    return X / np.where(norms > 0, norms, 1.0)[:, None]
+
+
+def _cos_to_centroid(Xn, y, classes):
+    """Coseno al centroide de cada clase: por clase y por UCE, y n negativos."""
+    per_class: List[Tuple[int, float]] = []
+    per_item: List[float] = []
+    n_neg = 0
+    for cls in classes:
+        idx = np.flatnonzero(y == cls)
+        if len(idx) == 0:
+            continue
+        mu = np.asarray(Xn[idx].mean(axis=0)).ravel()
+        norm = float(np.linalg.norm(mu))
+        cos = (
+            np.zeros(len(idx))
+            if norm <= 0
+            else np.asarray(Xn[idx] @ (mu / norm)).ravel()
+        )
+        n_neg += int((cos < 0.0).sum())
+        cos = np.clip(cos, 0.0, 1.0)
+        per_class.append((len(idx), float(cos.mean())))
+        per_item.extend(cos.tolist())
+    return per_class, np.asarray(per_item, float), n_neg
+
+
+def internal_coherence(
+    matrix,
+    labels: Sequence[int],
+    space_id: str,
+    metric: str = "cosine",
+    max_pairwise: int = 1500,
+    n_boot: int = 500,
+    n_perm: int = 500,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """C_in: homogeneidad intra-clase medida en un espacio DECLARADO.
+
+    ``space_id`` es obligatorio: un C_in no significa nada sin decir en que
+    espacio se midio (embedding de 384d, perfiles chi2, tf-idf...). La funcion
+    no adivina el espacio: lo recibe y lo devuelve en el resultado.
+
+    Para cada clase ``C_k`` con ``n_k`` elementos y centroide normalizado
+    ``mu_k``, el score de la UCE ``i`` es ``max(0, cos(x_i, mu_k))`` (truncado
+    a [0,1]: un coseno negativo es anti-similitud y se reporta aparte en
+    ``frac_negative``). Se devuelven tres versiones:
+
+    ``cin``           media MACRO de las medias por clase (la del paper).
+    ``cin_weighted``  ponderada por tamano de clase.
+    ``cin_pairwise``  media de similitudes pairwise intra-clase (control del
+                      sesgo del centroide hacia arriba para clases pequenas).
+
+    En d alta el valor absoluto no es interpretable: se anade ``excess =
+    cin - null_mean``, donde el nulo permuta las etiquetas (preserva tamanos
+    de clase y espacio, rompe la asociacion UCE-clase). Reportar ``cin`` sin
+    ``excess`` no distingue "clases coherentes" de "corpus homogeneo".
+
+    ``ci_low``/``ci_high`` es el IC bootstrap de la media macro (sobre las K
+    medias de clase); ``ci_low_weighted``/``ci_high_weighted`` lo es de la
+    ponderada (sobre las n UCEs). Con K chico el IC macro es conservador por
+    construccion: se remuestrean K valores.
+
+    Ignora etiquetas < 0. Devuelve NaN (con ``n`` y ``k`` poblados) si hay
+    menos de 3 UCEs o menos de 2 clases.
+    """
+    from scipy import sparse  # noqa: F401  (import local: ver _row_normalize)
+
+    y = np.asarray(list(labels)).astype(int)
+    X_full = matrix if hasattr(matrix, "shape") else np.asarray(matrix, float)
+    if X_full.shape[0] != len(y):
+        raise ValueError("matrix y labels deben tener el mismo numero de filas")
+    keep = y >= 0
+    X = X_full[keep] if sparse.issparse(X_full) else np.asarray(X_full, float)[keep]
+    y = y[keep]
+    n = int(len(y))
+    classes = np.unique(y)
+    k = int(len(classes))
+    out: Dict[str, Any] = {
+        "cin": float("nan"),
+        "cin_weighted": float("nan"),
+        "cin_pairwise": float("nan"),
+        "space_id": space_id,
+        "metric": metric,
+        "n": n,
+        "k": k,
+        "ci_low": float("nan"),
+        "ci_high": float("nan"),
+        "ci_low_weighted": float("nan"),
+        "ci_high_weighted": float("nan"),
+        "frac_negative": float("nan"),
+        "null_mean": float("nan"),
+        "null_std": float("nan"),
+        "excess": float("nan"),
+        "z_score": float("nan"),
+        "p_value": float("nan"),
+    }
+    if n < 3 or k < 2:
+        return out
+    Xn = _row_normalize(X)
+    per_class, per_item, n_neg = _cos_to_centroid(Xn, y, classes)
+    if not per_class:
+        return out
+    coin = np.array([m for _, m in per_class])
+    counts = np.array([c for c, _ in per_class], float)
+    cin = float(coin.mean())
+    out["cin"] = cin
+    out["cin_weighted"] = float((counts * coin).sum() / counts.sum())
+    out["frac_negative"] = n_neg / float(n)
+    out["ci_low"], out["ci_high"] = bootstrap_ci(
+        coin, np.mean, n_boot=n_boot, seed=seed
+    )[1:]
+    out["ci_low_weighted"], out["ci_high_weighted"] = bootstrap_ci(
+        per_item, np.mean, n_boot=n_boot, seed=seed
+    )[1:]
+    # pairwise: O(n_c^2) por clase, con tope por clase
+    pair = []
+    for cls in classes:
+        idx = np.flatnonzero(y == cls)
+        if len(idx) < 2:
+            continue
+        if len(idx) > max_pairwise:
+            idx = np.random.default_rng(seed).choice(idx, max_pairwise, replace=False)
+        gram = Xn[idx] @ Xn[idx].T
+        sim = np.asarray(gram.todense()) if sparse.issparse(gram) else np.asarray(gram)
+        iu = np.triu_indices(len(idx), 1)
+        pair.append(float(np.clip(sim[iu], 0.0, 1.0).mean()))
+    if pair:
+        out["cin_pairwise"] = float(np.mean(pair))
+    # nulo: permutacion de etiquetas (rompe la asociacion UCE-clase)
+    rng = np.random.default_rng(seed)
+    nulls = np.empty(n_perm)
+    for i in range(n_perm):
+        pc, _, _ = _cos_to_centroid(Xn, rng.permutation(y), classes)
+        nulls[i] = float(np.mean([m for _, m in pc]))
+    std = float(nulls.std(ddof=1))
+    out["null_mean"] = float(nulls.mean())
+    out["null_std"] = std
+    out["excess"] = cin - out["null_mean"]
+    out["z_score"] = (cin - out["null_mean"]) / std if std > 0 else float("nan")
+    out["p_value"] = float((nulls >= cin).mean())
+    return out
+
+
+def _entropy_stats(y, k_ref: Optional[int] = None) -> Dict[str, float]:
+    """Entropia y tamanos de una particion; ``k_ref`` fija K en el denominador."""
+    counts = np.bincount(y)
+    counts = counts[counts > 0]
+    n = int(counts.sum())
+    p = counts / n
+    h = float(-(p * np.log(p)).sum())
+    k = int(len(p))
+    k_norm = int(k_ref) if k_ref else k
+    return {
+        "n": n,
+        "k": k,
+        "entropy": h,
+        "entropy_norm": h / np.log(k_norm) if k_norm > 1 else float("nan"),
+        "simpson": float(1.0 - (p * p).sum()),
+        "effective_k": float(np.exp(h)),
+        "max_share": float(p.max()),
+    }
+
+
+def partition_diversity(
+    labels: Sequence[int], n_boot: int = 500, n_null: int = 500, seed: int = 42
+) -> Dict[str, Any]:
+    """d: diversidad de la particion (entropia normalizada, Simpson, Hill).
+
+    Propiedad de la PARTICION, no del contenido: solo depende del vector de
+    tamanos de clase. NO es ``diversidad_semantica`` (la metrica por UCE del
+    pipeline, ~0.82): aquella mide dispersion lexica dentro de una UCE, esta
+    mide equilibrio entre clases.
+
+    ``entropy``       H en nats.
+    ``entropy_norm``  H / ln K en [0,1] (la ``d`` que pide el paper).
+    ``simpson``       1 - sum p_k^2 (Gini-Simpson, en [0,1)).
+    ``effective_k``   exp(H): "numero efectivo de clases" (Hill).
+    ``max_share``     max p_k (coincide con el gate de dominancia sobre lo
+                      asignado cuando no hay ruido).
+
+    Nulo: la permutacion de etiquetas es VACUA aqui (invariante: permutar no
+    cambia ningun p_k), y se declara con ``label_permutation_invariant``. El
+    nulo que se reporta es de composicion, Dirichlet(1) con el mismo K: mide
+    si la particion esta mas (o menos) balanceada de lo que daria un reparto
+    aleatorio uniforme. El p-valor es bilateral.
+
+    ``ci_low``/``ci_high`` es el IC bootstrap de ``entropy_norm`` resampleando
+    UCEs con K FIJO en el denominador (si K variara en cada remuestra, el IC
+    estaria sesgado al alza por desaparicion de clases raras).
+
+    ``entropy_norm`` no es comparable entre particiones con distinto K
+    (normaliza por ln K); para comparar se usa ``effective_k``.
+    """
+    y = np.asarray(list(labels)).astype(int)
+    y = y[y >= 0]
+    base = _entropy_stats(y) if len(y) else None
+    out: Dict[str, Any] = (
+        dict(base)
+        if base
+        else {
+            "n": 0,
+            "k": 0,
+            "entropy": float("nan"),
+            "entropy_norm": float("nan"),
+            "simpson": float("nan"),
+            "effective_k": float("nan"),
+            "max_share": float("nan"),
+        }
+    )
+    out.update(
+        {
+            "ci_low": float("nan"),
+            "ci_high": float("nan"),
+            "null_mean": float("nan"),
+            "null_q05": float("nan"),
+            "null_q95": float("nan"),
+            "p_value": float("nan"),
+            "label_permutation_invariant": True,
+            "space_id": "cluster_id",
+        }
+    )
+    if base is None or base["k"] < 2:
+        return out
+    rng = np.random.default_rng(seed)
+    boots = np.empty(n_boot)
+    for i in range(n_boot):
+        boots[i] = _entropy_stats(
+            rng.choice(y, size=len(y), replace=True), k_ref=base["k"]
+        )["entropy_norm"]
+    out["ci_low"] = float(np.quantile(boots, 0.025))
+    out["ci_high"] = float(np.quantile(boots, 0.975))
+    comp = rng.dirichlet(np.ones(base["k"]), size=n_null)
+    h = -(comp * np.log(comp)).sum(axis=1) / np.log(base["k"])
+    out["null_mean"] = float(h.mean())
+    out["null_q05"] = float(np.quantile(h, 0.05))
+    out["null_q95"] = float(np.quantile(h, 0.95))
+    p_lo = float((h <= base["entropy_norm"]).mean())
+    p_hi = float((h >= base["entropy_norm"]).mean())
+    out["p_value"] = float(min(1.0, 2.0 * min(p_lo, p_hi)))
+    return out
+
+
+def _rmsd_core(ra: np.ndarray, ob: np.ndarray) -> Dict[str, float]:
+    """RMSD de proporciones con emparejamiento Hungarian de clases."""
+    ru, ri = np.unique(ra, return_inverse=True)
+    ou, oi = np.unique(ob, return_inverse=True)
+    n = len(ra)
+    ov = np.zeros((len(ru), len(ou)))
+    np.add.at(ov, (ri, oi), 1.0)
+    row, col = ov.sum(axis=1), ov.sum(axis=0)
+    r, c = linear_sum_assignment(-ov)
+    pairs = [(row[i] / n, col[j] / n) for i, j in zip(r, c)]
+    used_r, used_c = set(r.tolist()), set(c.tolist())
+    pairs += [(row[i] / n, 0.0) for i in range(len(ru)) if i not in used_r]
+    pairs += [(0.0, col[j] / n) for j in range(len(ou)) if j not in used_c]
+    pr = np.array([p for p, _ in pairs])
+    po = np.array([q for _, q in pairs])
+    return {
+        "rmsd": float(np.sqrt(np.mean((pr - po) ** 2))) if len(pr) else float("nan"),
+        "k_ref": int(len(ru)),
+        "k_obs": int(len(ou)),
+        "k_union": int(len(pr)),
+        "n_unmatched": int(len(pr) - len(r)),
+    }
+
+
+def rmsd_proportions(
+    labels_ref: Mapping[str, int],
+    labels_obs: Mapping[str, int],
+    reference_id: str,
+    n_boot: int = 300,
+    n_null: int = 300,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """RMSD entre los vectores de proporcion de clase de dos particiones.
+
+    Se usan las UCEs comunes con etiqueta >= 0 en ambas. Las clases se
+    emparejan con Hungarian maximizando el solape de la matriz de confusion, de
+    modo que el estadistico es invariante a la numeracion de las clases y
+    conservador: el emparejamiento se elige para que las proporciones se
+    parezcan lo mas posible.
+
+    ``reference_id`` es OBLIGATORIO y se devuelve en la salida. Sin el, el
+    numero no es interpretable:
+
+    * referencia externa (codificacion humana) -> parte de la validez externa;
+    * otra salida del pipeline -> concordancia entre metodos, NO validez;
+    * particion derivada del mismo dato -> ilustracion del calculo.
+
+    ADVERTENCIA (medida, no teorica): esto mide concordancia de PERFIL de
+    tamanos, NO de asignacion. El emparejamiento maximiza el solape, de modo
+    que el estadistico queda dominado por los marginales: en el self-test,
+    una particion ALEATORIA con el mismo vector de tamanos da RMSD menor que
+    la particion real. El nulo por permutacion de etiquetas es valido (el
+    emparejamiento depende de la asociacion) pero su dispersion es chica, y
+    un p-valor alto significa "no hay evidencia de acuerdo", no "hay
+    desacuerdo". Para acuerdo a nivel de UCE usar ``cross_partition_agreement``
+    (FMI/NMI/ARI). Recomendacion: reportar el RMSD como DESCRIPTOR de
+    perfiles y nunca como evidencia de validez.
+
+    ``k_union`` son los pares usados y ``n_unmatched`` las clases sin pareja
+    (penalizan que las dos particiones tengan distinto K). El IC bootstrap
+    remuestrea UCEs y RECALCULA el emparejamiento en cada remuestra.
+    """
+    common = [
+        u
+        for u in sorted(set(labels_ref) & set(labels_obs))
+        if labels_ref[u] is not None
+        and labels_obs[u] is not None
+        and int(labels_ref[u]) >= 0
+        and int(labels_obs[u]) >= 0
+    ]
+    out: Dict[str, Any] = {
+        "rmsd": float("nan"),
+        "n": len(common),
+        "k_ref": 0,
+        "k_obs": 0,
+        "k_union": 0,
+        "n_unmatched": 0,
+        "reference_id": reference_id,
+        "ci_low": float("nan"),
+        "ci_high": float("nan"),
+        "null_mean": float("nan"),
+        "null_std": float("nan"),
+        "null_q05": float("nan"),
+        "null_q95": float("nan"),
+        "p_value": float("nan"),
+    }
+    if len(common) < 2:
+        return out
+    ra = np.array([int(labels_ref[u]) for u in common])
+    ob = np.array([int(labels_obs[u]) for u in common])
+    out.update(_rmsd_core(ra, ob))
+    rng = np.random.default_rng(seed)
+    boots = np.empty(n_boot)
+    for i in range(n_boot):
+        idx = rng.integers(0, len(common), len(common))
+        boots[i] = _rmsd_core(ra[idx], ob[idx])["rmsd"]
+    out["ci_low"] = float(np.quantile(boots, 0.025))
+    out["ci_high"] = float(np.quantile(boots, 0.975))
+    nulls = np.empty(n_null)
+    for i in range(n_null):
+        nulls[i] = _rmsd_core(ra, rng.permutation(ob))["rmsd"]
+    out["null_mean"] = float(nulls.mean())
+    out["null_std"] = float(nulls.std(ddof=1))
+    out["null_q05"] = float(np.quantile(nulls, 0.05))
+    out["null_q95"] = float(np.quantile(nulls, 0.95))
+    out["p_value"] = float((nulls >= out["rmsd"]).mean())
+    return out
+
+
+# ── Estabilidad por remuestreo y nulo de etiquetas (STABILITY_NULL.md) ──────
+
+#: `ci_low` minimo para declarar ESTABLE. Medido: ruido <= 0.15, estructura
+#: >= 0.74 (STABILITY_NULL.md §2). No subir sin nueva evidencia.
+STABILITY_CI_LOW_MIN = 0.50
+
+#: `bootstrap_ari` medio por debajo del cual no hay senal recuperable.
+#: Debe coincidir con `method_selection.stability_mean_min`.
+STABILITY_MEAN_MIN = 0.30
+
+
+def _r2_partition(X, labels) -> float:
+    """R2 denso `1 - SSE/TSS` de `labels` sobre `X`. NaN si no es calculable.
+
+    Es el estadistico por defecto del nulo porque es **el que el clusterer
+    optimiza**: por eso el nulo de etiquetas no puede rechazar ruido
+    (STABILITY_NULL.md §1.1). Se expone tambien como utilidad de auditoria.
+    """
+    try:
+        A = np.asarray(X, dtype=float)
+        y = np.asarray(labels).astype(int)
+    except (TypeError, ValueError):
+        return float("nan")
+    if A.ndim != 2 or y.ndim != 1 or A.shape[0] != y.shape[0]:
+        return float("nan")
+    keep = y >= 0
+    if int(keep.sum()) < 3 or np.unique(y[keep]).size < 2:
+        return float("nan")
+    A, y = A[keep], y[keep]
+    mu = A.mean(axis=0, keepdims=True)
+    tss = float(np.sum((A - mu) ** 2))
+    if not np.isfinite(tss) or tss <= 0.0:
+        return float("nan")
+    sse = 0.0
+    for c in np.unique(y):
+        Ac = A[y == c]
+        sse += float(np.sum((Ac - Ac.mean(axis=0, keepdims=True)) ** 2))
+    value = 1.0 - sse / tss
+    return float(value) if np.isfinite(value) else float("nan")
+
+
+def _stability_verdict(mean: float, ci_low: float) -> str:
+    """Veredicto de §3: ESTABLE | SIN_SENAL | FRAGIL | NO_DISPONIBLE."""
+    if not math.isfinite(float(mean)):
+        return "NO_DISPONIBLE"
+    if float(mean) < STABILITY_MEAN_MIN:
+        return "SIN_SENAL"
+    if math.isfinite(float(ci_low)) and float(ci_low) >= STABILITY_CI_LOW_MIN:
+        return "ESTABLE"
+    return "FRAGIL"
+
+
+def bootstrap_stability(
+    X,
+    labels,
+    *,
+    predict_fn: Optional[Callable] = None,
+    n_boot: int = 10,
+    frac: float = 0.8,
+    replace: bool = False,
+    seed: int = 42,
+    min_n: int = 30,
+    alpha: float = 0.05,
+    stable_threshold: float = 0.75,
+) -> Dict[str, Any]:
+    """Estabilidad por submuestreo de UCEs + reajuste con el mismo K.
+
+    Contrato de `predict_fn`: `predict_fn(X_sub) -> labels` de longitud
+    `len(X_sub)`. El K, el piso y el `random_state` los cierra el llamador, de
+    modo que la funcion no se acopla a ward, kmeans ni dense_cdh.
+
+    En cada replica se submuuestrea `ceil(frac*n)` filas (sin reemplazo por
+    defecto), se reajusta el clusterer y se mide `ARI(pred, labels)` sobre las
+    filas comunes con etiqueta `>= 0`. `labels` es la particion de REFERENCIA
+    (la del ajuste completo).
+
+    Devuelve el bloque de STABILITY_NULL.md §4:
+    `bootstrap_ari`, `bootstrap_ari_ci_low`, `bootstrap_ari_ci_high`,
+    `bootstrap_n_boot`, `coverage_stable`, `stability_kind`,
+    `stability_verdict` (+ `ok`, `reason`, `bootstrap_std`, `n`, `n_failed`).
+
+    Precondiciones (todas devuelven `ok=False` + `nan`, NUNCA excepcion):
+    `X` denso 2-D, `labels` 1-D de la misma longitud, `n >= min_n`,
+    `predict_fn` callable, `n_boot >= 1`, `0 < frac <= 1`.
+    """
+    out: Dict[str, Any] = {
+        "ok": False,
+        "reason": "",
+        "bootstrap_ari": float("nan"),
+        "bootstrap_ari_ci_low": float("nan"),
+        "bootstrap_ari_ci_high": float("nan"),
+        "bootstrap_n_boot": int(n_boot) if isinstance(n_boot, int) else 0,
+        "bootstrap_std": float("nan"),
+        "coverage_stable": float("nan"),
+        "stability_kind": "",
+        "stability_verdict": "NO_DISPONIBLE",
+        "n": 0,
+        "n_failed": 0,
+    }
+    try:
+        A = np.asarray(X, dtype=float)
+        y = np.asarray(labels).astype(int)
+    except (TypeError, ValueError):
+        out["reason"] = "X_o_labels_invalidos"
+        return out
+    if A.ndim != 2 or y.ndim != 1 or A.shape[0] != y.shape[0]:
+        out["reason"] = "forma_invalida_o_longitudes_distintas"
+        return out
+    n = int(A.shape[0])
+    out["n"] = n
+    if n < int(min_n):
+        out["reason"] = f"n={n}_menor_que_min_n={int(min_n)}"
+        return out
+    if not callable(predict_fn):
+        out["reason"] = "predict_fn_no_es_callable"
+        return out
+    if int(n_boot) < 1:
+        out["reason"] = "n_boot<1"
+        return out
+    frac = float(frac)
+    if not (0.0 < frac <= 1.0):
+        out["reason"] = "frac_fuera_de_(0,1]"
+        return out
+    if not np.isfinite(A).all():
+        out["reason"] = "X_con_NaN_o_inf"
+        return out
+
+    n_sub = int(min(n, max(3, math.ceil(frac * n))))
+    rng = np.random.default_rng(int(seed))
+    ari_vals: List[float] = []
+    hits = np.zeros(n, dtype=int)
+    seen = np.zeros(n, dtype=int)
+    fails = 0
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for _ in range(int(n_boot)):
+            idx = rng.choice(n, size=n_sub, replace=bool(replace))
+            if replace:
+                idx = np.unique(idx)
+            if idx.size < 3:
+                fails += 1
+                continue
+            try:
+                pred = np.asarray(predict_fn(A[idx])).ravel().astype(int)
+            except Exception:
+                fails += 1
+                continue
+            if pred.size != idx.size:
+                fails += 1
+                continue
+            ys = y[idx]
+            keep = ys >= 0
+            if int(keep.sum()) < 2:
+                fails += 1
+                continue
+            if np.unique(ys[keep]).size < 2 or np.unique(pred[keep]).size < 2:
+                fails += 1
+                continue
+            value = float(adjusted_rand_score(ys[keep], pred[keep]))
+            if not np.isfinite(value):
+                fails += 1
+                continue
+            ari_vals.append(value)
+
+            # Alineacion Hungarian para poder contar UCEs estables.
+            ca, cb = np.unique(ys[keep]), np.unique(pred[keep])
+            ia = {int(v): i for i, v in enumerate(ca)}
+            ib = {int(v): j for j, v in enumerate(cb)}
+            ov = np.zeros((ca.size, cb.size))
+            for u, v in zip(ys[keep], pred[keep]):
+                ov[ia[int(u)], ib[int(v)]] += 1
+            rows, cols = linear_sum_assignment(-ov)
+            mapped = {int(cb[j]): int(ca[i]) for i, j in zip(rows, cols)}
+            for pos, uce in enumerate(idx):
+                if ys[pos] < 0:
+                    continue
+                seen[uce] += 1
+                if mapped.get(int(pred[pos])) == int(ys[pos]):
+                    hits[uce] += 1
+
+    out["n_failed"] = int(fails)
+    if not ari_vals:
+        out["reason"] = "todas_las_replicas_fallaron"
+        return out
+    arr = np.asarray(ari_vals, dtype=float)
+    out["bootstrap_ari"] = float(arr.mean())
+    out["bootstrap_std"] = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
+    out["bootstrap_ari_ci_low"] = float(np.quantile(arr, alpha / 2.0))
+    out["bootstrap_ari_ci_high"] = float(np.quantile(arr, 1.0 - alpha / 2.0))
+    assigned = y >= 0
+    if assigned.any():
+        need = np.ceil(float(stable_threshold) * np.maximum(seen, 1))
+        ok_rows = (seen > 0) & (hits >= need) & assigned
+        out["coverage_stable"] = float(int(ok_rows.sum()) / float(n))
+    out["stability_kind"] = "bootstrap"
+    out["stability_verdict"] = _stability_verdict(
+        out["bootstrap_ari"], out["bootstrap_ari_ci_low"]
+    )
+    out["ok"] = True
+    return out
+
+
+def null_partition_test(
+    X,
+    labels,
+    *,
+    stat_fn: Optional[Callable] = None,
+    n_perm: int = 50,
+    seed: int = 42,
+    min_n: int = 30,
+) -> Dict[str, Any]:
+    """Nulo por permutacion de ETIQUETAS. `stat_fn(X, labels) -> float`.
+
+    Por defecto `_r2_partition`. AVISO (STABILITY_NULL.md §1.1): el estadistico
+    observado procede de una particion AJUSTADA a X, asi que este nulo responde
+    "mejor que etiquetas aleatorias", no "hay estructura". Sobre ruido puro
+    devuelve `p = 1/(1+n_perm)` por sesgo de seleccion. **No es un gate.**
+
+    Devuelve `null_p` (una cola superior, correccion +1), `null_stat`,
+    `null_n_perm`, `null_z`, `null_mean`, `null_std`. Nunca lanza.
+    """
+    out: Dict[str, Any] = {
+        "ok": False,
+        "reason": "",
+        "null_p": float("nan"),
+        "null_stat": float("nan"),
+        "null_n_perm": int(n_perm) if isinstance(n_perm, int) else 0,
+        "null_z": float("nan"),
+        "null_mean": float("nan"),
+        "null_std": float("nan"),
+    }
+    try:
+        A = np.asarray(X, dtype=float)
+        y = np.asarray(labels).astype(int)
+    except (TypeError, ValueError):
+        out["reason"] = "X_o_labels_invalidos"
+        return out
+    if A.ndim != 2 or y.ndim != 1 or A.shape[0] != y.shape[0]:
+        out["reason"] = "forma_invalida_o_longitudes_distintas"
+        return out
+    if int(A.shape[0]) < int(min_n):
+        out["reason"] = f"n={int(A.shape[0])}_menor_que_min_n={int(min_n)}"
+        return out
+    if int(n_perm) < 1:
+        out["reason"] = "n_perm<1"
+        return out
+    stat = stat_fn if callable(stat_fn) else _r2_partition
+    try:
+        observed = float(stat(A, y))
+    except Exception:
+        observed = float("nan")
+    if not np.isfinite(observed):
+        out["reason"] = "estadistico_observado_NaN"
+        return out
+    out["null_stat"] = observed
+    rng = np.random.default_rng(int(seed))
+    nulls: List[float] = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for _ in range(int(n_perm)):
+            try:
+                value = float(stat(A, rng.permutation(y)))
+            except Exception:
+                continue
+            if np.isfinite(value):
+                nulls.append(value)
+    if not nulls:
+        out["reason"] = "todos_los_nulos_NaN"
+        return out
+    null = np.asarray(nulls, dtype=float)
+    out["null_mean"] = float(null.mean())
+    out["null_std"] = float(null.std(ddof=1)) if null.size > 1 else 0.0
+    if out["null_std"] > 0.0:
+        out["null_z"] = float((observed - out["null_mean"]) / out["null_std"])
+    out["null_p"] = float((1.0 + float(np.sum(null >= observed))) / (null.size + 1.0))
+    out["ok"] = True
     return out

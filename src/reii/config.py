@@ -101,6 +101,12 @@ TRANSCRIPTS_DIR: str = str(
 BEST_PARAMS_PATH: str = str(
     ROOT_DIR / os.environ.get("REII_BEST_PARAMS_PATH", "data/best_params.json")
 )
+# Modo clásico (ALCESTE 2012): artefactos en un directorio propio para que
+# A y B no compartan caché ni se pisen los resultados del paper.
+# Ver docs/design_v5/CLASSIC_MODE.md §4.
+CLASSIC_DATA_DIR: str = str(
+    ROOT_DIR / os.environ.get("REII_CLASSIC_DATA_DIR", "data/classic")
+)
 # Cache de la auto-calibración bayesiana de uce_target_size (ver
 # calibrar_uce_target_size en main_workflow.py). Mismo patrón de invalidación
 # por huella del corpus que BEST_PARAMS_PATH.
@@ -249,6 +255,9 @@ CORPUS_NAME: str = os.environ.get("REII_CORPUS_NAME", "Corpus ALCESTE")
 # ---------------------------------------------------------------------------
 # Output file names (used by workflows)
 # ---------------------------------------------------------------------------
+CLASSIC_OUTPUT_DIR: str = str(
+    OUTPUT_DIR / os.environ.get("REII_CLASSIC_OUTPUT_DIR", "classic")
+)
 OUTPUT_DASHBOARD: str = str(OUTPUT_DIR / "global_dashboard.json")
 OUTPUT_NETWORK_GEXF: str = str(OUTPUT_DIR / "red_semantica.gexf")
 OUTPUT_LEXICAL_JSON: str = str(OUTPUT_DIR / "global_lexical.json")

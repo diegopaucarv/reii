@@ -19,7 +19,17 @@ from typing import Any, Dict
 from reii.config import GRAMATICA_PATH
 
 DEFAULT_GRAMATICA: Dict[str, Any] = {
+    # POS "núcleo" del vocabulario activo. PROPN/X NO se declaran aquí:
+    # los gobierna retention_policy (ver reii/retention_policy.py y
+    # docs/design_v5/RETENTION_POLICY.md).
     "content_pos": ["NOUN", "VERB", "ADJ", "ADV"],
+    # Política de formas activas: pos_only | pos_plus_propn |
+    # tool_adverb_filtered. Default = tool_adverb_filtered (conservadora;
+    # enmienda 2026-10-28, RETENTION_POLICY.md §10).
+    "retention_policy": "tool_adverb_filtered",
+    # Override opcional de la lista cerrada de adverbios-herramienta
+    # (vacío = usar TOOL_ADVERB_LEMMAS, que está pre-registrada).
+    "tool_adverb_lemmas": [],
     "stopwords_extra": [],
     "expresiones": [],
     "palabras_activas": {},

@@ -27,7 +27,7 @@ RUN pip install --upgrade pip setuptools wheel \
     && pip install -r requirements.txt
 
 # ── spaCy model ───────────────────────────────────────────────
-RUN python -m spacy download es_core_news_lg==3.7.0
+RUN python -m spacy download es_core_news_lg
 
 # ── NLTK data ─────────────────────────────────────────────────────────
 RUN python -c "import nltk; nltk.download('punkt', quiet=True)"

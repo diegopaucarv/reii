@@ -9,6 +9,7 @@ import glob
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -42,6 +43,8 @@ from transformers import utils
 
 from reii.config import (
     BEST_PARAMS_PATH,
+    CLASSIC_DATA_DIR,
+    CLASSIC_OUTPUT_DIR,
     COREF_CHAINS_CACHE_PATH,
     CORPUS_NAME,
     DATABASE_URL,
@@ -77,6 +80,31 @@ from reii.gram.gramatical_analyzer import (
     train_adverb_classifier,
 )
 from reii.gramatica import load_gramatica
+from reii.hf_local import resolve_model_dir
+from reii.method_c_policy import (
+    build_method_c_result,
+    format_target_k_notice,
+    guarded_fit,
+    resolve_method_c_backend,
+)
+from reii.method_c_policy import (
+    corte_optimo_1d as _corte_optimo_1d,
+)
+from reii.method_selection import (
+    MethodMetrics,
+    Selection,
+    persist_selection,
+    select_method,
+)
+from reii.retention_policy import (
+    TOOL_ADVERB_LEMMAS,
+    TokenTableWriter,
+    normalize_lemmas,
+    policy_content_pos,
+    resolve_retention_policy,
+    token_decision,
+    token_rows,
+)
 
 # Contrato dinámico de UCE para la fase abductiva.
 # NUNCA modificar uce.cluster_id desde _project_liminal_uces().
@@ -141,7 +169,7 @@ def _get_sentence_embedder(model_name: str) -> SentenceTransformer:
     Evita re-validar el cache de HuggingFace y recargar pesos en cada
     llamada (generar_embeddings_uces/ucs, SynthesisGenerator, ...).
     """
-    return SentenceTransformer(model_name)
+    return SentenceTransformer(resolve_model_dir(model_name) or model_name)
 
 
 try:
@@ -345,7 +373,10 @@ _CLI_MODES_VALIDOS = {
     "wc_emb",
     "coref_emb",
     "all",
+    "select",
+    "classic",  # preset ALCESTE 2012 (NO es un classification_mode)
     # aliases legacy
+    "auto",
     "both",
     "sim_only",
     "wc_sim",
@@ -398,6 +429,274 @@ def _parse_cli_uce_target_size() -> Optional[int]:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# FLAGS DEL OPTIMIZADOR / SONDAS
+# ══════════════════════════════════════════════════════════════════════
+# Este módulo escanea sys.argv a mano (no usa argparse): un flag
+# desconocido se ignora EN SILENCIO. Eso convertía a los scripts de
+# diagnóstico en no-ops silenciosos. Los overrides se aplican al final de
+# main(), DESPUÉS de ConfigStore, porque ConfigStore puede pisar los
+# valores de Config(...).
+_CLI_FLAGS_CON_VALOR = {
+    "--trials",
+    "--seed",
+    "--study-name",
+    "--verdict-mode",
+    "--stage1-fraction",
+    "--coverage-gate",
+    "--coverage-gate-all",
+    "--method-c-backend",
+    "--max-class-share",
+}
+_CLI_FLAGS_SIN_VALOR = {
+    "--optimize-only",
+    "--no-optuna-warm-start",
+    "--single-stage",
+    "--stability-bootstrap",
+    "--allow-unknown-flags",
+}
+
+#: Backends de Method C expuestos por CLI. Espejo de `Config.method_c_backend`;
+#: la autoridad final sigue siendo `method_c_policy.resolve_method_c_backend`.
+_METHOD_C_BACKENDS_CLI = {"dense_cdh", "ward", "kmeans_spherical", "hdbscan"}
+
+#: Ayuda en ASCII puro: en consola Windows con cp1252 los acentos y las
+#: flechas rompen el print justo cuando el usuario pide ayuda.
+_CLI_USAGE = """
+REII - main_workflow.py [flags]
+
+  --force | --reprocess          reprocesa documentos ya completos
+  --uce-target-size N            fija el target de UCE (desactiva la calibracion)
+
+--mode (modo de clasificacion):
+  select                         A | B | C: elige UNO con select-v4 y lo
+                                 persiste en data/method_selection.json
+  wc_only | coref_only | emb_only             un solo metodo (A | B | C)
+  wc_coref | wc_emb | coref_emb | all         interseccion de metodos
+  classic                        escenario A: ALCESTE 2012 aislado en data/classic/
+  alias: auto->select, both->wc_coref, sim_only->coref_only,
+         wc_sim->wc_coref, sim_emb->coref_emb
+
+Optimizador:
+  --optimize-only                ignora best_params.json y TERMINA tras optimizar
+  --trials N                     presupuesto (default operativo 300, >= 1)
+  --stage1-fraction f            reparto etapa 1 / etapa 2 (0 < f < 1, default 0.3)
+  --single-stage                 una sola etapa (mode=select), sin etapa 1
+  --study-name X                 prefijo del study; el codigo anade
+                                 _stage1_wc_<fp> y _stage2_select_<fp>
+  --seed N                       random_state (>= 0)
+  --no-optuna-warm-start         sin warm start
+  --verdict-mode all|two_of_three
+  --coverage-gate f              gate de cobertura del select (en [0, 1])
+  --coverage-gate-all f          gate de cobertura del modo all (en [0, 1])
+
+Method C y gate de seleccion:
+  --method-c-backend B           dense_cdh (default) | ward | kmeans_spherical
+                                 | hdbscan (diagnostico: no controla K, emite -1)
+  --max-class-share f            gate de dominancia sobre el CORPUS
+                                 (pre-registrado en el paper: 0.70)
+
+Estabilidad:
+  --stability-bootstrap          bootstrap real; solo en el select final
+                                 (incompatible con --optimize-only)
+
+Otros:
+  -h, --help                     esta ayuda
+  --allow-unknown-flags          ignora flags desconocidos en vez de abortar
+
+Notas:
+  * Este modulo escanea sys.argv a mano: un flag desconocido ABORTA la corrida
+    (antes se ignoraba en silencio y la corrida parecia valida).
+  * El default del entrypoint es `select`, pero ConfigStore (PostgreSQL) puede
+    pisarlo; --mode gana sobre ambos.
+  * Sin flag a proposito: optimize_preference (knee esta pre-registrado).
+"""
+
+
+def _print_cli_help() -> None:
+    print(_CLI_USAGE.strip("\n"))
+
+
+_OPTIMIZE_ONLY = "--optimize-only" in sys.argv
+_NO_OPTUNA_WARM_START = "--no-optuna-warm-start" in sys.argv
+_SINGLE_STAGE = "--single-stage" in sys.argv
+
+# La ayuda se resuelve antes de construir Config, pero DESPUES de los imports
+# del modulo: no se puede evitar el coste de importar spacy/nltk.
+if __name__ == "__main__" and any(a in ("-h", "--help") for a in sys.argv[1:]):
+    _print_cli_help()
+    sys.exit(0)
+
+
+def _cli_val(flag: str) -> Optional[str]:
+    """Valor de `flag` en argv, o None si el flag no está presente."""
+    if flag not in sys.argv:
+        return None
+    i = sys.argv.index(flag)
+    if i + 1 >= len(sys.argv) or sys.argv[i + 1].startswith("--"):
+        print(f"   [ERROR] {flag} requiere un valor.")
+        sys.exit(2)
+    return sys.argv[i + 1].strip()
+
+
+def _cli_cast(flag: str, cast):
+    raw = _cli_val(flag)
+    if raw is None:
+        return None
+    try:
+        return cast(raw)
+    except ValueError:
+        print(f"   [ERROR] {flag} inválido: {raw!r}")
+        sys.exit(2)
+
+
+def _warn_unknown_cli_flags() -> None:
+    """Valida argv contra la lista de flags que este modulo conoce.
+
+    El escaneo de argv es manual: lo que no se reconocia se ignoraba en
+    silencio, de modo que un typo (`--stabilyty-bootstrap`) corria sin
+    bootstrap y el resultado parecia valido. Ahora aborta con exit 2, salvo
+    que se pida `--allow-unknown-flags`.
+    """
+    known = {"--force", "--reprocess", "--mode", "--uce-target-size"}
+    known |= _CLI_FLAGS_CON_VALOR | _CLI_FLAGS_SIN_VALOR
+    known |= {"--help", "-h"}
+    unknown = [a for a in sys.argv[1:] if a.startswith("-") and a not in known]
+    if not unknown:
+        return
+    if "--allow-unknown-flags" in sys.argv:
+        print(
+            "   [WARNING] flags desconocidos (ignorados por "
+            f"--allow-unknown-flags): {unknown}"
+        )
+        return
+    print(f"   [ERROR] flags desconocidos: {unknown}")
+    print("           se aborta en vez de ignorarlos en silencio.")
+    print("           usa --help para la lista de flags validos, o")
+    print("           --allow-unknown-flags para ignorarlos a proposito.")
+    sys.exit(2)
+
+
+def _check_cli_ranges(upd: dict) -> None:
+    """Valida rangos de los overrides antes de pasarlos a Config.
+
+    El cast solo comprobaba el tipo: `--stage1-fraction 1.5` llegaba al
+    optimizador y el reparto de trials se "autocorregia" con un mensaje que
+    no describia el problema.
+    """
+    rules = (
+        ("optimize_trials", "--trials", lambda v: v >= 1, ">= 1"),
+        ("random_state", "--seed", lambda v: v >= 0, ">= 0"),
+        (
+            "optimize_stage1_fraction",
+            "--stage1-fraction",
+            lambda v: 0.0 < v < 1.0,
+            "0 < f < 1",
+        ),
+        (
+            "optimize_coverage_gate",
+            "--coverage-gate",
+            lambda v: 0.0 <= v <= 1.0,
+            "en [0, 1]",
+        ),
+        (
+            "optimize_coverage_gate_all",
+            "--coverage-gate-all",
+            lambda v: 0.0 <= v <= 1.0,
+            "en [0, 1]",
+        ),
+    )
+    for field, flag, ok, txt in rules:
+        if field in upd and not ok(upd[field]):
+            print(f"   [ERROR] {flag} debe ser {txt} (recibido: {upd[field]!r})")
+            sys.exit(2)
+
+
+def _cli_overrides(cfg):
+    """Overrides del optimizador. Llamar SOLO tras aplicar ConfigStore."""
+    import dataclasses as _dc
+
+    upd = {}
+    for flag, field, cast in (
+        ("--trials", "optimize_trials", int),
+        ("--seed", "random_state", int),
+        ("--stage1-fraction", "optimize_stage1_fraction", float),
+        ("--coverage-gate", "optimize_coverage_gate", float),
+        ("--coverage-gate-all", "optimize_coverage_gate_all", float),
+        ("--study-name", "optimize_study_name", str),
+    ):
+        value = _cli_cast(flag, cast)
+        if value is not None:
+            upd[field] = value
+    _check_cli_ranges(upd)
+
+    verdict = _cli_val("--verdict-mode")
+    if verdict is not None:
+        if verdict not in ("all", "two_of_three"):
+            print(f"   [ERROR] --verdict-mode inválido: {verdict!r} (all|two_of_three)")
+            sys.exit(2)
+        upd["verdict_mode"] = verdict
+    if _SINGLE_STAGE:
+        upd["optimize_two_stage"] = False
+        print("   [CLI] --single-stage: una sola etapa (mode=select)")
+    if "--stability-bootstrap" in sys.argv:
+        if _OPTIMIZE_ONLY:
+            print(
+                "   [ERROR] --stability-bootstrap no se combina con "
+                "--optimize-only: el bootstrap real cuesta 1-10 s por select, el"
+                " optimizador corre cientos, y ademas mueve el objetivo de la"
+                " etapa 2. Reservado para el select final."
+            )
+            sys.exit(2)
+        upd["stability_bootstrap"] = True
+
+    _backend = _cli_val("--method-c-backend")
+    if _backend is not None:
+        if _backend not in _METHOD_C_BACKENDS_CLI:
+            print(
+                f"   [ERROR] --method-c-backend invalido: {_backend!r}. "
+                f"Validos: {', '.join(sorted(_METHOD_C_BACKENDS_CLI))}"
+            )
+            sys.exit(2)
+        upd["method_c_backend"] = _backend
+        if _backend == "hdbscan":
+            print(
+                "   [!] --method-c-backend=hdbscan: no controla K y emite -1;"
+                " `select` lo descarta salvo method_c_hdbscan_selectable=True."
+            )
+
+    _max_share = _cli_cast("--max-class-share", float)
+    if _max_share is not None:
+        if not 0.0 < _max_share < 1.0:
+            print(
+                f"   [ERROR] --max-class-share debe cumplir 0 < share < 1 "
+                f"(recibido: {_max_share!r})"
+            )
+            sys.exit(2)
+        upd["method_selection_max_class_share"] = _max_share
+        print(
+            f"   [!] --max-class-share={_max_share}: el valor pre-registrado del"
+            " paper es 0.70 sobre el CORPUS. Cambiarlo rompe la comparacion con"
+            " la corrida registrada."
+        )
+
+    if _OPTIMIZE_ONLY:
+        _m = _parse_cli_mode()
+        if _m not in (None, "classic"):
+            print(
+                f"   [i] --mode {_m} es inerte con --optimize-only: la corrida"
+                " termina tras el optimizador y la etapa 2 optimiza siempre en"
+                " mode='select'."
+            )
+        print(
+            "   [CLI] --optimize-only: se ignora best_params.json "
+            "y se sale tras el optimizador"
+        )
+    for field, value in upd.items():
+        print(f"   [CLI] {field}={value}")
+    return _dc.replace(cfg, **upd) if upd else cfg
+
+
+# ══════════════════════════════════════════════════════════════════════
 # FINGERPRINT DEL CORPUS (best_params dataset-specific)
 # ══════════════════════════════════════════════════════════════════════
 # best_params.json se optimiza para UN corpus concreto. Para no reutilizar
@@ -440,6 +739,32 @@ from reii.coref_cache import (
     load_cache,
     missing_ctx_values,
 )
+
+
+def _partition_sizes_from_labels(labels: Optional[Dict[str, int]]) -> List[int]:
+    """Tamanos de clase ordenados de una particion CRUDA (uce_id -> label).
+
+    Excluye los no asignados (``label < 0``, p.ej. HDBSCAN ``-1``): el
+    denominador del gate de dominancia son las UCEs ASIGNADAS. Sin esta
+    exclusion, un metodo con 55% de ruido y una clase mayoritaria entre los
+    asignados pasaria el gate por pura dilution del denominador.
+    """
+    if not labels:
+        return []
+    counts: Dict[int, int] = {}
+    for v in labels.values():
+        iv = int(v)
+        if iv < 0:
+            continue
+        counts[iv] = counts.get(iv, 0) + 1
+    return sorted(counts.values())
+
+
+# Tope de n para `ward` (memoria O(n²) de la matriz de distancias). A n=6000
+# son ~144 MiB condensados / ~275 MiB cuadrados. Por encima, la política
+# degrada a `dense_cdh` con aviso "[!]" en vez de abortar (HARDENING.md §2,
+# hunk #69). Se pasa a `guarded_fit(ward_max_n=...)`; NO es un campo de Config.
+_METHOD_C_WARD_MAX_N = 6000
 
 
 def _coref_cache_key_standalone(config_base: "Config", fp: str) -> str:
@@ -683,6 +1008,13 @@ class Config:
     )
     stem_backend: str = "snowball"  # 'snowball' | 'none'
 
+    # Escenario del paper (docs/design_v5/CLASSIC_MODE.md, §1):
+    #   "modern"  = B (ALCESTE + innovaciones)
+    #   "classic" = A (ALCESTE 2012, fidelidad; se activa con --mode classic)
+    # NO está en ConfigStore a propósito: el dashboard no debe poder convertir
+    # una corrida en clásica por accidente.
+    run_mode: str = "modern"
+
     min_uce_words: int = 2  # era 3; alineado con C (UCEs cortas)
     uce_target_size: int = 26  # objetivo de entrada; ver auto_calibrate_uce_size
     min_forms_uc: List[int] = field(default_factory=lambda: [13, 17])
@@ -726,6 +1058,11 @@ class Config:
     chi2_threshold_small: float = 3.84
     max_depth_cdh: int = 10
     min_cluster_size_cdh: float = 0.10
+    # min_cluster_size_cdh se interpreta como PISO DURO del tamaño de cada
+    # clase terminal (no solo como regla de parada de la recursión). Con
+    # False se recupera el comportamiento anterior, donde una clase podía
+    # terminar con 1 UC y K dependía de cortes 1-vs-(n-1).
+    cdh_enforce_min_leaf: bool = True
 
     clustering_method: str = "hdbscan"
     n_clusters: Optional[int] = None
@@ -799,12 +1136,25 @@ class Config:
     # ── Optimizer (Optuna) ──────────────────────────────────────────────
     optimize: bool = True
     optimize_trials: int = 200
+    optimize_stage1_fraction: float = 0.3  # n_stage1 = max(20, int(n * frac))
+    optimize_two_stage: bool = True  # False => una sola etapa (mode="select")
     optimize_sampler: str = "tpe"  # "tpe" | "random" | "cmaes"
     optimize_pruner: str = "median"  # "median" | "hyperband" | "none"
     optimize_storage: Optional[str] = None  # ej. "sqlite:///reii_optuna.db"
     optimize_study_name: str = "reii_search"
-    optimize_n_startup_trials: int = 25
+    # v5: 25 startup con 40 trials dejaba a TPE con n_below=2 (Parzen
+    # degenerado). 12 siembra el modelo y deja presupuesto para aprender.
+    optimize_n_startup_trials: int = 12
     optimize_multivariate: bool = True
+    # v5: resolucion del argmax de EI por trial (default de Optuna: 24).
+    # Solo cuesta CPU, no invoca el pipeline.
+    optimize_n_ei_candidates: int = 48
+    # v5: tope de puntos del frente de etapa 1 que se encolan en etapa 2
+    # (x3 copias cada uno); sin tope, el warm start puede comerse el
+    # presupuesto entero de la etapa 2.
+    optimize_warm_start_max: int = 10
+    # v5: congelar los parametros inertes (rho~0) en get_search_space().
+    optimize_freeze_inert: bool = True
     optimize_prune_n_startup: int = 15
     # Multi-objective: (ARI↑, coverage↑, −K↑  ≡ K↓)
     optimize_directions: Tuple[str, ...] = ("maximize", "maximize", "minimize")
@@ -859,9 +1209,45 @@ class Config:
     #   "wc_coref"   A + B          (was "wc_sim" / "both")
     #   "wc_emb"     A + C
     #   "coref_emb"  B + C          (was "sim_emb")
-    #   "all"        A + B + C
-    #   Aliases: "both"→"wc_coref", "sim_only"→"coref_only", "wc_sim"→"wc_coref", "sim_emb"→"coref_emb"
+    #   "all"        A + B + C  (intersección triple: NO es el modo por defecto)
+    #   "select"     A | B | C  — elige UN método con la regla `select-v3`
+    #                (reii/method_selection.py) y lo persiste en
+    #                data/method_selection.json. Sin intersecciones.
+    #   Aliases: "auto"→"select", "both"→"wc_coref", "sim_only"→"coref_only",
+    #            "wc_sim"→"wc_coref", "sim_emb"→"coref_emb"
     classification_mode: str = "wc_only"
+
+    # ── Regla de selección de método (`select`, select-v3) ──────────────
+    # Pre-registrada: viabilidad (K en rango, coverage UTIL ≥ floor) → max ARI
+    # intra-método → desempate por coverage útil → aviso de casi-empate.
+    # coverage útil = coverage (estables) − tiny (estables en clases menores
+    # que min_class_share·n), con denominador n_total para todos los métodos.
+    method_selection_margin: float = 0.02
+    method_selection_coverage_floor: float = 0.15
+
+    #: Modo del contraste contra el nulo: "diagnostic" (default) lo imprime
+    #: como control y no filtra. Ver docs/design_v5/STABILITY_NULL.md.
+    method_selection_null_mode: str = "diagnostic"
+    #: Presupuesto del motor de estabilidad (STABILITY_NULL.md §6).
+    method_selection_stability_boot: int = 10
+    method_selection_stability_perm: int = 50
+    method_selection_stability_min_n: int = 30
+    #: Opt-in del bootstrap real de estabilidad (submuestra + reajuste)
+    #: que alimenta ``DoubleClassifier._stability_spaces``. Con False no
+    #: se construye ningun espacio y ``_stability_blocks`` devuelve
+    #: ``{}``: comportamiento identico al anterior (la corrida congelada
+    #: no cambia). Ver docs/design_v5/BOOTSTRAP_WIRING.md.
+    stability_bootstrap: bool = False
+    method_selection_k_bounds: Tuple[int, int] = (3, 20)
+    method_selection_min_class_share: float = 0.01
+    method_selection_noise_max: float = 0.50
+    # Gate de no dominancia: si la clase mayor ocupa mas de esta fraccion del
+    # CORPUS (c = max_class_share * (1 - noise_frac), particion cruda), la
+    # particion es degenerada (una clase + satelites) y el metodo se descarta.
+    # Medir sobre el corpus y no sobre lo asignado evita que el ruido de
+    # HDBSCAN decida el veredicto (ver docs/design_v5/GATE_NOISE.md).
+    method_selection_max_class_share: float = 0.70
+    optimize_coverage_gate_select: float = 0.10
 
     # Method C — HDBSCAN on retrofitted UCE embedding space
     #
@@ -894,16 +1280,66 @@ class Config:
     )
     hdbscan_uce_metric: str = "euclidean"  # "euclidean" | "cosine"
 
+    # ── Method C — backend de clasificación densa (BACKEND_C.md §2, hunk #21)
+    # Valores y rol:
+    #   "dense_cdh"        bisección best-first por PC1 local con gate r2_dense.
+    #                      Controla K, no emite -1, O(n·d²) con d fijo. DEFAULT.
+    #   "ward"             AgglomerativeClustering(n_clusters=K, linkage=ward).
+    #                      K exacto, sin RNG, O(n²) en memoria: 144 MiB en el
+    #                      camino condensado y 275 MiB en el cuadrado a n=6000
+    #                      (HARDENING.md §2.2). Guarda: _METHOD_C_WARD_MAX_N.
+    #   "kmeans_spherical" L2 + KMeans(n_init=10, random_state=42). K exacto.
+    #   "hdbscan"          comportamiento histórico. NO controla K (target_k sólo
+    #                      fija min_cluster_size) y emite -1. Diagnostic only
+    #                      salvo que method_c_hdbscan_selectable sea True.
+    # Valor desconocido: NO aborta la corrida. Se resuelve con
+    # method_c_policy.resolve_method_c_backend(source="persisted"), que degrada
+    # al DEFAULT_METHOD_C_BACKEND de la política y emite un aviso "[!]".
+    # La procedencia (persistida vs interna) y el resto de la regla viven en
+    # CLASSIC_MODE.md §6; aquí sólo se declara el campo, no se duplica.
+    method_c_backend: str = "dense_cdh"
+    # Escape hatch: True devuelve a hdbscan el derecho a competir en `select`.
+    # False => diagnostic_only=True y `select-v4` lo descarta por
+    # backend == "hdbscan" (SELECT_V4.md §2.1).
+    method_c_hdbscan_selectable: bool = False
+    # K objetivo de dense_cdh. None => se deriva del plumbing existente:
+    # min_cluster_size_cdh = frac = 1/(2K) => K = round(1/(2·frac)), acotado a
+    # [2, n//floor] por method_c_policy.effective_target_k. Ver §3.
+    method_c_target_k: Optional[int] = None
+    # Gates medidos en §6: r2_1d ≈ 2/π sobre ruido => inútil (0.0, apagado);
+    # r2_dense discrimina (null 0.036-0.064, real 0.103-0.142) => 0.08.
+    dense_cdh_min_r2_1d: float = 0.0
+    dense_cdh_min_r2_dense: float = 0.08
+    # Pase loose: piso × 0.75, nunca por debajo de
+    # hdbscan_uce_min_cluster_floor (§3). En los densos no cambia K.
+    dense_cdh_loose_factor: float = 0.75
+
     # DSN de la base de datos (PostgreSQL). Si None, se deriva de db_local_path.
     db_dsn: Optional[str] = DATABASE_URL
     # Escribir también el JSON de compatibilidad durante la transición.
     dual_write_json: bool = False
 
     # ── Gramática personalizable (capa de personalización léxica) ──────────
-    # content_pos: POS que se consideran "activas" (entran al vocabulario).
+    # content_pos: POS "núcleo" del vocabulario activo. PROPN/X NO se
+    # declaran aquí: los gobierna retention_policy (más abajo).
     content_pos: List[str] = field(
         default_factory=lambda: ["NOUN", "VERB", "ADJ", "ADV"]
     )
+    # retention_policy: política de formas activas (fidelidad ALCESTE).
+    #   "pos_only"             POS núcleo y not is_stop (baseline pre-11,
+    #                          10.72 lemas/UCE en este corpus).
+    #   "pos_plus_propn"       núcleo + PROPN/X, sin is_stop (13.16).
+    #   "tool_adverb_filtered" idem, menos adverbios-herramienta (12.24).
+    # None = sin elección programática: manda ia/gramatica.json y, si
+    # tampoco hay valor, "tool_adverb_filtered" (default adoptado en la
+    # enmienda 2026-10-28). A diferencia de content_pos, este
+    # knob NO se pisa en silencio (ver reii.retention_policy).
+    retention_policy: Optional[str] = None
+    # Caché de tokens por UCE ({forma, lemma, pos, is_stop, is_alpha} de
+    # TODOS los tokens), invalidada por corpus_fingerprint. Permite
+    # reevaluar políticas sin volver a correr Stanza (~13 s/UCE).
+    token_table_path: str = os.path.join(REII_DATA_DIR, "token_table.jsonl")
+    use_token_table_cache: bool = True
     # stopwords_extra: palabras tratadas como suplementarias (además de is_stop).
     stopwords_extra: List[str] = field(default_factory=list)
     # expresiones: frases multi-palabra (separadas por espacio) unidas con '_'.
@@ -2032,7 +2468,18 @@ class SegmentadorALCESTE:
         # campos de Config con los valores resueltos. Los valores también se
         # guardan como atributos de instancia para que lematizar_uces los use.
         gramatica = load_gramatica()
-        self.config.content_pos = list(gramatica.get("content_pos", config.content_pos))
+        # Precedencia del knob (RETENTION_POLICY.md §2.0):
+        #   Config.retention_policy > ia/gramatica.json > "tool_adverb_filtered"
+        # A diferencia de content_pos (que load_gramatica pisa SIEMPRE),
+        # una elección programática explícita aquí no se pierde.
+        self.retention_policy = resolve_retention_policy(
+            getattr(config, "retention_policy", None),
+            gramatica.get("retention_policy"),
+        )
+        self.config.retention_policy = self.retention_policy
+        self.config.content_pos = policy_content_pos(
+            self.retention_policy, gramatica.get("content_pos", config.content_pos)
+        )
         self.config.stopwords_extra = list(gramatica.get("stopwords_extra", []))
         self.config.expresiones = list(gramatica.get("expresiones", []))
         self.config.palabras_activas = dict(gramatica.get("palabras_activas", {}))
@@ -2050,6 +2497,14 @@ class SegmentadorALCESTE:
         self.palabras_suplementarias = set(self.config.palabras_suplementarias)
         self.palabras_excluir = set(self.config.palabras_excluir)
         self.sinonimos = dict(self.config.sinonimos)
+        self.tool_adverb_lemmas = normalize_lemmas(
+            gramatica.get("tool_adverb_lemmas") or TOOL_ADVERB_LEMMAS
+        )
+        self.token_table = TokenTableWriter(
+            getattr(config, "token_table_path", None),
+            _corpus_fingerprint(),
+            enabled=bool(getattr(config, "use_token_table_cache", True)),
+        )
 
         self.stemmer = (
             SnowballStemmer("spanish") if config.stem_backend == "snowball" else None
@@ -2270,6 +2725,13 @@ class SegmentadorALCESTE:
         stemmer = self.stemmer
         for uce in uces:
             doc = self.nlp(uce.texto)
+            # Tabla completa de tokens (TODOS, también PUNCT): es la caché
+            # que permite reevaluar políticas sin volver a correr Stanza.
+            self.token_table.add(
+                getattr(uce, "id", None),
+                token_rows(doc),
+                words=len(uce.texto.split()),
+            )
             tokens_raw = [
                 (i, t.text, t.lemma_.lower(), t.pos_, t.is_stop, t.is_alpha)
                 for i, t in enumerate(doc)
@@ -2370,35 +2832,41 @@ class SegmentadorALCESTE:
                             "pos_idx": i,
                         }
                     )
-                elif (
-                    is_forced_supp
-                    or is_extra_stop
-                    or (
-                        is_alpha
-                        and (
-                            is_stop
-                            or pos
-                            in {"PRON", "SCONJ", "CCONJ", "DET", "AUX", "ADP", "INTJ"}
+                else:
+                    # Una sola fuente de verdad para la clasificación:
+                    # la política decide is_stop, PROPN/X y la lista de
+                    # adverbios-herramienta (ver retention_policy.py).
+                    _decision = token_decision(
+                        policy=self.retention_policy,
+                        pos=pos,
+                        lemma=resolved_lemma,
+                        is_stop=is_stop,
+                        is_alpha=is_alpha,
+                        content_pos=self.content_pos,
+                        is_forced_supp=is_forced_supp,
+                        is_extra_stop=is_extra_stop,
+                        tool_adverb_lemmas=self.tool_adverb_lemmas,
+                    )
+                    if _decision == "marker":
+                        marcadores.append(
+                            {"forma": text.lower(), "lemma": resolved_lemma, "pos": pos}
                         )
-                    )
-                ):
-                    marcadores.append(
-                        {"forma": text.lower(), "lemma": resolved_lemma, "pos": pos}
-                    )
-                elif pos in self.content_pos and not is_stop and is_alpha:
-                    stem = stemmer.stem(resolved_lemma) if stemmer else resolved_lemma
-                    lemmas.append(resolved_lemma)
-                    stems.append(stem)
-                    pos_tags.append(pos)
-                    formas_tokens.append(
-                        {
-                            "forma": text,
-                            "lemma": resolved_lemma,
-                            "stem": stem,
-                            "pos": pos,
-                            "pos_idx": i,
-                        }
-                    )
+                    elif _decision == "active":
+                        stem = (
+                            stemmer.stem(resolved_lemma) if stemmer else resolved_lemma
+                        )
+                        lemmas.append(resolved_lemma)
+                        stems.append(stem)
+                        pos_tags.append(pos)
+                        formas_tokens.append(
+                            {
+                                "forma": text,
+                                "lemma": resolved_lemma,
+                                "stem": stem,
+                                "pos": pos,
+                                "pos_idx": i,
+                            }
+                        )
             if self.config.use_bigrams:
                 for j in range(len(tokens_raw) - 1):
                     t1, t2 = tokens_raw[j], tokens_raw[j + 1]
@@ -3402,7 +3870,11 @@ def _debug_emb_matrix(
 
     from scipy.spatial.distance import pdist
 
-    d_sample = mat if n <= 2000 else mat[np.random.default_rng(42).choice(n, 2000, replace=False)]
+    d_sample = (
+        mat
+        if n <= 2000
+        else mat[np.random.default_rng(42).choice(n, 2000, replace=False)]
+    )
     dists = pdist(d_sample, metric="euclidean")
     p5, p50, p95 = np.percentile(dists, [5, 50, 95])
     print(
@@ -3561,9 +4033,10 @@ class ClasificadorDescendente:
         self._leaf_counter = 0
         n_total = mat_sparse.shape[0]
         self._min_cluster_size = max(5, int(n_total * self.config.min_cluster_size_cdh))
+        _k_cap = max(1, n_total // max(1, self._min_cluster_size))
         print(
             f"   [CDH] n={n_total} · min_cluster_size={self._min_cluster_size} "
-            f"({self.config.min_cluster_size_cdh:.0%} of corpus)"
+            f"({self.config.min_cluster_size_cdh:.0%} of corpus) · K_max~={_k_cap}"
         )
         # Validate uc_vectors shape; discard silently if mismatched
         if uc_vectors is not None and uc_vectors.shape[0] != n_total:
@@ -3578,6 +4051,22 @@ class ClasificadorDescendente:
         arbol = self._partition(indices, mat_sparse, depth=0, uc_vectors=uc_vectors)
         labels = np.full(n_total, -1, dtype=int)
         self._fill_labels(arbol, labels)
+
+        # Invariante del piso: ninguna clase terminal debe quedar por debajo
+        # de min_cluster_size (salvo que una rama no alcance 2*floor UCs).
+        sizes = np.bincount(labels[labels >= 0])
+        if sizes.size:
+            floor = self._min_cluster_size
+            small = int((sizes < floor).sum())
+            print(
+                f"   [CDH] clases={sizes.size} · tamano min={int(sizes.min())} "
+                f"max={int(sizes.max())} mediana={int(np.median(sizes))}"
+            )
+            if small and getattr(self.config, "cdh_enforce_min_leaf", True):
+                print(
+                    f"   [!] {small}/{sizes.size} clases por debajo del piso "
+                    f"({floor}): la rama no llega a 2*floor UCs"
+                )
         return labels, arbol
 
     def _primer_factor(
@@ -3664,33 +4153,17 @@ class ClasificadorDescendente:
 
         return x
 
-    def _corte_optimo(self, coord: np.ndarray) -> Tuple[float, np.ndarray]:
-        n = len(coord)
-        if n < 2:
-            return 0.0, np.zeros(n, dtype=int)
+    def _corte_optimo(
+        self, coord: np.ndarray, min_side: int = 1
+    ) -> Tuple[float, np.ndarray]:
+        """Corte optimo 1-D con piso. Delegado a la funcion pura.
 
-        order = np.argsort(coord)
-        sorted_c = coord[order]
-        total = sorted_c.sum()
-        mean = total / n
-
-        # Between-class sum of squares (unnormalized)
-        cum = np.cumsum(sorted_c)
-        left_sum = cum[:-1]
-        right_sum = total - left_sum
-        left_n = np.arange(1, n)
-        right_n = n - left_n
-
-        ss_between = left_sum**2 / left_n + right_sum**2 / right_n - total**2 / n
-        k_best = int(np.argmax(ss_between)) + 1
-
-        # Normalize: var_inter = SS_between / SS_total (= R²)
-        ss_total = float(np.sum((sorted_c - mean) ** 2))
-        var_inter = float(ss_between[k_best - 1]) / (ss_total + 1e-12)
-
-        labels = np.zeros(n, dtype=int)
-        labels[order[k_best:]] = 1
-        return var_inter, labels
+        El cuerpo se extrajo a `method_c_policy.corte_optimo_1d` (misma
+        matematica, misma reversion, mismo orden de desempate) para que el
+        backend `dense_cdh` use EXACTAMENTE el mismo corte que el CDH de A.
+        `min_side > 1` evita cortes 1-vs-(n-1).
+        """
+        return _corte_optimo_1d(coord, min_side=min_side)
 
     def _intercambio(
         self,
@@ -3922,7 +4395,11 @@ class ClasificadorDescendente:
         uc_vectors: Optional[np.ndarray] = None,  # ← NEW: full array, sliced here
     ) -> CDHNode:
         n = len(indices)
-        if n < self._min_cluster_size or depth >= self.config.max_depth_cdh:
+        floor = self._min_cluster_size
+        enf_floor = bool(getattr(self.config, "cdh_enforce_min_leaf", True))
+        # Con piso duro hacen falta 2*floor UCs para que AMBOS hijos lo cumplan.
+        n_min_split = 2 * floor if enf_floor else floor
+        if n < n_min_split or depth >= self.config.max_depth_cdh:
             node = CDHNode(
                 depth=depth,
                 n_ucs=n,
@@ -3938,7 +4415,7 @@ class ClasificadorDescendente:
         sub_vecs = uc_vectors[indices] if uc_vectors is not None else None
 
         coord = self._primer_factor(sub_mat, uc_vectors=sub_vecs)  # ← warm-start
-        var_obs, labels = self._corte_optimo(coord)
+        var_obs, labels = self._corte_optimo(coord, min_side=floor if enf_floor else 1)
 
         if not self._es_significativo(coord, labels, var_obs):
             node = CDHNode(
@@ -3951,6 +4428,7 @@ class ClasificadorDescendente:
             node.label = self._next_leaf()
             return node
 
+        labels_pre_swap = labels
         if self.config.swap_iterations > 0:
             labels = self._intercambio(
                 sub_mat,
@@ -3958,6 +4436,10 @@ class ClasificadorDescendente:
                 max_iter=self.config.swap_iterations,
                 uc_vectors=sub_vecs,  # ← hybrid swap
             )
+            if enf_floor and int(np.bincount(labels, minlength=2).min()) < floor:
+                # El refinamiento chi² desbalanceó el corte por debajo del
+                # piso: se conserva la partición del promediado recíproco.
+                labels = labels_pre_swap
 
         if len(np.unique(labels)) < 2:
             node = CDHNode(
@@ -4120,6 +4602,12 @@ class DoubleClassifier:
         self.threshold_delta = 0.05
         self.uc_builder = uc_builder
         self.ppmi_builder: Optional["SubtlexPPMIBuilder"] = None
+        # Última selección de método (modo "select"), para el optimizador y
+        # para el hook de calidad.
+        self.last_selection: Optional[Selection] = None
+        # Pass intermedio del orquestador (pre-retrofitting): no imprime ni
+        # persiste la selección, que aún no ve Method C.
+        self.quiet_selection = False
         # Method B: ProgressiveSegmenter instance (None = Method B unavailable)
         self.progressive_segmenter = progressive_segmenter
 
@@ -4901,19 +5389,26 @@ class DoubleClassifier:
         min_samples: Optional[
             int
         ] = None,  # ([hdbscan-scale-patch]) resuelto por el caller
+        *,
+        variant: str = "tight",  # "tight" | "loose": solo cambia el piso
     ) -> Optional[Dict]:
         """
-        Method C: direct HDBSCAN clustering of all UCEs in retrofitted space.
+        Method C: clasificacion densa de las UCEs en espacio retrofitted.
+
+        El backend lo elige `Config.method_c_backend` (hunk #21) y lo resuelve
+        `method_c_policy` (hunk #72): PREFLIGHT, guarda de memoria de ward,
+        acotado de K y validacion de salida NO se reimplementan aqui.
 
         No UC objects are created here; cluster labels are assigned per-UCE.
-        The result dict carries 'uce_to_label' instead of 'ucs'/'labels',
-        making it structurally distinct from Methods A and B — handled
-        explicitly in _extract_uce_labels and _hungarian_stability_direct.
-
-        Quality signal: HDBSCAN cluster_persistence_ (higher = more stable).
+        The result dict carries 'uce_to_label' instead of 'ucs'/'labels'
+        (BACKEND_C.md §1).
         """
-        if not _HDBSCAN_AVAILABLE:
-            print("   [EMB] hdbscan not installed — skipping Method C.")
+        requested = getattr(self.config, "method_c_backend", "dense_cdh")
+        backend, _notice = resolve_method_c_backend(requested, source="persisted")
+        if _notice:
+            print(f"   {_notice['message']}")
+        if backend == "hdbscan" and not _HDBSCAN_AVAILABLE:
+            print("   [EMB] hdbscan not installed - skipping Method C.")
             return None
 
         we = self.uc_builder.vectorizer.we
@@ -4929,7 +5424,8 @@ class DoubleClassifier:
         mat = _compute_uce_centroids_from_retro(all_uces, retrofitted_vectors, we, sub)
 
         # Reject if >50 % of UCEs are unembeddable
-        zero_rows = int(np.all(mat == 0, axis=1).sum())
+        embeddable_mask = ~np.all(mat == 0, axis=1)
+        zero_rows = int((~embeddable_mask).sum())
         if zero_rows > len(all_uces) * 0.5:
             print(
                 f"   [EMB] {zero_rows}/{len(all_uces)} zero-vectors — "
@@ -4969,56 +5465,93 @@ class DoubleClassifier:
                 print(f"   [EMB-DEBUG] PCA explica {var_pct:.1f}% de la varianza.")
                 _debug_emb_matrix(mat, zero_rows, n_samples, label="post-PCA")
 
-        # Si el caller no resolvió min_samples explícitamente (pasos nuevos
-        # SIEMPRE lo resuelven con _resolve_hdbscan_uce_params), cae al
-        # mismo criterio escalado — nunca al 1 fijo de antes. ([hdbscan-scale-patch])
-        if min_samples is None:
-            ratio = float(getattr(self.config, "hdbscan_uce_min_samples_ratio", 0.25))
-            explicit = getattr(self.config, "hdbscan_uce_min_samples", None)
-            min_samples = (
-                max(1, int(explicit))
-                if explicit is not None
-                else max(2, round(ratio * min_cluster_size))
+        cfg = self.config
+
+        # Piso de hoja: el mcs del pase (ya escalado al corpus) es el piso de
+        # los backends densos; el pase loose lo reduce por
+        # dense_cdh_loose_factor, nunca por debajo del floor absoluto (§3).
+        _floor_min = int(getattr(cfg, "hdbscan_uce_min_cluster_floor", 5))
+        floor = max(_floor_min, int(round(float(min_cluster_size))))
+        if variant == "loose":
+            _factor = float(getattr(cfg, "dense_cdh_loose_factor", 0.75))
+            floor = max(_floor_min, int(round(floor * _factor)))
+
+        # K pedido: explícito o recuperado del plumbing existente
+        # (min_cluster_size_cdh = 1/(2K) => K = round(1/(2*frac))).
+        target_k = getattr(cfg, "method_c_target_k", None)
+        if target_k is None:
+            _frac = getattr(cfg, "min_cluster_size_cdh", None)
+            _frac = 0.10 if _frac is None else float(_frac)
+            target_k = int(round(1.0 / (2.0 * max(1e-6, _frac))))
+
+        # Unica llamada a los backends: las guardas viven en la politica.
+        labels, _diag = guarded_fit(
+            backend,
+            mat,
+            int(target_k),
+            floor,
+            n_zero_rows=zero_rows,
+            ward_max_n=_METHOD_C_WARD_MAX_N,
+            min_r2_1d=float(getattr(cfg, "dense_cdh_min_r2_1d", 0.0)),
+            min_r2_dense=float(getattr(cfg, "dense_cdh_min_r2_dense", 0.08)),
+            # mcs_frac reproduce el min_cluster_size del pase para hdbscan.
+            mcs_frac=float(min_cluster_size) / float(max(1, len(all_uces))),
+        )
+        for _msg in _diag.get("notices", []):
+            print(f"   {_msg}")
+
+        if labels is None:
+            _be = str(_diag.get("backend_used", backend))
+            # I3 (HARDENING §9): target_k -> n_clusters tambien cuando no hay
+            # particion. guarded_fit ya dejo n_clusters en diag.
+            _ncls = _diag.get("n_clusters")
+            if _be == "dense_cdh" and _ncls is not None:
+                _rej = int(
+                    (_diag.get("backend_diagnostics") or {}).get(
+                        "rejected_min_r2_dense", 0
+                    )
+                )
+                _k_notice = format_target_k_notice(int(target_k), int(_ncls), _rej)
+                if _k_notice:
+                    print(f"   {_k_notice}")
+            print(
+                f"   [!] Method C backend={_be} sin particion "
+                f"({_diag['precondition']['reason']})"
             )
-        clusterer = hdbscan.HDBSCAN(
-            min_cluster_size=min_cluster_size,
-            min_samples=min_samples,
-            cluster_selection_epsilon=getattr(self.config, "hdbscan_uce_epsilon", 0.0),
-            metric=getattr(self.config, "hdbscan_uce_metric", "euclidean"),
-            gen_min_span_tree=True,
-            prediction_data=True,
-        )
-        labels = clusterer.fit_predict(mat)
-
-        real = np.unique(labels[labels >= 0])
-        n_noise = int(np.sum(labels == -1))
-        persist = list(getattr(clusterer, "cluster_persistence_", []))
-
-        print(
-            f"   [EMB min_cluster_size={min_cluster_size}] "
-            f"UCEs={len(all_uces)}, clusters={len(real)}, "
-            f"noise={n_noise}, persistence={[round(p, 3) for p in persist]}"
-        )
-
-        if len(real) < 2:
             return None
 
-        # uce_to_label: only non-noise UCEs
-        uce_to_label: Dict[str, int] = {
-            uce_ids[i]: int(labels[i]) for i in range(len(uce_ids)) if labels[i] >= 0
-        }
+        # hdbscan no controla K y emite -1: se computa, no compite, salvo
+        # escape hatch (BACKEND_C.md §2, hunk #22.5).
+        _be = str(_diag["backend_used"])
+        diagnostic_only = bool(
+            _be == "hdbscan"
+            and not bool(getattr(cfg, "method_c_hdbscan_selectable", False))
+        )
 
-        return {
-            "method": "embedding",
-            "min_cluster_size": min_cluster_size,
-            "uce_to_label": uce_to_label,  # ← per-UCE, no UC wrapper
-            "labels_array": labels,  # full array aligned with uce_ids
-            "uce_ids": uce_ids,
-            "embedding_matrix": mat,
-            "cluster_persistence": persist,
-            "n_clusters": int(len(real)),
-            "n_noise": n_noise,
-        }
+        result = build_method_c_result(
+            labels,
+            _diag,
+            uce_ids,
+            mat,
+            int(target_k),
+            int(floor),
+            requested=str(requested),
+            diagnostic_only=diagnostic_only,
+            resolution_notice=(_notice["message"] if _notice else ""),
+        )
+        if result is None:
+            return None
+        # [stability] UCEs con embedding real del pase tight: el bootstrap
+        # de C remuestrea solo esta subpoblacion (las OOV colapsan en un
+        # unico punto tras el PCA y falsearian el ARI).
+        result["embeddable_mask"] = embeddable_mask
+        print(
+            f"   [EMB backend={result['backend']}] UCEs={len(all_uces)}, "
+            f"clusters={result['n_clusters']}, noise={result['n_noise']}, "
+            f"K_pedido={result['target_k']}"
+            + (", diagnostic_only" if diagnostic_only else "")
+        )
+        return result
 
     # ─────────────────────────────────────────────────────────────────────
     # HELPER: extract {uce_id: label} from WC/SIM result dict (A or B)
@@ -5345,6 +5878,237 @@ class DoubleClassifier:
             for t in uce.trigram_stems if use_stems else uce.trigrams:
                 yield "_".join(t)
 
+    #: Techo de celdas de la matriz densa que usa el bootstrap de A/B. Con
+    #: n=528 UCEs y ~5k terminos son ~2.6M celdas (~21 MiB); el techo solo
+    #: evita que un vocabulario anomalo densifique cientos de MiB.
+    _STABILITY_MAX_DENSE_CELLS = 20_000_000
+
+    def _build_stability_spaces(
+        self,
+        res_wc: Optional[Dict],
+        res_coref: Optional[Dict],
+        res_emb: Optional[Dict],
+        *,
+        min_n: int = 30,
+    ) -> Optional[Dict[str, Tuple[Any, List[str], Dict[str, int], Any]]]:
+        """Espacios ``(X, ids, cluster_of, predict_fn)`` del bootstrap.
+
+        Opt-in: con ``config.stability_bootstrap`` en False devuelve ``None``
+        y ``_stability_blocks`` recibe ``None`` -> ``{}``, que es el
+        comportamiento previo byte a byte. Con True se intenta cada metodo por
+        separado: el que no se pueda construir se OMITE (su ``bootstrap_ari``
+        queda ``nan`` = "no disponible" y la regla no descarta por eso) y se
+        imprime ``[stability] metodo X sin espacio: motivo``. Nunca lanza.
+
+        Las unidades son las de la particion PRIMARIA del metodo; NO se
+        re-segmenta el corpus:
+
+          * A/B: las UCs del pase tight, con la MISMA matriz UC x terminos
+            (binaria -> PPMI) que consumio el CDH; ``predict_fn`` reajusta el
+            CDH sobre la submuestra de UCs conservando el piso absoluto.
+          * C: las UCEs con embedding del pase tight, en las coordenadas PCA
+            del ajuste; ``predict_fn`` reajusta el backend denso con el mismo
+            ``target_k`` y el piso re-escalado a esa subpoblacion.
+        """
+        if not bool(getattr(self.config, "stability_bootstrap", False)):
+            return None
+
+        import contextlib
+        import dataclasses
+        import io
+
+        try:
+            from scipy.sparse import csr_matrix
+        except Exception as exc:  # pragma: no cover - scipy es dependencia
+            print(f"   [stability] sin espacios: {exc}")
+            return {}
+
+        spaces: Dict[str, Tuple[Any, List[str], Dict[str, int], Any]] = {}
+
+        def _omit(method: str, reason: object) -> None:
+            print(f"   [stability] metodo {method} sin espacio: {reason}")
+
+        def _term_space(res: Optional[Dict]):
+            if not res:
+                raise RuntimeError("sin resultado del pase tight")
+            ucs = res.get("ucs") or []
+            voc = res.get("voc") or []
+            labels = res.get("labels")
+            if not ucs or not voc or labels is None:
+                raise RuntimeError("resultado sin ucs/voc/labels")
+            if len(ucs) != len(labels):
+                raise RuntimeError(f"ucs={len(ucs)} != labels={len(labels)}")
+            mat = MatrizBuilder(self.config).construir_matriz_dispersa(ucs, voc)
+            if self.ppmi_builder is not None:
+                mat = self.ppmi_builder.build(mat, voc)
+            n_cells = int(mat.shape[0]) * int(mat.shape[1])
+            if n_cells > self._STABILITY_MAX_DENSE_CELLS:
+                raise RuntimeError(
+                    f"matriz {mat.shape[0]}x{mat.shape[1]}={n_cells} celdas "
+                    f"> {self._STABILITY_MAX_DENSE_CELLS}"
+                )
+            X = np.asarray(
+                mat.toarray() if hasattr(mat, "toarray") else mat, dtype=float
+            )
+            ids = [str(uc.id) for uc in ucs]
+            cluster_of = {uid: int(labels[i]) for i, uid in enumerate(ids)}
+            n_assigned = sum(1 for v in cluster_of.values() if v >= 0)
+            if n_assigned < int(min_n):
+                raise RuntimeError(f"asignadas={n_assigned} < min_n={int(min_n)}")
+            # Piso ABSOLUTO del ajuste completo: se conserva en cada replica
+            # (mismo K efectivo), no la fraccion del submuestreo.
+            floor = max(
+                5,
+                int(len(ids) * float(self.config.min_cluster_size_cdh)),
+            )
+
+            def predict(X_sub):
+                n_sub = int(np.asarray(X_sub).shape[0])
+                # +0.5 para que int(n_sub * frac) == floor pese al redondeo
+                # en coma flotante (`clasificar` trunca, no redondea).
+                frac_sub = (float(floor) + 0.5) / float(max(1, n_sub))
+                cfg_sub = dataclasses.replace(
+                    self.config, min_cluster_size_cdh=frac_sub
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    labels_sub, _tree = ClasificadorDescendente(cfg_sub).clasificar(
+                        csr_matrix(X_sub)
+                    )
+                return labels_sub
+
+            return (X, ids, cluster_of, predict)
+
+        for method, res in (("A", res_wc), ("B", res_coref)):
+            try:
+                spaces[method] = _term_space(res)
+            except Exception as exc:
+                _omit(method, exc)
+        try:
+            if not res_emb:
+                raise RuntimeError("sin resultado del pase tight")
+            X_emb = res_emb.get("embedding_matrix")
+            labels_arr = res_emb.get("labels_array")
+            ids_all = list(res_emb.get("uce_ids") or [])
+            backend = str(res_emb.get("backend") or "")
+            if X_emb is None or labels_arr is None:
+                raise RuntimeError("resultado sin embedding_matrix/labels_array")
+            if backend not in ("dense_cdh", "ward", "kmeans_spherical"):
+                raise RuntimeError(f"backend={backend!r} no controla K")
+            A = np.asarray(X_emb, dtype=float)
+            y = np.asarray(labels_arr, dtype=int).ravel()
+            if A.ndim != 2 or A.shape[0] != len(ids_all):
+                raise RuntimeError(f"matriz {A.shape} != uce_ids={len(ids_all)}")
+            if y.size != len(ids_all):
+                raise RuntimeError(f"labels={y.size} != uce_ids={len(ids_all)}")
+            mask = res_emb.get("embeddable_mask")
+            if mask is None:
+                raise RuntimeError("resultado sin embeddable_mask")
+            mask = np.asarray(mask, dtype=bool).ravel()
+            if mask.size != len(ids_all):
+                raise RuntimeError(
+                    f"embeddable_mask={mask.size} != uce_ids={len(ids_all)}"
+                )
+            ids = [ids_all[i] for i in np.flatnonzero(mask)]
+            A = A[mask]
+            y = y[mask]
+            n_assigned = int((y >= 0).sum())
+            if n_assigned < int(min_n):
+                raise RuntimeError(
+                    f"embeddable={len(ids)} asignadas={n_assigned} < min_n={int(min_n)}"
+                )
+            target_k = int(res_emb.get("target_k") or 0)
+            floor_full = int(res_emb.get("min_cluster_size") or 0)
+            floor_min = int(getattr(self.config, "hdbscan_uce_min_cluster_floor", 5))
+            # Misma FRACCION de piso que el ajuste completo, aplicada a las
+            # UCEs informativas: el K efectivo se conserva y el piso no
+            # depende del tamano de la replica.
+            frac_floor = float(floor_full) / float(max(1, len(ids_all)))
+            floor = max(floor_min, int(round(frac_floor * len(ids))))
+            min_r2_1d = float(getattr(self.config, "dense_cdh_min_r2_1d", 0.0))
+            min_r2_dense = float(getattr(self.config, "dense_cdh_min_r2_dense", 0.08))
+            mcs_frac = float(floor) / float(max(1, len(ids)))
+
+            def predict_c(X_sub):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    labels_sub, diag = guarded_fit(
+                        backend,
+                        np.asarray(X_sub, dtype=float),
+                        target_k,
+                        floor,
+                        n_zero_rows=0,
+                        ward_max_n=_METHOD_C_WARD_MAX_N,
+                        min_r2_1d=min_r2_1d,
+                        min_r2_dense=min_r2_dense,
+                        mcs_frac=mcs_frac,
+                    )
+                if labels_sub is None:
+                    reason = (diag.get("precondition") or {}).get("reason", "?")
+                    raise RuntimeError(f"guarded_fit sin particion ({reason})")
+                return labels_sub
+
+            spaces["C"] = (
+                A,
+                ids,
+                {uid: int(y[i]) for i, uid in enumerate(ids)},
+                predict_c,
+            )
+        except Exception as exc:
+            _omit("C", exc)
+
+        return spaces
+
+    def _stability_blocks(
+        self,
+        spaces: Optional[Dict[str, Tuple[Any, List[str], Dict[str, int], Any]]],
+        *,
+        n_boot: int = 10,
+        n_perm: int = 50,
+        seed: int = 42,
+        min_n: int = 30,
+    ) -> Dict[str, Dict]:
+        """``{metodo: bloque}`` con el ARI bootstrap y el nulo de cada metodo.
+
+        ``spaces[m] = (X, uce_ids, cluster_of_uce, predict_fn)``. Un metodo sin
+        espacio produce ``{}``: sus claves caen a ``nan`` y la regla no lo
+        descarta por falta de dato (STABILITY_NULL.md §4). Nunca lanza.
+        """
+        from reii.quality.metrics import bootstrap_stability, null_partition_test
+
+        out: Dict[str, Dict] = {}
+        for method, spec in (spaces or {}).items():
+            try:
+                X, uce_ids, cluster_of, predict_fn = spec
+                A = np.asarray(X, dtype=float)
+                if A.ndim != 2 or A.shape[0] != len(uce_ids):
+                    out[method] = {}
+                    continue
+                y = np.asarray([int(cluster_of.get(u, -1)) for u in uce_ids], dtype=int)
+                if int((y >= 0).sum()) < int(min_n) or not callable(predict_fn):
+                    out[method] = {}
+                    continue
+                boot = bootstrap_stability(
+                    A,
+                    y,
+                    predict_fn=predict_fn,
+                    n_boot=int(n_boot),
+                    seed=int(seed),
+                    min_n=int(min_n),
+                )
+                nul = null_partition_test(
+                    A, y, n_perm=int(n_perm), seed=int(seed), min_n=int(min_n)
+                )
+                block = dict(boot)
+                block.update(
+                    null_p=nul.get("null_p", float("nan")),
+                    null_stat=nul.get("null_stat", float("nan")),
+                    null_n_perm=int(nul.get("null_n_perm", n_perm)),
+                    null_z=nul.get("null_z", float("nan")),
+                )
+                out[method] = block
+            except Exception:
+                out[method] = {}
+        return out
+
     def _triple_stability_verdicts(
         self,
         uces_por_doc: List[List[UCE]],
@@ -5364,6 +6128,16 @@ class DoubleClassifier:
         ari_cross_ab: float,
         ari_cross_bc: float,
         ari_cross_ac: float,
+        # fracción de UCEs sin asignar en el pase tight de cada método
+        noise_wc: float = 0.0,
+        noise_coref: float = 0.0,
+        noise_emb: float = 0.0,
+        # tamanos de clase de la particion CRUDA de cada metodo (sin -1).
+        # Solo los usa el modo 'select' para el gate de no dominancia.
+        partition_sizes: Optional[Dict[str, List[int]]] = None,
+        # Salida de ``_stability_blocks`` (STABILITY_NULL.md §5). ``None`` o
+        # ``{}`` => todo cae a nan y la seleccion se comporta como antes.
+        stability_blocks: Optional[Dict[str, Dict]] = None,
     ) -> Dict:
         """
         Assign per-UCE stability verdicts and build the primary stable list.
@@ -5381,9 +6155,18 @@ class DoubleClassifier:
 
         Graceful degradation:
           If EMB is unavailable (empty stable_emb), "all" collapses to "wc_coref".
+
+        Selected mode ("select"):
+        ──────────────────────────
+        No hay intersección. Se mide cada método por separado (K, ARI
+        intra-método, coverage, ruido) y ``select_method`` elige UNO con la
+        regla pre-registrada ``select-v3``. El ganador es el que decide el
+        ``primary_cluster``; los demás solo aportan métricas comparativas.
         """
         all_uids = {uce.id for doc in uces_por_doc for uce in doc}
         n_total = len(all_uids)
+        _stab = stability_blocks or {}
+        selection: Optional[Selection] = None
 
         # ── Resolve primary set and cluster reference ─────────────────────
         emb_available = bool(stable_emb)
@@ -5412,13 +6195,144 @@ class DoubleClassifier:
             primary_ids = set(stable_wc)
             primary_cluster = stable_wc
 
-        elif _mode == "sim_only":
+        elif _mode in ("coref_only", "sim_only"):
             primary_ids = set(stable_sim)
             primary_cluster = stable_sim
 
         elif _mode == "emb_only":
             primary_ids = set(stable_emb)
             primary_cluster = stable_emb
+
+        elif _mode == "select":
+            # ── Un solo método, elegido por regla pre-registrada ─────────
+            _stable_by_method = {
+                "A": stable_wc,
+                "B": stable_sim,
+                "C": stable_emb,
+            }
+            _share = float(
+                getattr(self.config, "method_selection_min_class_share", 0.01)
+            )
+            _min_class = max(2, int(n_total * _share))
+
+            def _class_stats(stable: Dict[str, int]):
+                """(min_size, mediana, tiny_frac) de las clases del método.
+
+                `tiny_frac` = UCEs estables en clases menores que
+                `min_class_share * n_total`, sobre `n_total`. Es el ruido real
+                de A/B, que el CDH nunca reporta como -1.
+                """
+                if not stable:
+                    return 0, 0.0, 0.0
+                counts: Dict[int, int] = {}
+                for cid in stable.values():
+                    counts[int(cid)] = counts.get(int(cid), 0) + 1
+                sizes = sorted(counts.values())
+                tiny = sum(s for s in sizes if s < _min_class)
+                return sizes[0], float(sizes[len(sizes) // 2]), tiny / max(1, n_total)
+
+            _stats = {m: _class_stats(_stable_by_method[m]) for m in ("A", "B", "C")}
+            _noise = {"A": noise_wc, "B": noise_coref, "C": noise_emb}
+            _ari = {"A": ari_wc, "B": ari_sim, "C": ari_emb}
+            _pert = {"A": "A1<->A2", "B": "B1<->B2", "C": "C1<->C2"}
+            _raw_sizes = partition_sizes or {}
+
+            def _max_share(_m: str) -> float:
+                """Clase mayor / asignadas en la particion CRUDA del metodo.
+
+                Se usa la particion cruda (no la estable) a proposito: una
+                particion C con {442, 25, 12} es degenerada aunque la
+                interseccion tight/loose solo retenga {199, 25, 12}.
+                """
+                sizes = [int(s) for s in (_raw_sizes.get(_m) or []) if int(s) > 0]
+                tot = sum(sizes)
+                return (max(sizes) / tot) if tot > 0 else 0.0
+
+            def _raw_stats(_m: str) -> Dict[str, int]:
+                sizes = [int(s) for s in (_raw_sizes.get(_m) or []) if int(s) > 0]
+                assigned = sum(sizes)
+                return {
+                    "n_total": int(n_total),
+                    "n_assigned": assigned,
+                    "n_noise": int(n_total) - assigned,
+                    "max_class_size": max(sizes) if sizes else 0,
+                }
+
+            def _sb(_m: str) -> Dict:
+                """Bloque de estabilidad del metodo, o {} si no se midio."""
+                return _stab.get(_m) or {}
+
+            metrics = [
+                MethodMetrics(
+                    method=_m,
+                    k=len(set(_stable_by_method[_m].values())),
+                    ari=float(_ari[_m]),
+                    coverage=len(_stable_by_method[_m]) / max(1, n_total),
+                    noise_frac=float(_noise[_m]),
+                    tiny_frac=float(_stats[_m][2]),
+                    perturbation=_pert[_m],
+                    available=bool(_stable_by_method[_m]),
+                    assigned_frac=max(0.0, 1.0 - float(_noise[_m])),
+                    min_class_size=int(_stats[_m][0]),
+                    median_class_size=float(_stats[_m][1]),
+                    max_class_share=_max_share(_m),
+                    **_raw_stats(_m),
+                    backend=(
+                        str(getattr(self.config, "method_c_backend", "hdbscan"))
+                        if _m == "C"
+                        else ""
+                    ),
+                    diagnostic_only=bool(
+                        _m == "C"
+                        and getattr(self.config, "method_c_backend", "hdbscan")
+                        == "hdbscan"
+                        and not getattr(
+                            self.config, "method_c_hdbscan_selectable", False
+                        )
+                    ),
+                    bootstrap_ari=float(_sb(_m).get("bootstrap_ari", float("nan"))),
+                    bootstrap_ci_lo=float(
+                        _sb(_m).get("bootstrap_ari_ci_low", float("nan"))
+                    ),
+                    bootstrap_ci_hi=float(
+                        _sb(_m).get("bootstrap_ari_ci_high", float("nan"))
+                    ),
+                    coverage_stable=float(_sb(_m).get("coverage_stable", float("nan"))),
+                    null_p=float(_sb(_m).get("null_p", float("nan"))),
+                    null_z=float(_sb(_m).get("null_z", float("nan"))),
+                )
+                for _m in ("A", "B", "C")
+            ]
+            selection = select_method(
+                metrics,
+                margin=float(getattr(self.config, "method_selection_margin", 0.02)),
+                coverage_floor=float(
+                    getattr(self.config, "method_selection_coverage_floor", 0.15)
+                ),
+                k_bounds=tuple(
+                    getattr(self.config, "method_selection_k_bounds", (3, 20))
+                ),
+                min_class_share=_share,
+                noise_max=float(
+                    getattr(self.config, "method_selection_noise_max", 0.50)
+                ),
+                max_class_share_max=float(
+                    getattr(self.config, "method_selection_max_class_share", 0.70)
+                ),
+                null_mode=str(
+                    getattr(self.config, "method_selection_null_mode", "diagnostic")
+                ),
+            )
+            self.last_selection = selection
+            if selection.winner is None:
+                primary_ids = set()
+                primary_cluster = {}
+            else:
+                primary_cluster = _stable_by_method[selection.winner]
+                primary_ids = set(primary_cluster)
+            # La persistencia NO se hace aqui: este metodo corre una vez por
+            # trial del optimizador (1050+ veces). La corrida principal la
+            # escribe via WorkflowOrchestrator -> persist_method_selection().
 
         elif _mode == "wc_coref":
             primary_ids = set(stable_cross_ab)
@@ -5428,7 +6342,7 @@ class DoubleClassifier:
             primary_ids = set(stable_cross_ac)
             primary_cluster = stable_wc
 
-        elif _mode == "sim_emb":
+        elif _mode in ("coref_emb", "sim_emb"):
             primary_ids = set(stable_cross_bc)
             primary_cluster = stable_sim
 
@@ -5464,12 +6378,16 @@ class DoubleClassifier:
 
         # ── Back-propagate to UCE objects ─────────────────────────────────
         primary_stable_uces: List[UCE] = []
+        _stability_tag = _mode
+        if _mode == "select":
+            _winner = selection.winner if selection is not None else None
+            _stability_tag = f"select:{_winner}" if _winner else "select:none"
 
         for doc_uces in uces_por_doc:
             for uce in doc_uces:
                 uid = uce.id
 
-                if _mode in ("all", "two_of_three"):
+                if _mode in ("all", "two_of_three", "select"):
                     uce.stable_wc = uid in stable_wc
                     uce.stable_sim = uid in stable_sim
                     uce.stable_emb = uid in stable_emb
@@ -5480,7 +6398,7 @@ class DoubleClassifier:
                 if uid in primary_ids and uid in primary_cluster:
                     uce.cluster_id = primary_cluster[uid]
                     uce.is_stable = True
-                    uce.stability_method = _mode
+                    uce.stability_method = _stability_tag
                     primary_stable_uces.append(uce)
                 else:
                     # Best available partial tag for debugging
@@ -5580,6 +6498,35 @@ class DoubleClassifier:
                 f"║  Primary output:     {n_primary:>6}  ({_pct(n_primary)})                          ║\n"
                 f"╚{'═' * 70}╝\n"
             )
+        elif _mode == "select":
+            _sel_lines = (
+                selection.explain_lines()
+                if selection is not None
+                else ["METHOD SELECTION (sin metricas disponibles)"]
+            )
+            _size_lines = []
+            for _row in selection.all_metrics if selection is not None else []:
+                if not _row.get("available"):
+                    continue
+                _size_lines.append(
+                    f"  [i] {_row['method']}: clase min="
+                    f"{int(_row.get('min_class_size') or 0)} mediana="
+                    f"{float(_row.get('median_class_size') or 0):.0f} "
+                    f"mayor={float(_row.get('max_class_share') or 0):.2f} "
+                    f"asignadas={float(_row.get('assigned_frac') or 0):.3f}"
+                )
+            summary = (
+                f"\n{'=' * 70}\n"
+                f"  STABILITY REPORT - SELECT (un metodo, sin interseccion)\n"
+                f"{'=' * 70}\n"
+                f"  Total UCEs: {n_total}\n"
+                f"  Primary output (metodo elegido): {n_primary} ({_pct(n_primary)})\n"
+                f"  Unstable: {n_unstable} ({_pct(n_unstable)})\n"
+                f"{'-' * 70}\n"
+                + "\n".join(_sel_lines)
+                + ("\n" + "\n".join(_size_lines) if _size_lines else "")
+                + f"\n{'=' * 70}\n"
+            )
         else:
             summary = (
                 f"\n╔{'═' * 70}╗\n"
@@ -5590,11 +6537,72 @@ class DoubleClassifier:
                 f"╚{'═' * 70}╝\n"
             )
 
+        # Nota de interpretacion (una vez por corrida, no por trial): con el
+        # piso del CDH aplicado, la granularidad esta acotada por
+        # construccion (K <= n/piso) y el arbol equilibrado da K ~ 2^d. Subir
+        # el piso baja K y SUBE el ARI entre perturbaciones por construccion.
+        _piso = max(
+            5,
+            int(
+                n_total
+                * float(getattr(self.config, "min_cluster_size_cdh", 0.0) or 0.0)
+            ),
+        )
+        _k_cap = max(1, int(n_total) // max(1, _piso))
+        summary += (
+            f"  [i] Piso CDH={_piso} UCEs -> K_max~={_k_cap}. La estabilidad (ARI\n"
+            f"      entre perturbaciones) crece de forma MONOTONA con la coarseza:\n"
+            f"      mas piso => K menor => ARI mayor por construccion. No comparar\n"
+            f"      ARI entre K distintos como si midieran lo mismo.\n"
+        )
+
         return {
             "primary_stable_uces": primary_stable_uces,
             "summary": summary,
             "effective_mode": _mode,
+            "selection": selection,
+            "stability_blocks": _stab,
+            "selected_method": selection.winner if selection is not None else None,
         }
+
+    def persist_method_selection(self, selection: Selection, n_total: int) -> None:
+        """Persiste la eleccion junto al corpus al que se aplico.
+
+        Snapshot (sobrescrito) + historial JSONL (append-only) para que el
+        auditor ``9_selection_audit.py`` pueda detectar si el ganador cambia
+        entre targets vecinos. Un fallo de escritura nunca aborta el run.
+        """
+        if str(getattr(self.config, "run_mode", "modern")) == "classic":
+            print(
+                "   [i] classic: sin method_selection.json (no hay elección de método)."
+            )
+            return
+        target = int(getattr(self.config, "uce_target_size", 0) or 0)
+        try:
+            persist_selection(
+                selection,
+                os.path.join(REII_DATA_DIR, "method_selection.json"),
+                history_path=os.path.join(REII_DATA_DIR, "method_selection_log.jsonl"),
+                context={
+                    "corpus_fingerprint": _corpus_fingerprint(),
+                    "uce_target_size": target,
+                    "mode": "select",
+                    "n_uces": int(n_total),
+                    "seed": getattr(self.config, "random_state", None),
+                    "method_c_backend": str(
+                        getattr(self.config, "method_c_backend", "hdbscan")
+                    ),
+                    "spec_hash": hashlib.sha256(
+                        json.dumps(
+                            dataclasses.asdict(self.config),
+                            sort_keys=True,
+                            default=str,
+                        ).encode("utf-8")
+                    ).hexdigest()[:16],
+                },
+            )
+        except Exception as exc:  # defensivo: la seleccion ya esta en memoria
+            print(f"   [!] no se pudo persistir la seleccion de metodo: {exc}")
 
     # ═══════════════════════════════════════════════════════════════════
     # MAIN ENTRY POINT
@@ -5615,6 +6623,7 @@ class DoubleClassifier:
         # normalise alias
         # Normalise legacy aliases so downstream code only sees canonical names
         _ALIASES = {
+            "auto": "select",
             "both": "wc_coref",
             "wc_sim": "wc_coref",
             "sim_only": "coref_only",
@@ -5657,7 +6666,7 @@ class DoubleClassifier:
         overlap_aa = overlap_bb = overlap_cc = np.zeros((0, 0))
 
         # ── Step 1: Method A — word-count double-pass ─────────────────
-        _do_wc = mode in ("wc_only", "wc_coref", "wc_emb", "all")
+        _do_wc = mode in ("wc_only", "wc_coref", "wc_emb", "all", "select")
         if _do_wc:
             print(f"\n--- Classification A1: word-count tight (mf={mf1}) ---")
             res_wc1 = self._clasificar_umbral_wordcount(
@@ -5678,7 +6687,7 @@ class DoubleClassifier:
                 print("   [!] Method A failed — skipping.")
 
         # ── Step 2: Method B — coref-driven double-pass ───────────────
-        _do_coref = mode in ("coref_only", "wc_coref", "coref_emb", "all")
+        _do_coref = mode in ("coref_only", "wc_coref", "coref_emb", "all", "select")
         res_coref1 = res_coref2 = None
         stable_coref: Dict[str, int] = {}
         ari_coref = 0.0
@@ -5730,7 +6739,7 @@ class DoubleClassifier:
 
         # ── Step 3: Method C — HDBSCAN on retrofitted embedding space ─
         _do_emb = (
-            mode in ("emb_only", "wc_emb", "coref_emb", "all")
+            mode in ("emb_only", "wc_emb", "coref_emb", "all", "select")
             and retrofitted_vectors is not None
         )
         if _do_emb:
@@ -5745,14 +6754,22 @@ class DoubleClassifier:
                 f"min_samples={ms_tight}) ---"
             )
             res_emb1 = self._clasificar_umbral_embedding(
-                uces_por_doc, mcs_tight, retrofitted_vectors, min_samples=ms_tight
+                uces_por_doc,
+                mcs_tight,
+                retrofitted_vectors,
+                min_samples=ms_tight,
+                variant="tight",
             )
             print(
                 f"--- Classification C2: EMB loose (min_cluster_size={mcs_loose}, "
                 f"min_samples={ms_loose}) ---"
             )
             res_emb2 = self._clasificar_umbral_embedding(
-                uces_por_doc, mcs_loose, retrofitted_vectors, min_samples=ms_loose
+                uces_por_doc,
+                mcs_loose,
+                retrofitted_vectors,
+                min_samples=ms_loose,
+                variant="loose",
             )
 
             if res_emb1 and res_emb2:
@@ -5812,6 +6829,61 @@ class DoubleClassifier:
         ):
             effective_verdict_mode = "two_of_three"
 
+        def _noise_frac(labels: Optional[Dict[str, int]], n_total: int) -> float:
+            """UCEs SIN ASIGNAR (label < 0, o fuera de `labels`) / `n_total`.
+
+            Denominador COMUN (n_total) para que A, B y C sean comparables:
+            antes se dividia por `len(labels)`, asi que el CDH (que asigna
+            etiqueta a toda UC, nunca -1) daba 0.00 por construccion y HDBSCAN
+            parecia el unico metodo con ruido.
+            """
+            if not labels:
+                return 1.0
+            assigned = sum(1 for v in labels.values() if int(v) >= 0)
+            return max(0.0, (int(n_total) - assigned) / max(1, int(n_total)))
+
+        _n_total = len({uce.id for doc in uces_por_doc for uce in doc})
+        noise_wc = _noise_frac(
+            self._extract_uce_labels(res_wc1) if res_wc1 else None, _n_total
+        )
+        noise_coref = _noise_frac(
+            self._extract_uce_labels(res_coref1) if res_coref1 else None, _n_total
+        )
+        noise_emb = _noise_frac(
+            res_emb1["uce_to_label"] if res_emb1 else None, _n_total
+        )
+
+        def _partition_sizes(labels: Optional[Dict[str, int]]) -> List[int]:
+            """Tamanos de clase de la particion CRUDA (excluye no asignados <0).
+
+            Es el denominador correcto del gate de dominancia: la particion
+            cruda del metodo, no la interseccion tight/loose.
+            """
+            return _partition_sizes_from_labels(labels)
+
+        _raw_sizes = {
+            "A": _partition_sizes(
+                self._extract_uce_labels(res_wc1) if res_wc1 else None
+            ),
+            "B": _partition_sizes(
+                self._extract_uce_labels(res_coref1) if res_coref1 else None
+            ),
+            "C": _partition_sizes(res_emb1["uce_to_label"] if res_emb1 else None),
+        }
+
+        self._stability_spaces = self._build_stability_spaces(
+            res_wc1,
+            res_coref1,
+            res_emb1,
+            min_n=int(getattr(self.config, "method_selection_stability_min_n", 30)),
+        )
+        stability_blocks = self._stability_blocks(
+            getattr(self, "_stability_spaces", None),
+            n_boot=int(getattr(self.config, "method_selection_stability_boot", 10)),
+            n_perm=int(getattr(self.config, "method_selection_stability_perm", 50)),
+            min_n=int(getattr(self.config, "method_selection_stability_min_n", 30)),
+            seed=int(getattr(self.config, "random_state", 42) or 42),
+        )
         report = self._triple_stability_verdicts(
             uces_por_doc=uces_por_doc,
             mode=effective_verdict_mode,
@@ -5827,10 +6899,21 @@ class DoubleClassifier:
             ari_cross_ab=ari_cross_ab,
             ari_cross_bc=ari_cross_bc,
             ari_cross_ac=ari_cross_ac,
+            noise_wc=noise_wc,
+            noise_coref=noise_coref,
+            noise_emb=noise_emb,
+            partition_sizes=_raw_sizes,
+            stability_blocks=stability_blocks,
         )
 
         primary_stable = report["primary_stable_uces"]
-        print(report["summary"])
+        if self.quiet_selection:
+            print(
+                "   [select] pass intermedio: seleccion no persistida "
+                "(Method C aun no disponible)"
+            )
+        else:
+            print(report["summary"])
 
         # ── Store pairwise matrices for orchestrator ──────────────────
         def _arr(m):
@@ -5874,14 +6957,19 @@ class DoubleClassifier:
 
         # Choose primary result dict (for vocabulary extraction)
         effective_mode = report["effective_mode"]
-        if effective_mode in ("wc_only", "wc_coref", "wc_emb", "all", "two_of_three"):
+        _selected = report.get("selected_method")
+        if effective_mode == "select":
+            # El vocabulario sale del pase tight del metodo GANADOR (C no tiene
+            # vocabulario propio: se construye desde primary_stable).
+            primary_res = {"A": res_wc1, "B": res_coref1, "C": None}.get(_selected)
+        elif effective_mode in ("wc_only", "wc_coref", "wc_emb", "all", "two_of_three"):
             primary_res = res_wc1
         elif effective_mode in ("coref_only", "coref_emb"):
             primary_res = res_coref1
         else:  # emb_only
             primary_res = None
 
-        if primary_res is None and effective_mode != "emb_only":
+        if primary_res is None and effective_mode not in ("emb_only", "select"):
             print("   [!] Fatal: primary_res unavailable.")
             return (
                 [],
@@ -5905,32 +6993,36 @@ class DoubleClassifier:
         all_res = [r for r in [res_wc1, res_wc2, res_coref1, res_coref2] if r]
 
         # Provide ARI arrays for optimizer compatibility (use best available pair)
-        if _do_wc and res_wc1 and res_wc2:
-            labels1_ari = np.array(
-                [
-                    self._extract_uce_labels(res_wc1).get(u.id, -1)
-                    for u in primary_stable
-                ]
-            )
-            labels2_ari = np.array(
-                [
-                    self._extract_uce_labels(res_wc2).get(u.id, -1)
-                    for u in primary_stable
-                ]
-            )
+        # En "select" el par es el del metodo ganador: el ARI que ve el
+        # optimizador debe ser el mismo que decidio la seleccion.
+        _ari_pair: Optional[Tuple[Optional[Dict], Optional[Dict]]] = None
+        if effective_mode == "select":
+            _ari_pair = {
+                "A": (res_wc1, res_wc2),
+                "B": (res_coref1, res_coref2),
+                "C": (res_emb1, res_emb2),
+            }.get(_selected)
+        elif _do_wc and res_wc1 and res_wc2:
+            _ari_pair = (res_wc1, res_wc2)
         elif _do_coref and res_coref1 and res_coref2:
-            labels1_ari = np.array(
-                [
-                    self._extract_uce_labels(res_coref1).get(u.id, -1)
-                    for u in primary_stable
-                ]
-            )
-            labels2_ari = np.array(
-                [
-                    self._extract_uce_labels(res_coref2).get(u.id, -1)
-                    for u in primary_stable
-                ]
-            )
+            _ari_pair = (res_coref1, res_coref2)
+
+        def _labels_of(res: Optional[Dict]) -> Optional[Dict[str, int]]:
+            if res is None:
+                return None
+            if "uce_to_label" in res:  # Method C
+                return res["uce_to_label"]
+            return self._extract_uce_labels(res)
+
+        if _ari_pair is not None:
+            _l1 = _labels_of(_ari_pair[0])
+            _l2 = _labels_of(_ari_pair[1])
+        else:
+            _l1 = _l2 = None
+
+        if _l1 is not None and _l2 is not None:
+            labels1_ari = np.array([_l1.get(u.id, -1) for u in primary_stable])
+            labels2_ari = np.array([_l2.get(u.id, -1) for u in primary_stable])
         else:
             labels1_ari = labels2_ari = None
 
@@ -7399,6 +8491,157 @@ except ImportError:
     _OPTUNA_AVAILABLE = False
 
 
+# ══════════════════════════════════════════════════════════════════════
+# MODO CLÁSICO (ALCESTE 2012) — preset + identidad de especificación
+# ══════════════════════════════════════════════════════════════════════
+# Escenario A del paper (docs/design_v5/CLASSIC_MODE.md). Un override, no un
+# fork: el mismo pipeline con la fidelidad de 2012. El fork
+# main_workflow_clasico.py queda retirado (shim, §9.5).
+
+CLASSIC_OVERRIDES: Dict[str, Any] = {
+    "run_mode": "classic",
+    "classification_mode": "wc_only",  # §2 Paso 2: un solo CDH
+    "min_forms_uc": [10, 14],  # §2 Paso 1: UC 10 vs 14 palabras
+    "cdh_enforce_min_leaf": False,  # §2: el clásico no tiene piso de hoja
+    "optimize": False,  # §2: parámetros fijos, sin búsqueda
+    "use_embeddings": False,  # §2/§3: sin retrofitting ni Method C
+    "use_liminal_projection": False,  # §3 Paso 6: proyección es de REII
+    "auto_calibrate_uce_size": False,  # §2: tamaño de UCE fijo
+}
+
+_CLASSIC_SPEC_FIELDS = (
+    "classification_mode",
+    "min_forms_uc",
+    "tsj",
+    "pseudocount",
+    "cdh_enforce_min_leaf",
+    "min_cluster_size_cdh",
+    "min_r2_threshold",
+    "uce_target_size",
+    "min_uce_words",
+    "stem_backend",
+    "use_bigrams",
+    "use_trigrams",
+    "use_embeddings",
+    "random_state",
+)
+
+
+def run_spec_id(config) -> str:
+    """Identidad de la especificación (§4.1). Moderno => "modern" literal,
+    para no invalidar ninguna caché previa."""
+    if str(getattr(config, "run_mode", "modern")) != "classic":
+        return "modern"
+    payload = {k: getattr(config, k, None) for k in _CLASSIC_SPEC_FIELDS}
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return "classic:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+
+
+def apply_classic_mode(config: Config, uc_config: "UCBuilderConfig"):
+    """Devuelve (Config, UCBuilderConfig) del escenario A. Idempotente.
+
+    No toca `pseudocount`: el paper pide 0.1 pero la CDH no lo consume
+    (docs/design_v5/CLASSIC_MODE.md §3). Queda 0.0 y se declara.
+    """
+    # `_optimizer_will_run = bool(_OPTIMIZE_ONLY) or (...)` (main()) fuerza el
+    # optimizador aunque classic fije optimize=False; la etapa 2 corre en
+    # mode="select", asi que optimizaria el objetivo moderno sobre una config
+    # clasica y escribiria best_params en data/classic/ con exit 0.
+    if _OPTIMIZE_ONLY:
+        print(
+            "[X] --optimize-only no es compatible con --mode classic: el escenario A "
+            "fija los hiperparámetros del paper (optimize=False) y el optimizador los "
+            "buscaría con el objetivo de 'select'."
+        )
+        sys.exit(2)
+    base = os.path.join(CLASSIC_DATA_DIR)
+    os.makedirs(base, exist_ok=True)
+    os.makedirs(CLASSIC_OUTPUT_DIR, exist_ok=True)
+    classic = dataclasses.replace(
+        config,
+        **CLASSIC_OVERRIDES,
+        # ── Aislamiento (§4.2): una sola palanca arrastra best_params,
+        #    comparative_results y el SQLite de Optuna.
+        db_local_path=os.path.join(base, "workflow_data.json"),
+        optimize_storage=(
+            f"sqlite:///{os.path.join(base, 'reii_optuna.db').replace(os.sep, '/')}"
+            if getattr(config, "optimize_storage", None)
+            else None
+        ),
+        optimize_study_name=f"{getattr(config, 'optimize_study_name', 'reii_search')}"
+        f":{run_spec_id(dataclasses.replace(config, **CLASSIC_OVERRIDES))}",
+    )
+    spec = run_spec_id(classic)
+    print("   [CLI] --mode classic -> ALCESTE 2012 (escenario A)")
+    print(f"         spec={spec}  data_dir={CLASSIC_DATA_DIR}")
+    print(
+        "         overrides: classification_mode=wc_only min_forms_uc=[10, 14]\n"
+        "                    cdh_enforce_min_leaf=False optimize=False\n"
+        "                    use_embeddings=False use_liminal_projection=False\n"
+        "                    auto_calibrate_uce_size=False"
+    )
+    print(
+        "         [!] pseudocount=0.0 (paper pide 0.1; epsilon no implementado "
+        "en la CDH)"
+    )
+    return classic, uc_config
+
+
+# ══════════════════════════════════════════════════════════════════════
+# LECTOR DE PARAMS ROBUSTO (claves desconocidas) — §6
+# ══════════════════════════════════════════════════════════════════════
+_NON_CONFIG_PARAM_KEYS = {
+    # espacio de búsqueda / parámetros que se aplican fuera de Config
+    "cdh_target_k",
+    "min_forms_uc_1",
+    "forms_gap",
+    "similarity_threshold",  # UCBuilderConfig
+    "coref_weight",  # UCBuilderConfig
+    "uc_window_size",  # UCBuilderConfig
+}
+
+
+def resolve_best_params(
+    params: Dict[str, Any],
+    *,
+    where: str = "best_params.json",
+) -> Dict[str, Any]:
+    """Filtra claves no aplicables; falla SÓLO si no queda ninguna válida.
+
+    Un archivo con una clave de un diseño futuro debe degradar, no abortar:
+    el resto de los parámetros sigue siendo el resultado del optimizador.
+    """
+    if not params:
+        return {}
+    known = set(Config.__dataclass_fields__) | _NON_CONFIG_PARAM_KEYS
+    valid: Dict[str, Any] = {}
+    ignored: List[str] = []
+    for key, value in params.items():
+        if key in known:
+            valid[key] = value
+        else:
+            ignored.append(str(key))
+    if ignored:
+        print(
+            f"   [!] {where}: {len(ignored)} clave(s) desconocida(s) ignorada(s): "
+            f"{', '.join(sorted(ignored))}"
+        )
+        logger.warning(
+            "%s: claves ignoradas (no aplicables a esta versión de Config): %s",
+            where,
+            sorted(ignored),
+        )
+        for _k in sorted(ignored):
+            print(f"       - {_k} = {params[_k]!r}")
+    if not valid:
+        raise ValueError(
+            f"{where}: ninguna de las {len(params)} claves es aplicable "
+            f"(ignoradas: {', '.join(sorted(ignored))}). "
+            "No se puede continuar sin parámetros."
+        )
+    return valid
+
+
 # Centinela dominado para trials inválidos (gates duros). Optuna 3.6.2
 # (pin <4.0.0) crashea en TPE multi-objetivo cuando un trial PRUNED
 # (values=None) cae en el conjunto "below" del Parzen estimator
@@ -7417,6 +8660,392 @@ _SENTINEL_TRIAL = (-2.0, -1.0, 0.0)
 def _is_sentinel(values) -> bool:
     """True si `values` es el centinela de trial inválido."""
     return tuple(values) == _SENTINEL_TRIAL
+
+
+_MAX_TB_CHARS = 2000
+_MAX_TB_LINES = 20
+
+
+def _sentinel(trial: "optuna.Trial", reason: str):
+    """Centinela dominado + motivo, para separar gates de excepciones."""
+    try:
+        trial.set_user_attr("outcome", "gate")
+        trial.set_user_attr("gate_reason", str(reason)[:120])
+    except Exception:  # nunca enmascarar el centinela por un fallo de atributos
+        logger.debug("No se pudo registrar gate_reason=%s", reason)
+    return _SENTINEL_TRIAL
+
+
+def _trial_exc_attrs(exc: BaseException) -> Dict[str, str]:
+    """user_attrs de un trial que explotó: tipo, mensaje y ultimas ~20 lineas."""
+    tb = traceback.format_exc().splitlines()[-_MAX_TB_LINES:]
+    return {
+        "error_type": type(exc).__name__,
+        "error_msg": str(exc)[:500],
+        "traceback": "\n".join(tb)[-_MAX_TB_CHARS:],
+    }
+
+
+def _make_guarded_objective(objective, printer=print):
+    """Envuelve el objetivo de Optuna para que NINGUNA excepcion se pierda.
+
+    - `Exception` -> `_SENTINEL_TRIAL` + error_type/error_msg/traceback en
+      user_attrs (el FAIL #81 del probe v4 se perdio justo por no tener esto);
+    - `KeyboardInterrupt`/`SystemExit` NO se capturan (BaseException): se
+      re-lanzan para que Ctrl-C corte de verdad;
+    - imprime una sola vez por trial.
+    """
+
+    def _guarded(trial):
+        try:
+            return objective(trial)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:  # noqa: BLE001 — ver docstring
+            attrs = _trial_exc_attrs(exc)
+            try:
+                trial.set_user_attr("outcome", "exception")
+                trial.set_user_attr("trial_failed", True)
+                for k, v in attrs.items():
+                    trial.set_user_attr(k, v)
+            except Exception:  # registrar el fallo no puede tumbar el trial
+                logger.warning(
+                    "No se pudieron guardar los attrs del trial %s",
+                    getattr(trial, "number", "?"),
+                )
+            printer(
+                f"[!] trial #{getattr(trial, 'number', '?')} fallo: "
+                f"{attrs['error_type']}: {attrs['error_msg']} "
+                f"(traceback en user_attr)"
+            )
+            return _SENTINEL_TRIAL
+
+    return _guarded
+
+
+def _sentinel_breakdown(trials) -> Tuple[int, int, List[str]]:
+    """(por_gate, por_excepcion, detalle) sobre los trials centinela."""
+    n_gate = n_exc = 0
+    detail: List[str] = []
+    for t in trials:
+        try:
+            values = t.values
+        except Exception:
+            continue
+        if values is None or not _is_sentinel(values):
+            continue
+        etype = (getattr(t, "user_attrs", {}) or {}).get("error_type")
+        if etype:
+            n_exc += 1
+            detail.append(
+                f"#{getattr(t, 'number', '?')} {etype}: "
+                f"{(getattr(t, 'user_attrs', {}) or {}).get('error_msg', '')}"
+            )
+        else:
+            n_gate += 1
+    return n_gate, n_exc, detail
+
+
+#: Techo de `cdh_target_k` (piso del CDH expresado en clases objetivo).
+#: No es un objetivo: se convierte en `min_cluster_size_cdh = 1/(2K)`, así
+#: que subirlo REDUCE el piso de hoja y el CDH particiona más. Medido en
+#: `reii_probe_v5_stage1_wc` (n=528): kT<=12 -> K<=18 (viable); kT>=16 ->
+#: K=25..34, fuera del gate `k_bounds=(3,20)`, centinela garantizado. Con
+#: el techo anterior (20) se gastaba el 30 % del presupuesto de la etapa 1
+#: en trials infactibles por construcción.
+_CDH_TARGET_K_HI = 12
+
+
+def _cdh_frac_from_params(params: Dict[str, Any], default: float = 0.10) -> float:
+    """Piso del CDH como fracción de n, resuelto desde los params de un trial.
+
+    Espacio actual: ``cdh_target_k`` (K objetivo) -> ``piso = n / (2K)``, es
+    decir ``frac = 1 / (2K)``. El árbol CDH parte de forma equilibrada, así
+    que K ≈ 2^profundidad y el piso necesario para K hojas es n/(2K).
+
+    Prioridad: si ``min_cluster_size_cdh`` está presente se respeta tal cual
+    (fracción explícita). Eso cubre los estudios y ``best_params.json``
+    previos y, sobre todo, permite que las sondas que editan el archivo a
+    mano (``8_probe_b_permissive.py``) sigan teniendo la última palabra:
+    ``save_pareto_front`` escribe las dos claves y la explícita gana.
+    """
+    legacy = params.get("min_cluster_size_cdh")
+    if legacy is not None:
+        try:
+            return float(min(0.5, max(0.01, float(legacy))))
+        except (TypeError, ValueError):
+            pass
+    k = params.get("cdh_target_k")
+    if k is not None:
+        try:
+            return float(min(0.5, max(0.01, 1.0 / (2.0 * max(1.0, float(k))))))
+        except (TypeError, ValueError):
+            pass
+    return float(default)
+
+
+# ── Espacio condicional v5 ─────────────────────────────────────────────
+def _suggest_conditional(
+    trial: "optuna.Trial", name: str, spec: Dict[str, Any], params: Dict[str, Any]
+):
+    """Muestrea un parametro cuyo rango depende de otro ya muestreado.
+
+    ``spec = {"kind": "lt"|"gt", "other": <driver>, ...}``
+
+      lt → entero en ``[lo, other-1]``   (p.ej. tight < loose)
+      gt → float  en ``(other, hi]``     (p.ej. frac > frac_loose)
+
+    Rangos dinamicos: Optuna 3.6.2 los soporta para int/float (solo exige
+    que ``step`` y ``log`` no cambien entre trials) pero NO para categoricos
+    (``ValueError: CategoricalDistribution does not support dynamic value
+    space``). Por eso el dependiente nunca es categorico.
+    """
+    driver = spec.get("other")
+    base = params.get(driver)
+    if base is None:
+        raise ValueError(f"{name}: falta el parametro driver {driver!r}")
+
+    kind = spec.get("kind")
+    if kind == "lt":
+        lo = int(spec.get("lo", 1))
+        hi = int(base) - 1
+        if hi < lo:
+            raise ValueError(f"{name}: rango vacio [{lo}, {hi}] con {driver}={base}")
+        return trial.suggest_int(name, lo, hi)
+
+    if kind == "gt":
+        lo = float(base) + float(spec.get("eps", 0.002))
+        hi = float(spec.get("hi", 0.06))
+        if hi < lo:
+            raise ValueError(f"{name}: rango vacio [{lo}, {hi}] con {driver}={base}")
+        return trial.suggest_float(name, lo, hi)
+
+    raise ValueError(f"{name}: tipo condicional desconocido {kind!r}")
+
+
+def _expand_levels(spec: Any) -> List[Any]:
+    """Valores alcanzables de un spec (para precargar caches y contar)."""
+    if isinstance(spec, dict):
+        return []  # dependiente: lo cubre el driver + _suggest_conditional
+    if isinstance(spec, tuple) and len(spec) == 2:
+        lo, hi = spec
+        if isinstance(lo, int) and isinstance(hi, int):
+            return list(range(lo, hi + 1))
+        return [lo, hi]
+    if isinstance(spec, list):
+        return list(spec)
+    return [spec]
+
+
+# ── Auditor de bordes del espacio (v6, WARN-only) ──────────────────────
+#: Parametros AMPLIABLES: si el ganador cae en un extremo, el rango puede
+#: estar recortando el optimo. La recomendacion es ensanchar UN paso la
+#: proxima campana con un study NUEVO (Optuna no debe mezclar trials
+#: muestreados de espacios distintos).
+_BOUNDARY_EXPANDABLE = (
+    "min_forms_uc_1",
+    "forms_gap",
+    "similarity_threshold",
+    "min_r2_threshold",
+    "coref_weight",
+)
+
+#: Parametros ESTRUCTURALES: su extremo describe un limite del metodo (o el
+#: rango lo fija otro parametro). Ampliarlo no compra busqueda: cambia el
+#: metodo o produce trials infactibles. El auditor NO los recomienda ampliar.
+_BOUNDARY_STRUCTURAL = (
+    "swap_iterations",
+    "cdh_target_k",
+    "coref_context_units_tight",
+    "hdbscan_uce_min_cluster_frac",
+    "hdbscan_uce_min_cluster_frac_loose",
+)
+
+#: Motivo (una frase) de por que cada estructural NO se amplia.
+_BOUNDARY_STRUCTURAL_WHY = {
+    "swap_iterations": (
+        "0 apaga _intercambio (ablacion del refinamiento, no un "
+        "hiperparametro) y por encima de 5 el swap ya satura"
+    ),
+    "cdh_target_k": (
+        "no es un objetivo: fija min_cluster_size_cdh=1/(2K); pasado "
+        "_CDH_TARGET_K_HI el CDH sale del gate k_bounds y el trial es "
+        "centinela por construccion"
+    ),
+    "coref_context_units_tight": (
+        "es el dependiente de coref_context_units_loose (tight < loose); "
+        "el borde lo fija el driver, no el presupuesto"
+    ),
+    "hdbscan_uce_min_cluster_frac": (
+        "es el dependiente de frac_loose (frac > frac_loose); su techo "
+        "0.04 codifica el regimen mcs~5-20 medido"
+    ),
+    "hdbscan_uce_min_cluster_frac_loose": (
+        "el driver fija la escala de Method C (mcs), no un rango explorable"
+    ),
+}
+
+#: Censura DECLARADA: el optimo queda en el borde y el rango se deja como esta.
+#: No es un descuido: es una decision tomada antes del run v6, y el auditor la
+#: imprime para que quede en el log, no para que se "arregle" despues.
+_BOUNDARY_DECLINED = {
+    "tsj": (
+        "el techo se mantiene: `tsj` es umbral de frecuencia documental, "
+        "subirlo poda vocabulario y baja lemas/UCE (retencion), que es "
+        "endpoint registrado (0.451 frente a 0.537 de ALCESTE). Ganar "
+        "estabilidad podando retencion es el intercambio que este auditor "
+        "existe para hacer visible, no para firmar"
+    ),
+}
+
+
+def _edge_equal(a: Any, b: Any) -> bool:
+    """Igualdad tolerante a floats y a tipos raros (nunca lanza)."""
+    try:
+        if isinstance(a, bool) or isinstance(b, bool):
+            return bool(a == b)
+        if isinstance(a, float) or isinstance(b, float):
+            return math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-12)
+        return bool(a == b)
+    except (TypeError, ValueError):
+        return False
+
+
+def _edge_bounds(spec: Any, chosen: Dict[str, Any]):
+    """(lo, hi) del spec, o None si es de una sola opcion / no clasificable."""
+    if isinstance(spec, tuple) and len(spec) == 2:
+        lo, hi = spec
+        if isinstance(lo, bool) or isinstance(hi, bool):
+            return None
+        if isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
+            return None if lo == hi else (lo, hi)
+        return None
+    if isinstance(spec, list):
+        if len(spec) < 2:
+            return None
+        return spec[0], spec[-1]
+    if isinstance(spec, dict):
+        kind = spec.get("kind")
+        base = chosen.get(spec.get("other"))
+        if base is None:
+            return None
+        try:
+            if kind == "lt":
+                lo, hi = int(spec.get("lo", 1)), int(base) - 1
+            elif kind == "gt":
+                lo = float(base) + float(spec.get("eps", 0.002))
+                hi = float(spec.get("hi", 0.06))
+            else:
+                return None
+        except (TypeError, ValueError):
+            return None
+        return (lo, hi) if hi >= lo else None
+    return None
+
+
+def _edge_num(x: Any) -> str:
+    """Numero compacto: 0.012000000000000002 -> 0.012."""
+    return f"{x:g}" if isinstance(x, float) else str(x)
+
+
+def _edge_label(spec: Any, lo: Any = None, hi: Any = None) -> str:
+    """Rango legible del spec para la linea del auditor."""
+    if isinstance(spec, list):
+        return "[" + ", ".join(_edge_num(x) for x in spec) + "]"
+    if isinstance(spec, tuple) and len(spec) == 2:
+        return f"({_edge_num(spec[0])}, {_edge_num(spec[1])})"
+    if isinstance(spec, dict):
+        other = spec.get("other")
+        return f"(dependiente de {other}: [{_edge_num(lo)}, {_edge_num(hi)}])"
+    return str(spec)
+
+
+def _edge_recommendation(
+    name: str, spec: Any, lo: Any, hi: Any, at_lo: bool, at_hi: bool
+) -> str:
+    """Recomendacion; el prefijo declara la politica (4 categorias)."""
+    if name in _BOUNDARY_STRUCTURAL:
+        why = _BOUNDARY_STRUCTURAL_WHY.get(name, "el borde es un limite del metodo")
+        return f"estructural: rango {_edge_label(spec, lo, hi)}; NO se amplia ({why})"
+    if name in _BOUNDARY_DECLINED:
+        return (
+            f"censurado-declarado: rango {_edge_label(spec, lo, hi)}; NO se "
+            f"amplia ({_BOUNDARY_DECLINED[name]})"
+        )
+    if name not in _BOUNDARY_EXPANDABLE:
+        return (
+            f"sin-clasificar: rango {_edge_label(spec, lo, hi)}; revisar a mano antes "
+            "de ampliar (no hay politica pre-registrada)"
+        )
+
+    tail = "la proxima pasada con un study nuevo"
+    if isinstance(spec, list):
+        if at_hi:
+            step = spec[-1] - spec[-2]
+            what = f"anadir el nivel {round(spec[-1] + step, 10)} por arriba"
+        else:
+            step = spec[1] - spec[0]
+            what = f"anadir un nivel por debajo del minimo (paso {round(step, 10)})"
+        return f"ampliable: lista {_edge_label(spec, lo, hi)} -> {what}; {tail}"
+
+    if isinstance(lo, int) and isinstance(hi, int):
+        step = 1
+    else:
+        step = float(hi) - float(lo)
+        step = step if step > 0 else 1.0
+    new_lo, new_hi = (lo, hi + step) if at_hi else (lo - step, hi)
+    widened = f"({_edge_num(new_lo)}, {_edge_num(new_hi)})"
+    return f"ampliable: rango {_edge_label(spec, lo, hi)} -> {widened}; {tail}"
+
+
+def _boundary_audit(space: Any, chosen_params: Any) -> List[Tuple[str, str, str]]:
+    """Bordes del espacio que toca el trial ganador: solo diagnostico.
+
+    Devuelve ``(param, valor, recomendacion)`` por cada parametro cuyo valor
+    cae en un extremo. ``recomendacion`` empieza por ``ampliable:``,
+    ``estructural:``, ``censurado-declarado:`` o ``sin-clasificar:`` para
+    que el llamador (y los tests) distingan la politica sin parsear texto
+    libre.
+
+    Reglas: tupla ``(lo, hi)`` -> extremo si el valor es ``lo`` o ``hi``;
+    lista categorica -> primer/ultimo nivel; spec condicional -> el extremo
+    se resuelve con el driver; escalar -> una sola opcion, se ignora.
+
+    NUNCA lanza y NUNCA altera la optimizacion: un ``space``/``chosen``
+    inesperado devuelve una lista (posiblemente vacia).
+    """
+    hits: List[Tuple[str, str, str]] = []
+    try:
+        if not isinstance(space, dict) or not isinstance(chosen_params, dict):
+            return hits
+        for name in sorted(space):
+            try:
+                spec = space[name]
+                if name not in chosen_params:
+                    continue
+                value = chosen_params[name]
+                if value is None or isinstance(value, bool):
+                    continue
+                bounds = _edge_bounds(spec, chosen_params)
+                if bounds is None:
+                    continue
+                lo, hi = bounds
+                at_lo = _edge_equal(value, lo)
+                at_hi = _edge_equal(value, hi)
+                if not (at_lo or at_hi):
+                    continue
+                hits.append(
+                    (
+                        name,
+                        str(value),
+                        _edge_recommendation(name, spec, lo, hi, at_lo, at_hi),
+                    )
+                )
+            except Exception:  # un spec raro no tumba el auditor
+                continue
+    except Exception:  # ni un `space`/`chosen` raro
+        return hits
+    return hits
 
 
 class Optimizador:
@@ -7472,6 +9101,8 @@ class Optimizador:
         self.total_uces = total_uces or sum(len(d) for d in self.uces_por_doc)
         # Cache del espacio de búsqueda — se llena en optimizar()
         self._search_space_cached: Dict[str, Any] = {}
+        self._last_pairwise: Optional[Dict[str, Any]] = None
+        self._last_selection: Optional[Selection] = None
 
         # ── Precomputación de cadenas coref por contexto ──────────────────
         # Sólo si hay progressive_segmenter y el modo lo requiere. Con None,
@@ -7519,8 +9150,15 @@ class Optimizador:
         if ctx_values is None:
             try:
                 space = self.get_search_space()
-                tight_vals = space.get("coref_context_units_tight", [2])
-                loose_vals = space.get("coref_context_units_loose", [4])
+                loose_vals = _expand_levels(space.get("coref_context_units_loose", [4]))
+                tight_spec = space.get("coref_context_units_tight", [2])
+                if isinstance(tight_spec, dict):
+                    # v5: el dependiente es un rango dinamico [lo, max(loose)-1]
+                    _lo = int(tight_spec.get("lo", 1))
+                    _hi = max(int(c) for c in loose_vals) - 1 if loose_vals else _lo
+                    tight_vals = list(range(_lo, max(_lo, _hi) + 1))
+                else:
+                    tight_vals = _expand_levels(tight_spec)
                 ctx_values = set(tight_vals) | set(loose_vals)
             except Exception:
                 ctx_values = {
@@ -7717,24 +9355,44 @@ class Optimizador:
         best_idx = self._select_preference(best_trials)
         best_trial = best_trials[best_idx]
 
+        def _bp_params(t) -> Dict[str, Any]:
+            """params del trial + la fracción CDH derivada.
+
+            Se emite también ``min_cluster_size_cdh`` para que los lectores
+            legacy (``rerun_classification``, sondas) no tengan que conocer
+            la parametrización por K.
+            """
+            out = dict(t.params)
+            if "cdh_target_k" in out:
+                out["min_cluster_size_cdh"] = round(_cdh_frac_from_params(out), 4)
+            # v5: los parametros congelados no pasan por suggest_*, asi que no
+            # estan en trial.params. Se emiten explicitos para que
+            # _apply_best_params replique exactamente lo que corrio el trial.
+            for _k, _v in self._search_space_cached.items():
+                if not isinstance(_v, (list, tuple, dict)):
+                    out.setdefault(_k, _v)
+            return out
+
         payload = {
             # ── Compatibilidad con lector legacy ────────────────────────
-            "params": best_trial.params,
+            "params": _bp_params(best_trial),
             # values[0] es coverage_primary en stage 2 ("all") y ari en stage 1 ("wc_only").
             "score": float(best_trial.values[0]),
             # ── Nuevo formato Pareto ────────────────────────────────────
-            "best_params": best_trial.params,
+            "best_params": _bp_params(best_trial),
             "best_values": list(best_trial.values),
             "preference": self.config_base.optimize_preference,
             "directions": list(self.config_base.optimize_directions),
             "objectives": (
                 ["ari", "coverage", "neg_k"]
-                if getattr(self, "_current_stage_mode", "all") == "wc_only"
+                if getattr(self, "_current_stage_mode", "select") == "wc_only"
+                else ["coverage_primary", "ari_winner", "neg_k"]
+                if getattr(self, "_current_stage_mode", "select") == "select"
                 else ["coverage_primary", "agreement_sym", "neg_k"]
             ),
             "pareto_front": [
                 {
-                    "params": dict(t.params),
+                    "params": _bp_params(t),
                     "values": list(t.values),
                     "trial": int(t.number),
                 }
@@ -7863,6 +9521,7 @@ class Optimizador:
             data = json.load(f)
         params = data.get("best_params") or data.get("params")
         if params:
+            params = resolve_best_params(params, where=os.path.basename(path))
             print(f"   [Optimizador] Loaded params from {path}: {params}")
         return params
 
@@ -7910,19 +9569,71 @@ class Optimizador:
         """
         f1, _ = self.config_base.min_forms_uc
         tsj = self.config_base.tsj
-        return {
+        # ── Piso del CDH: se barre en unidades de K, no de fracción ───────
+        # El árbol CDH parte equilibradamente (K ~ 2^profundidad), así que la
+        # fracción solo se distingue en escalones: en la sonda reii_probe_v2
+        # 0.20 y 0.15 daban AMBAS K=4, y 0.10 y 0.08 AMBAS K=8. Una rejilla
+        # de fracciones duplica niveles efectivos (§2 de cada 5 valores) y
+        # deja el óptimo pegado a un techo arbitrario.
+        #
+        # Ahora el sampler elige el K objetivo y el piso se DERIVA:
+        #     min_cluster_size_cdh = 1 / (2K)      (piso ~ n/(2K))
+        # El rango de K coincide con el gate de select-v2 (3..20) y se
+        # recorta para que el piso absoluto (5 UCEs) sea alcanzable; el techo
+        # lo acota además _CDH_TARGET_K_HI (kT no es un objetivo, ver allí).
+        n_total = int(getattr(self, "total_uces", 0) or 0)
+        k_hi = (
+            _CDH_TARGET_K_HI
+            if n_total <= 0
+            else max(3, min(_CDH_TARGET_K_HI, n_total // 10))
+        )
+
+        # ── v5: separacion minima del par de fracciones = 1 UCE ──────────
+        # mcs = max(floor, round(frac*n_emb)). Sumar exactamente 1/n_emb
+        # garantiza round(frac_t*n) >= round(frac_l*n) + 1 (round(x+1) =
+        # round(x)+1), es decir una UCE de separacion real entre C1 y C2.
+        _rv = getattr(self, "retrofitted_vectors", None)
+        n_emb = int(len(_rv)) if _rv else n_total
+        frac_eps = round(1.0 / n_emb, 5) if n_emb > 0 else 0.002
+        frac_eps = max(0.0005, frac_eps)
+
+        space: Dict[str, Any] = {
             "min_forms_uc_1": (max(2, f1 - 4), f1 + 4),
             "forms_gap": (2, 7),
+            # v6 (PRE-REGISTRADO antes del run v6): en v5 el optimo de `tsj`
+            # quedo CENSURADO al techo en AMBAS etapas (tsj=5, rango [2, 5]).
+            # NO se amplia: `tsj` es umbral de frecuencia documental y subirlo
+            # poda vocabulario, lo que baja lemas/UCE (retencion), endpoint
+            # registrado del paper (0.451 frente a 0.537 de ALCESTE). La
+            # censura se declara en _BOUNDARY_DECLINED y el auditor la deja
+            # en el log de cada corrida; el techo se queda en 5.
             "tsj": (max(2, tsj - 2), tsj + 2),
             # pseudocount eliminado (BLOQUE 1: siempre 0.0)
-            "min_cluster_size_cdh": [0.05, 0.08, 0.10, 0.15, 0.20],
-            "swap_iterations": [1, 2, 5],
-            "min_r2_threshold": [0.03, 0.05, 0.08, 0.10],
+            "cdh_target_k": (3, k_hi),
+            # v6 (PRE-REGISTRADO antes del run v6): 0 fuera del espacio.
+            # Con 0, `_partition` no llama a `_intercambio` (`if > 0`): la
+            # particion es el corte k-means crudo. Eso quita varianza entre
+            # pases y SUBE el ARI de estabilidad por construccion, no por
+            # mejor estructura: es una ablacion del refinamiento, no un
+            # hiperparametro (los ganadores de v5, trials 18/19, caian ahi).
+            "swap_iterations": [1, 2, 3, 5],
+            # v5 (§3.3): el ganador esta en el maximo (0.10).
+            "min_r2_threshold": [0.03, 0.05, 0.08, 0.10, 0.15, 0.20],
             "similarity_threshold": [0.25, 0.35, 0.45, 0.55, 0.65],
-            "coref_weight": [0.0, 0.1, 0.2, 0.3, 0.4],
+            # v5 (§3.1): combinacion convexa con similarity_weight=1-w; no
+            # hay cota estructural en 0.4.
+            "coref_weight": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
             "uc_window_size": [1, 2, 3, 4, 5],
-            "coref_context_units_tight": [1, 2, 3],
-            "coref_context_units_loose": [3, 4, 5],
+            # v5 (§3.2): driver primero, dependiente derivado. El ganador del
+            # probe esta en (loose=5, tight=3), ambos bordes superiores.
+            # 6 y 8 duplican el paso para cubrir el regimen saturado
+            # (ctx >= len(doc) es un no-op).
+            "coref_context_units_loose": [3, 4, 5, 6, 8],
+            "coref_context_units_tight": {
+                "kind": "lt",
+                "other": "coref_context_units_loose",
+                "lo": 1,
+            },
             # Fracción de n_embeddable, no absoluto — ver _resolve_hdbscan_uce_params.
             # ([hdbscan-scale-patch])
             # Grilla angostada: REII_EMB_DEBUG confirmó que con corpus chicos
@@ -7932,14 +9643,34 @@ class Optimizador:
             # (0.03-0.15 → mcs≈16-79 en un corpus de 528) nunca entraba en
             # ese rango — de ahí el clusters=0 sistemático en toda la grilla
             # vieja pese a que la matriz sí tenía densidad real.
-            "hdbscan_uce_min_cluster_frac": [0.01, 0.015, 0.02, 0.03, 0.04],
+            # v5: frac_loose NO se mueve (§3.5): con floor=5, 0.002 == 0.005
+            # para el corpus del probe (n_emb=528, ver §3.5 para el limite).
+            "hdbscan_uce_min_cluster_frac": {
+                "kind": "gt",
+                "other": "hdbscan_uce_min_cluster_frac_loose",
+                "hi": 0.04,
+                "eps": frac_eps,
+            },
             "hdbscan_uce_min_cluster_frac_loose": [0.005, 0.01, 0.015, 0.02, 0.03],
         }
+
+        # ── v5 (§5.4): congelar los inertes (rho~0, n=11). El dict admite
+        # escalares: _suggest los devuelve tal cual, sin suggest_*.
+        if bool(getattr(self.config_base, "optimize_freeze_inert", True)):
+            space["min_forms_uc_1"] = int(f1)
+            space["uc_window_size"] = int(getattr(self.uc_config, "window_size", 3))
+        return space
 
     @staticmethod
     def _suggest(trial: "optuna.Trial", space: Dict[str, Any]) -> Dict[str, Any]:
         params: Dict[str, Any] = {}
+        pending: Dict[str, Any] = {}
         for k, v in space.items():
+            # v5: condicional -> segunda pasada, cuando el driver ya esta
+            # muestreado (no depende del orden de insercion del dict).
+            if isinstance(v, dict):
+                pending[k] = v
+                continue
             if isinstance(v, tuple) and len(v) == 2:
                 lo, hi = v
                 if isinstance(lo, int) and isinstance(hi, int):
@@ -7950,6 +9681,8 @@ class Optimizador:
                 params[k] = trial.suggest_categorical(k, v)
             else:
                 params[k] = v
+        for k, spec in pending.items():
+            params[k] = _suggest_conditional(trial, k, spec, params)
         return params
 
     # ══════════════════════════════════════════════════════════════════════
@@ -7994,6 +9727,9 @@ class Optimizador:
 
         # Persistir last_pairwise_stability para que _evaluate_trial lo consuma
         self._last_pairwise = getattr(double_clf, "last_pairwise_stability", None)
+        # Última selección de método (modo "select"): el objetivo de la
+        # etapa 2 es (coverage, ARI del ganador, -K), no agreement_sym.
+        self._last_selection = getattr(double_clf, "last_selection", None)
         return resultados
 
     # ══════════════════════════════════════════════════════════════════════
@@ -8029,8 +9765,14 @@ class Optimizador:
         cfg.classification_mode = mode
         cfg.min_forms_uc = [mf1, mf2]
         cfg.tsj = params["tsj"]
-        cfg.pseudocount = 0.0  # BLOQUE 1: nunca sumar ε
-        cfg.min_cluster_size_cdh = params["min_cluster_size_cdh"]
+        # BLOQUE 1: nunca sumar ε. En clásico se conserva el valor declarado
+        # para poder REPORTARLO (sigue siendo 0.0 mientras ε no exista en la
+        # CDH — ver CLASSIC_MODE.md §3). En moderno, invariante 0.0.
+        if str(getattr(cfg, "run_mode", "modern")) != "classic":
+            cfg.pseudocount = 0.0
+        cfg.min_cluster_size_cdh = _cdh_frac_from_params(
+            params, default=cfg.min_cluster_size_cdh
+        )
         cfg.swap_iterations = params["swap_iterations"]
         cfg.min_r2_threshold = params["min_r2_threshold"]
         cfg.use_liminal_projection = False
@@ -8058,16 +9800,23 @@ class Optimizador:
         # la fracción tight debe ser estrictamente MAYOR que la loose (más
         # grande = clusters más grandes/pocos = "tight"). ([hdbscan-scale-patch]) ─────────
         if cfg.coref_context_units_tight >= cfg.coref_context_units_loose:
-            return _SENTINEL_TRIAL
+            return _sentinel(trial, "espacio: tight >= loose")
         if cfg.hdbscan_uce_min_cluster_frac <= cfg.hdbscan_uce_min_cluster_frac_loose:
-            return _SENTINEL_TRIAL
+            return _sentinel(trial, "espacio: frac <= frac_loose")
 
         # ── Lazy: asegurar cadenas coref para los ctx de ESTE trial ──────
         # Solo si el modo del trial realmente usa Method B — en wc_only
         # (etapa 1) _do_coref es False más abajo en _evaluacion_rapida, así
         # que precomputar aquí es trabajo puro desperdiciado (premerge CPU +
         # Stanza remoto por cada (tight, loose) nuevo que Optuna muestree).
-        _mode_needs_coref = mode in ("coref_only", "wc_coref", "coref_emb", "all")
+        _mode_needs_coref = mode in (
+            "coref_only",
+            "wc_coref",
+            "coref_emb",
+            "all",
+            "select",
+            "auto",
+        )
         if _mode_needs_coref and self.progressive_segmenter is not None:
             self._ensure_coref_chains(
                 [cfg.coref_context_units_tight, cfg.coref_context_units_loose]
@@ -8080,32 +9829,46 @@ class Optimizador:
         uc_cfg.coref_weight = params.get("coref_weight", uc_cfg.coref_weight)
         uc_cfg.window_size = params.get("uc_window_size", uc_cfg.window_size)
 
-        try:
-            result = self._evaluacion_rapida(cfg, uc_cfg=uc_cfg)
-        except Exception as e:
-            logger.debug("Trial %d exception: %s", trial.number, e)
-            return _SENTINEL_TRIAL
+        # v5: sin try/except local. La excepcion sube al guard de
+        # study.optimize (_make_guarded_objective), que la convierte en
+        # centinela CON traceback. Antes se descartaba aqui y el trial
+        # quedaba indistinguible de un gate (o FAIL sin rastro, #81).
+        result = self._evaluacion_rapida(cfg, uc_cfg=uc_cfg)
 
         primary_stable = result[0] if result else None
         if not primary_stable:
-            return _SENTINEL_TRIAL
+            return _sentinel(trial, "sin primary_stable")
 
         labels_primary = [
             u.cluster_id for u in primary_stable if u.cluster_id is not None
         ]
         if len(labels_primary) == 0:
-            return _SENTINEL_TRIAL
+            return _sentinel(trial, "sin labels primarios")
 
         n_clusters = int(len(np.unique(labels_primary)))
 
-        # ── Gate duro: K fuera de rango útil ─────────────────────────────
-        if n_clusters < 2 or n_clusters > 20:
-            return _SENTINEL_TRIAL
+        # ── K real vs K pedido (CLASSIC_MODE.md §7, HARDENING.md §5) ──────
+        # `n_clusters` cuenta solo UCEs ESTABLES. El K que el sampler cree
+        # haber evaluado es `cdh_target_k`; el gate se aplica al K REAL.
+        _k_target = params.get("cdh_target_k")
+        _k_stable = int(n_clusters)
+        _k_ach = _k_stable  # se refina por rama (winner_k / A1 crudo)
+
+        # ── Gate duro: K fuera de rango util ─────────────────────────────
+        # Se aplica al K REAL: un ganador con K=25 no debe llegar al frente
+        # como -25 (HARDENING.md §8.3).
+        if _k_ach < 2 or _k_ach > 20:
+            trial.set_user_attr("k_rejected", int(_k_ach))
+            return _sentinel(trial, "K fuera de [2, 20]")
 
         coverage_primary = len(primary_stable) / max(1, self.total_uces)
 
         # ── Gate duro de cobertura, dependiente del modo ─────────────────
-        if mode == "all":
+        if mode == "select":
+            coverage_gate = float(
+                getattr(self.config_base, "optimize_coverage_gate_select", 0.10)
+            )
+        elif mode == "all":
             coverage_gate = float(
                 getattr(self.config_base, "optimize_coverage_gate_all", 0.10)
             )
@@ -8114,25 +9877,121 @@ class Optimizador:
                 getattr(self.config_base, "optimize_coverage_gate", 0.25)
             )
         if coverage_primary < coverage_gate:
-            return _SENTINEL_TRIAL
+            return _sentinel(trial, "coverage < gate")
+
+        # ── Etapa 2 (select): un solo método, sin agreement_sym ───────────
+        # El sentinel de la etapa 2 anterior ("all") venía de
+        # `if not primary_stable` sobre una intersección triple que era vacía
+        # en el 100% de los trials. Con "select" el primary_stable es el del
+        # método ganador: si algún método es estable, hay resultado.
+        if mode == "select":
+            sel = self._last_selection
+            if sel is None or sel.winner is None:
+                # Abstención (ningun metodo viable). Se registra el motivo: si
+                # el 100% de los trials son centinela, 3_diagnose_optuna_db.py
+                # puede distinguir "gates infactibles" de "abstencion".
+                if sel is not None:
+                    trial.set_user_attr("abstained", True)
+                    trial.set_user_attr("selection_reason", str(sel.reason)[:200])
+                    trial.set_user_attr(
+                        "discarded",
+                        "; ".join(f"{d['method']}: {d['why']}" for d in sel.discarded)[
+                            :300
+                        ],
+                    )
+                return _sentinel(trial, "abstencion (sin metodo viable)")
+            if not math.isfinite(float(sel.winner_ari)):
+                return _sentinel(trial, "ARI del ganador no finito")
+            _win_row = next(
+                (r for r in (sel.all_metrics or []) if r.get("method") == sel.winner),
+                {},
+            )
+            trial.set_user_attr("selected_method", sel.winner)
+            trial.set_user_attr("ari_winner", float(sel.winner_ari))
+            trial.set_user_attr("coverage_primary", float(coverage_primary))
+            trial.set_user_attr(
+                "usable_coverage_winner",
+                float(sel.winner_usable_coverage),
+            )
+            trial.set_user_attr(
+                "tiny_frac_winner", float(_win_row.get("tiny_frac") or 0.0)
+            )
+            trial.set_user_attr(
+                "noise_frac_winner", float(_win_row.get("noise_frac") or 0.0)
+            )
+            trial.set_user_attr(
+                "max_class_share_winner",
+                float(_win_row.get("max_class_share") or 0.0),
+            )
+            trial.set_user_attr(
+                "dominance_corpus_winner",
+                float(_win_row.get("dominance_corpus_eff") or 0.0),
+            )
+            trial.set_user_attr("abstained", False)
+            trial.set_user_attr("n_clusters", n_clusters)
+            trial.set_user_attr("selection_ambiguous", bool(sel.ambiguous))
+            trial.set_user_attr(
+                "selection_criteria_conflict", bool(sel.criteria_conflict)
+            )
+            # ── Kach vs target_k (CLASSIC_MODE.md §7) ────────────────────
+            # El objetivo −K debe ser el K REAL de la partición del ganador.
+            # `n_clusters` cuenta sólo UCEs estables: un trial puede haber
+            # pedido K=8 y producir 5 hojas. Se reporta la brecha en vez de
+            # fingir que se alcanzó el objetivo del sampler.
+            _k_ach = int(getattr(sel, "winner_k", 0) or n_clusters)
+            # HARDENING.md §8.3: la revalidación 2..20 va DESPUÉS del
+            # refinamiento (winner_k=25 no debe llegar al frente como -25).
+            if _k_ach < 2 or _k_ach > 20:
+                trial.set_user_attr("k_rejected", int(_k_ach))
+                return _sentinel(trial, "select: K real fuera de [2, 20]")
+            trial.set_user_attr("k_ach", _k_ach)
+            trial.set_user_attr(
+                "k_target", int(_k_target) if _k_target is not None else -1
+            )
+            trial.set_user_attr(
+                "k_shortfall",
+                int(_k_target) - _k_ach if _k_target is not None else 0,
+            )
+            trial.set_user_attr("k_stable", _k_stable)
+            return (
+                float(coverage_primary),
+                float(sel.winner_ari),
+                -float(_k_ach),
+            )
 
         # ── Etapa 1 (wc_only): ARI como prior ─────────────────────────────
         if mode == "wc_only":
             all_res = result[4] if len(result) > 4 else []
             if len(all_res) < 2 or all_res[0] is None or all_res[1] is None:
-                return _SENTINEL_TRIAL
+                return _sentinel(trial, "wc_only: faltan los dos pases")
             uce_to_a1 = DoubleClassifier._extract_uce_labels(all_res[0])
             uce_to_a2 = DoubleClassifier._extract_uce_labels(all_res[1])
             common = sorted(set(uce_to_a1) & set(uce_to_a2))
             if len(common) < 2:
-                return _SENTINEL_TRIAL
+                return _sentinel(trial, "wc_only: <2 UCEs comunes")
             arr_a = np.array([uce_to_a1[u] for u in common])
             arr_b = np.array([uce_to_a2[u] for u in common])
             valid = (arr_a >= 0) & (arr_b >= 0)
             if valid.sum() < 2:
-                return _SENTINEL_TRIAL
+                return _sentinel(trial, "wc_only: <2 UCEs validas")
             ari = float(adjusted_rand_score(arr_a[valid], arr_b[valid]))
-            return ari, float(coverage_primary), -float(n_clusters)
+            # K de la partición CRUDA de A1 (no el de la estable).
+            _k_ach = int(len(np.unique(arr_a[valid])))
+            # HARDENING.md §8.3: la revalidación 2..20 va DESPUÉS del
+            # refinamiento (el K crudo de A1 manda sobre n_clusters).
+            if _k_ach < 2 or _k_ach > 20:
+                trial.set_user_attr("k_rejected", int(_k_ach))
+                return _sentinel(trial, "wc_only: K real fuera de [2, 20]")
+            trial.set_user_attr("k_ach", _k_ach)
+            trial.set_user_attr(
+                "k_target", int(_k_target) if _k_target is not None else -1
+            )
+            trial.set_user_attr(
+                "k_shortfall",
+                int(_k_target) - _k_ach if _k_target is not None else 0,
+            )
+            trial.set_user_attr("k_stable", _k_stable)
+            return ari, float(coverage_primary), -float(_k_ach)
 
         # ── Etapa 2 (all): veredicto final vía agreement simétrico ───────
         pairwise = self._last_pairwise or {}
@@ -8148,7 +10007,7 @@ class Optimizador:
         if not pairwise.get("emb_persistence_c1") or not pairwise.get(
             "emb_persistence_c2"
         ):
-            return _SENTINEL_TRIAL
+            return _sentinel(trial, "Method C sin persistencia en C1/C2")
 
         ari_ab = float(pairwise.get("ari_cross_ab", 0.0))
         ari_bc = float(pairwise.get("ari_cross_bc", 0.0))
@@ -8168,6 +10027,7 @@ class Optimizador:
     def _active_methods(cfg) -> Set[str]:
         mode = getattr(cfg, "classification_mode", "wc_only")
         aliases = {
+            "auto": "select",
             "both": "wc_coref",
             "wc_sim": "wc_coref",
             "sim_only": "coref_only",
@@ -8182,6 +10042,7 @@ class Optimizador:
             "wc_emb": {"wc", "emb"},
             "coref_emb": {"coref", "emb"},
             "all": {"wc", "coref", "emb"},
+            "select": {"wc", "coref", "emb"},
         }.get(mode, {"wc"})
 
     @staticmethod
@@ -8198,7 +10059,7 @@ class Optimizador:
     def _make_sampler(self):
         name = getattr(self.config_base, "optimize_sampler", "tpe")
         seed = self.config_base.random_state
-        n_startup = int(getattr(self.config_base, "optimize_n_startup_trials", 25))
+        n_startup = int(getattr(self.config_base, "optimize_n_startup_trials", 12))
         multivariate = bool(getattr(self.config_base, "optimize_multivariate", True))
 
         if name == "tpe":
@@ -8206,6 +10067,14 @@ class Optimizador:
                 seed=seed,
                 n_startup_trials=n_startup,
                 multivariate=multivariate,
+                n_ei_candidates=int(
+                    getattr(self.config_base, "optimize_n_ei_candidates", 48)
+                ),
+                # v5: tight/frac_loose se muestrean con rango dinamico, asi
+                # que Optuna los excluye del TPE multivariado y avisa una vez
+                # por trial. Es esperado (el par es un triangulo, no una
+                # gaussiana); se silencia para no inundar el log.
+                warn_independent_sampling=False,
             )
         if name == "random":
             return RandomSampler(seed=seed)
@@ -8263,11 +10132,23 @@ class Optimizador:
 
         if not two_stage:
             params, _ = self._run_single_stage(
-                n_trials=n_trials, mode="all", warm_start_trials=[]
+                n_trials=n_trials, mode="select", warm_start_trials=[]
             )
             return params
 
+        # El piso de 20 trials de la etapa 1 puede agotar (o superar) el
+        # presupuesto total: con --trials 12 y frac=0.5 daba n_stage1=20 y
+        # n_stage2=-8, de modo que la etapa 2 no ejecutaba NINGUN trial y el
+        # resumen lo atribuia a centinelas. Se garantiza 1 trial por etapa.
         n_stage1 = max(20, int(n_trials * stage1_fraction))
+        if n_stage1 >= n_trials:
+            n_stage2_prev = max(1, int(n_trials * (1.0 - stage1_fraction)))
+            n_stage1 = max(1, n_trials - n_stage2_prev)
+            print(
+                f"   [!] Presupuesto de {n_trials} trials < suelo de 20 de la"
+                f" etapa 1: reparto ajustado a {n_stage1} (etapa 1) +"
+                f" {n_trials - n_stage1} (etapa 2)."
+            )
         _, stage1_pareto = self._run_single_stage(
             n_trials=n_stage1,
             mode="wc_only",
@@ -8275,12 +10156,12 @@ class Optimizador:
             study_suffix="_stage1_wc",
         )
 
-        n_stage2 = n_trials - n_stage1
+        n_stage2 = max(1, n_trials - n_stage1)
         stage2_params, _ = self._run_single_stage(
             n_trials=n_stage2,
-            mode="all",
+            mode="select",
             warm_start_trials=stage1_pareto,
-            study_suffix="_stage2_all",
+            study_suffix="_stage2_select",
             perturb_warm_start=True,
         )
         return stage2_params
@@ -8294,6 +10175,13 @@ class Optimizador:
         perturb_warm_start: bool = False,
     ) -> Tuple[Dict[str, Any], List]:
         self._current_stage_mode = mode
+
+        if n_trials <= 0:
+            print(
+                f"   [!] Etapa '{mode}' sin presupuesto de trials "
+                f"(n_trials={n_trials}); no se ejecuta."
+            )
+            return {}, []
 
         sampler = self._make_sampler()
         pruner = self._make_pruner(n_trials)
@@ -8354,7 +10242,15 @@ class Optimizador:
             _seen_enq.add(key)
             study.enqueue_trial(pr)
 
-        for prev_trial in warm_start_trials:
+        if _NO_OPTUNA_WARM_START:
+            print("   [CLI] --no-optuna-warm-start: etapa 2 sin warm start.")
+            warm_start_trials = []
+
+        # v5 (§5.5): el frente de etapa 1 puede traer decenas de puntos y cada
+        # uno se encola x3; sin tope, el warm start consume el presupuesto
+        # entero de la etapa 2 y TPE nunca muestrea.
+        _ws_max = int(getattr(self.config_base, "optimize_warm_start_max", 10))
+        for prev_trial in list(warm_start_trials)[:_ws_max]:
             _enqueue(dict(prev_trial.params))
             if perturb_warm_start:
                 for _salt in range(2):
@@ -8363,13 +10259,25 @@ class Optimizador:
         print(f"\n=== Optuna · {n_trials} trials (mode={mode}) ===")
         print(f"   Sampler    : {self.config_base.optimize_sampler}")
         print(f"   Pruner     : {self.config_base.optimize_pruner}")
-        print(
-            f"   Objectives : {list(zip(['coverage', 'agreement', 'n_clusters'], directions))}"
+        _obj_names = (
+            ["ari", "coverage", "n_clusters"]
+            if mode == "wc_only"
+            else ["coverage", "ari_winner", "n_clusters"]
+            if mode == "select"
+            else ["coverage", "agreement", "n_clusters"]
         )
+        print(f"   Objectives : {list(zip(_obj_names, directions))}")
         print(f"   UCEs       : {self.total_uces}")
+        _cdh_space = self._search_space_cached.get("cdh_target_k")
+        if isinstance(_cdh_space, tuple) and len(_cdh_space) == 2:
+            _lo, _hi = _cdh_space
+            print(
+                f"   CDH floor  : K_obj en [{_lo}, {_hi}] -> "
+                f"frac=1/(2K) en [{1.0 / (2.0 * _hi):.3f}, {1.0 / (2.0 * _lo):.3f}]"
+            )
 
         study.optimize(
-            self._evaluate_trial,
+            _make_guarded_objective(self._evaluate_trial),
             n_trials=n_trials,
             show_progress_bar=False,
         )
@@ -8388,10 +10296,30 @@ class Optimizador:
             f"\n   >>> Estado: {n_completed} completados, "
             f"{n_pruned} pruned, {n_failed} failed"
         )
+        # v5: separar los dos centinelas (antes se confundian).
+        _n_gate, _n_exc, _exc_detail = _sentinel_breakdown(study.trials)
+        print(
+            f"=> Centinelas: {_n_gate} por gates de factibilidad · "
+            f"{_n_exc} por excepción"
+        )
+        if _n_exc:
+            print(
+                f"[!] {_n_exc} trial(s) con excepcion; el detalle esta en "
+                f"user_attr 'traceback' (comparative_results.json)"
+            )
+            for _line in _exc_detail[:5]:
+                print(f"[X] {_line[:160]}")
 
         best_trials = [t for t in study.best_trials if not _is_sentinel(t.values)]
         if not best_trials:
-            print("   [!] Sin soluciones válidas (todos los trials fueron centinela).")
+            if n_completed == 0:
+                print(
+                    "   [!] Sin soluciones válidas: la etapa no ejecutó ningún trial."
+                )
+            else:
+                print(
+                    "   [!] Sin soluciones válidas (todos los trials fueron centinela)."
+                )
             return {}, []
 
         # Persistir frente completo
@@ -8400,6 +10328,23 @@ class Optimizador:
         # Selección según preferencia
         best_idx = self._select_preference(best_trials)
         best_trial = best_trials[best_idx]
+
+        # ── Auditor de bordes (v6, WARN-only): diagnostico, no decision ──
+        # Corre DESPUES de elegir el ganador y no toca ni `best_trial` ni el
+        # study: si un parametro quedo censurado, se reporta aqui para
+        # planificar la proxima campana sin reescribir esta corrida.
+        try:
+            _audit = _boundary_audit(
+                getattr(self, "_search_space_cached", {}) or {},
+                dict(getattr(best_trial, "params", {}) or {}),
+            )
+            print("   ── BOUNDARY AUDIT (WARN-only; no altera el resultado) ──")
+            if not _audit:
+                print("   [OK] ningun parametro elegido esta en un borde.")
+            for _name, _val, _rec in _audit:
+                print(f"   [BORDE] {_name} = {_val} | {_rec}")
+        except Exception as _exc:  # un diagnostico nunca tumba la corrida
+            logger.debug("BOUNDARY AUDIT omitido: %s", _exc)
 
         print(
             f"\n   >>> Pareto front: {len(study.best_trials)} soluciones no-dominadas"
@@ -8494,7 +10439,10 @@ class WorkflowOrchestrator:
         try:
             from reii.backend.config_store import ConfigStore
 
-            ConfigStore(config.db_dsn).seed_from_config(config)
+            # v5: en clásico el seed NO se aplica (el modo fija sus overrides
+            # después); en moderno se conserva el comportamiento previo.
+            if str(getattr(config, "run_mode", "modern")) != "classic":
+                ConfigStore(config.db_dsn).seed_from_config(config)
         except Exception as e:
             print(f"   [WARNING] ConfigStore.seed_from_config falló: {e}")
         self.segmentador = SegmentadorALCESTE(config)
@@ -9021,13 +10969,17 @@ class WorkflowOrchestrator:
 
         def _apply_best_params(bp: Dict[str, Any]) -> None:
             """Aplica los hiperparámetros ganadores al Config activo."""
+            bp = resolve_best_params(bp, where="best_params (apply)")
             mf1 = bp.get("min_forms_uc_1", self.config.min_forms_uc[0])
             gap = bp.get("forms_gap", self.config.min_forms_uc[1] - mf1)
             self.config.min_forms_uc = [mf1, mf1 + gap]
             self.config.tsj = bp.get("tsj", self.config.tsj)
-            self.config.pseudocount = 0.0  # BLOQUE 1: invariante
-            self.config.min_cluster_size_cdh = bp.get(
-                "min_cluster_size_cdh", self.config.min_cluster_size_cdh
+            if str(getattr(self.config, "run_mode", "modern")) != "classic":
+                self.config.pseudocount = 0.0  # BLOQUE 1: invariante
+            # El piso llega como K objetivo (cdh_target_k) o, en archivos
+            # legacy, como fracción directa (min_cluster_size_cdh).
+            self.config.min_cluster_size_cdh = _cdh_frac_from_params(
+                bp, default=self.config.min_cluster_size_cdh
             )
             self.config.swap_iterations = bp.get(
                 "swap_iterations", self.config.swap_iterations
@@ -9079,13 +11031,18 @@ class WorkflowOrchestrator:
         best_params_path = BEST_PARAMS_PATH
         best_params: Optional[Dict[str, Any]] = None
 
-        if os.path.exists(best_params_path):
+        if os.path.exists(best_params_path) and not _OPTIMIZE_ONLY:
             print(
                 "   Found existing best_params.json. Loading parameters and skipping optimizer."
             )
             try:
                 with open(best_params_path, "r", encoding="utf-8") as f:
                     best_data = json.load(f)
+                if str(getattr(self.config, "run_mode", "modern")) == "classic":
+                    raise RuntimeError(
+                        "classic: no se lee best_params.json del modo moderno "
+                        "(aislamiento de artefactos, CLASSIC_MODE.md §4)"
+                    )
                 _stored_fp = best_data.get("corpus_fingerprint")
                 _current_fp = _corpus_fingerprint()
                 if _stored_fp and _stored_fp != _current_fp:
@@ -9125,6 +11082,10 @@ class WorkflowOrchestrator:
                             print(
                                 f"   [WARNING] No se pudo sellar best_params.json: {_se}"
                             )
+            except RuntimeError:
+                # Guardas de contrato (p.ej. aislamiento del modo clasico,
+                # #44): NO deben degradar a 'optimizador si habilitado'.
+                raise
             except Exception as e:
                 print(
                     f"   [WARNING] Could not load best_params.json: {e}. "
@@ -9194,7 +11155,11 @@ class WorkflowOrchestrator:
                 # degrada a 'wc_coref' como antes.
                 retrofitted_vectors=retro_vecs_for_optimizer,
             )
-            mejores_params = optimizador.optimizar(n_trials=self.config.optimize_trials)
+            mejores_params = optimizador.optimizar(
+                n_trials=self.config.optimize_trials,
+                two_stage=getattr(self.config, "optimize_two_stage", True),
+                stage1_fraction=getattr(self.config, "optimize_stage1_fraction", 0.3),
+            )
             if mejores_params:
                 # El frente de Pareto ya quedó persistido dentro de optimizar()
                 _apply_best_params(mejores_params)
@@ -9202,6 +11167,13 @@ class WorkflowOrchestrator:
                 print("   [!] Optimización no viable. Usando config base.")
             cached_uces_por_doc = optimizador.uces_por_doc
             cached_doc_metadata_map = optimizador.doc_metadata_map
+
+            if _OPTIMIZE_ONLY:
+                print(
+                    "   [CLI] --optimize-only: fin tras el optimizador "
+                    f"({os.path.basename(best_params_path)})."
+                )
+                sys.exit(0)
 
         # Restaurar embeddings para la corrida principal
         self.config.use_embeddings = True
@@ -9269,31 +11241,43 @@ class WorkflowOrchestrator:
 
         print("=== Pass 1: CHD with generic vectors ===")
 
-        (
-            uces_est_p1,
-            _,
-            voc_p1,
-            uces_por_doc_p1,
-            resultados_p1,
-            _,
-            _,
-            _,
-            _,
-            doc_metadata_map,
-        ) = self.double_clf.run(
-            corpus_raw,
-            ppmi_builder=self.ppmi_builder,
-            cached_uces_por_doc=cached_uces_por_doc,  # from optimizer, or None
-            cached_doc_metadata_map=cached_doc_metadata_map,
-            checkpoint_path=checkpoint_path,
-            force=force,
-            precomputed_coref_chains=precomputed_coref_chains,  # ← NUEVO
-        )
+        # En modo "select" el pass 1 no puede ver Method C (aun no hay
+        # vectores retrofitted): su seleccion es provisional. No se imprime
+        # como veredicto ni se persiste; el pass 2 es el definitivo.
+        self.double_clf.quiet_selection = True
+        try:
+            (
+                uces_est_p1,
+                _,
+                voc_p1,
+                uces_por_doc_p1,
+                resultados_p1,
+                _,
+                _,
+                _,
+                _,
+                doc_metadata_map,
+            ) = self.double_clf.run(
+                corpus_raw,
+                ppmi_builder=self.ppmi_builder,
+                cached_uces_por_doc=cached_uces_por_doc,  # from optimizer, or None
+                cached_doc_metadata_map=cached_doc_metadata_map,
+                checkpoint_path=checkpoint_path,
+                force=force,
+                precomputed_coref_chains=precomputed_coref_chains,  # ← NUEVO
+            )
+        finally:
+            self.double_clf.quiet_selection = False
 
         # ── Retrofitting on pass-1 output ─────────────────────────────────────────
-        retro_vecs_p1: Optional[Dict[str, np.ndarray]] = (
-            self._compute_retrofitted_vectors(resultados_p1, voc_p1)
-        )
+        if self.config.use_embeddings:
+            retro_vecs_p1: Optional[Dict[str, np.ndarray]] = (
+                self._compute_retrofitted_vectors(resultados_p1, voc_p1)
+            )
+        else:
+            # Escenario A: sin retrofitting (no hay espacio denso que poblar).
+            retro_vecs_p1 = {}
+            print("   [i] use_embeddings=False: sin retrofitting (modo clasico).")
 
         # ── Pass 2 (or fallback to pass-1 results) ───────────────────────────────
         if retro_vecs_p1 is not None:
@@ -9325,6 +11309,22 @@ class WorkflowOrchestrator:
                 self.db.data["pairwise_stability"] = (
                     self.double_clf.last_pairwise_stability
                 )
+            # ── Persist the selected method (mode "select") ──────────────────────
+            _sel = getattr(self.double_clf, "last_selection", None)
+            if _sel is not None:
+                self.db.data["method_selection"] = _sel.to_dict()
+                # Decision persistida (snapshot + historial append-only).
+                # La tabla ya se imprimio en DoubleClassifier.run().
+                self.double_clf.persist_method_selection(_sel, len(uces_est_list))
+
+            # ── Estabilidad ALCESTE clásica (CR + ARI 10↔14) — §5 ────────
+            if str(getattr(self.config, "run_mode", "modern")) == "classic":
+                _pairwise = (
+                    getattr(self.double_clf, "last_pairwise_stability", {}) or {}
+                )
+                _cr = self._classic_stability(uces_est_list, _pairwise)
+                self.db.data["classic_stability"] = _cr
+                print(_classic_stability_text(_cr))
 
         else:
             print("   Single-pass only (no retrofitting available).")
@@ -9830,6 +11830,51 @@ class WorkflowOrchestrator:
                 if term in sig_terms
             }
 
+    def _classic_stability(self, uces_por_doc, pairwise) -> Dict[str, Any]:
+        """CR y ARI de las dos corridas (UC 10 vs UC 14). Sin select-v4."""
+        total = sum(len(d) for d in uces_por_doc)
+        labels = [
+            u.cluster_id
+            for d in uces_por_doc
+            for u in d
+            if getattr(u, "cluster_id", None) is not None
+        ]
+        k = len(set(labels))
+        sizes = Counter(labels)
+        return {
+            "scenario": "A",
+            "run_mode": "classic",
+            "spec_id": run_spec_id(self.config),
+            "n_uces": int(total),
+            "n_stable": int(len(labels)),
+            "cr": float(len(labels) / max(1, total)),
+            "ari_a1_a2": float(pairwise.get("ari_wc", float("nan"))),
+            "k_partition": int(k),
+            "min_class_size": int(min(sizes.values())) if sizes else 0,
+            "max_class_share": float(max(sizes.values()) / max(1, len(labels)))
+            if sizes
+            else 0.0,
+            "max_class_share": float(max(sizes.values()) / max(1, len(labels)))
+            if sizes
+            else 0.0,
+            "pseudocount": float(getattr(self.config, "pseudocount", 0.0)),
+            "epsilon_status": "not_implemented",
+        }
+
+
+def _classic_stability_text(rep: Dict[str, Any]) -> str:
+    return (
+        "\n  ALCESTE 2012 - ESTABILIDAD (UC 10 vs 14)\n"
+        f"    UCEs totales       : {rep['n_uces']}\n"
+        f"    Estables (misma clase en A1 y A2) : {rep['n_stable']}"
+        f"  CR = {rep['cr']:.3f}\n"
+        f"    ARI(A1,A2)         : {rep['ari_a1_a2']:.3f}\n"
+        f"    K (particion)      : {rep['k_partition']}"
+        f"  clase min={rep['min_class_size']}"
+        f"  mayor={rep['max_class_share']:.2f}\n"
+        "    [!] pseudocount=0.0 (paper: 0.1; epsilon no implementado en la CDH)\n"
+    )
+
 
 if __name__ == "__main__":
     # ── Configs  ────────────────────────────────────────────────
@@ -9860,7 +11905,11 @@ if __name__ == "__main__":
         ppmi_k=1.0,
         analytic_temperature=0.1,
         use_llm_synthesis=False,
-        classification_mode="all",
+        # Modo por defecto: un solo método, elegido por regla pre-registrada y
+        # persistido en data/method_selection.json. Los modos de intersección
+        # ("all", "two_of_three", ...) siguen disponibles pero ya no son el
+        # default: no son identificables y no son ALCESTE 2012.
+        classification_mode="select",
         coref_context_units_tight=2,
         coref_context_units_loose=4,
         hdbscan_uce_min_cluster_size=5,
@@ -9873,7 +11922,7 @@ if __name__ == "__main__":
         optimize_pruner="median",
         optimize_storage="sqlite:///reii_optuna.db",  # persistencia entre sesiones
         optimize_study_name="reii_search_v2",
-        optimize_n_startup_trials=25,
+        optimize_n_startup_trials=12,
         optimize_multivariate=True,
         optimize_prune_n_startup=15,
         optimize_directions=("maximize", "maximize", "minimize"),
@@ -9900,11 +11949,30 @@ if __name__ == "__main__":
 
     # ── Override CLI: --mode gana sobre ConfigStore ─────────────────────
     _cli_mode = _parse_cli_mode()
-    if _cli_mode is not None:
+    if _cli_mode is not None and _cli_mode != "classic":
         alceste_config = dataclasses.replace(
             alceste_config, classification_mode=_cli_mode
         )
         print(f"   [CLI] classification_mode={_cli_mode} (--mode override)")
+
+    _mode_final = str(getattr(alceste_config, "classification_mode", "") or "")
+    _mode_final = {"auto": "select"}.get(_mode_final, _mode_final)
+    print(f"   [i] modo de clasificacion efectivo: {_mode_final}")
+    if _mode_final in (
+        "all",
+        "two_of_three",
+        "wc_coref",
+        "wc_emb",
+        "coref_emb",
+        "both",
+        "wc_sim",
+        "sim_emb",
+    ):
+        print(
+            f"   [WARNING] classification_mode={_mode_final!r} es una INTERSECCION "
+            "de metodos (filtro propio, no ALCESTE). El modo por defecto es "
+            "'select' (un metodo: A, B o C, persistido)."
+        )
 
     # ── Override CLI: --uce-target-size gana sobre ConfigStore y desactiva
     #    la auto-calibración (el valor explícito manda) ──────────────────
@@ -9917,6 +11985,10 @@ if __name__ == "__main__":
             f"   [CLI] uce_target_size={_cli_uce} "
             "(--uce-target-size override; auto-calibración desactivada)"
         )
+
+    # ── Overrides CLI del optimizador (DESPUÉS de ConfigStore) ──────────
+    alceste_config = _cli_overrides(alceste_config)
+    _warn_unknown_cli_flags()
 
     gram_config = GramConfig(
         min_tokens_por_uce=30,
@@ -9932,6 +12004,8 @@ if __name__ == "__main__":
         chi2_threshold=3.84,  # α=0.05 for 1 degree of freedom (χ²=3.84)
     )
     cfg = UCBuilderConfig()
+    if _cli_mode == "classic":
+        alceste_config, cfg = apply_classic_mode(alceste_config, cfg)
 
     # Entrenar clasificador de adverbios si no existe
     clf_path = os.path.join(
@@ -9963,13 +12037,27 @@ if __name__ == "__main__":
         "wc_coref",
         "coref_emb",
         "all",
+        "select",
         "both",
         "sim_only",
         "wc_sim",
         "sim_emb",
+        "auto",
     }  # aliases too
+    # El optimizador de dos etapas corre la etapa 2 en mode="select", que
+    # incluye Method B. Con el modo del run en wc_only (p.ej. --optimize-only
+    # sin --mode) el segmenter NO se construía y Method B quedaba
+    # ESTRUCTURALMENTE fuera de la optimización: select-v2 solo podía elegir
+    # entre A y C, así que la decisión persistida no era «A|B|C».
+    _optimizer_will_run = bool(_OPTIMIZE_ONLY) or (
+        bool(getattr(alceste_config, "optimize", True))
+        and not os.path.exists(BEST_PARAMS_PATH)
+    )
+    _needs_progressive = (
+        alceste_config.classification_mode in _coref_modes or _optimizer_will_run
+    )
     progressive_seg = None
-    if alceste_config.classification_mode in _coref_modes:
+    if _needs_progressive:
         progressive_seg = ProgressiveSegmenter(
             model_name=alceste_config.embedding_model_name,
             stanza_lang="es",
@@ -9984,6 +12072,10 @@ if __name__ == "__main__":
         if not STANZA_SERVER_URL and progressive_seg.get_stanza() is None:
             print("[WARN] Stanza failed to load — Method B will be skipped.")
             progressive_seg = None
+        elif _optimizer_will_run and (
+            alceste_config.classification_mode not in _coref_modes
+        ):
+            print("   [i] Method B habilitado para el optimizador (etapa 2 = select).")
 
     # ── PHASE 1: ALCESTE — segmentación + clasificación ──────────────
     # WorkflowOrchestrator.ejecutar() ahora acepta gram_pipeline
@@ -10014,7 +12106,11 @@ if __name__ == "__main__":
         grammatical_pipeline=gram_pipeline,
         global_corpus=global_corpus,
         lex_analyzer=lex_analyzer,
-        grammatical_dashboard_path=OUTPUT_DASHBOARD,
+        grammatical_dashboard_path=(
+            os.path.join(CLASSIC_OUTPUT_DIR, "global_dashboard.json")
+            if alceste_config.run_mode == "classic"
+            else OUTPUT_DASHBOARD
+        ),
         checkpoint_path=_coref_ckpt_path,
         force=_force_from_cli,
     )
@@ -10034,7 +12130,11 @@ if __name__ == "__main__":
     # ── PHASE 3: Red semántica global ────────────────────────────────
     G = lex_analyzer.semantic_network()
     print(f"Network: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
-    lex_analyzer.export_network_gexf(OUTPUT_NETWORK_GEXF)
+    lex_analyzer.export_network_gexf(
+        os.path.join(CLASSIC_OUTPUT_DIR, "red_semantica.gexf")
+        if alceste_config.run_mode == "classic"
+        else OUTPUT_NETWORK_GEXF
+    )
 
     # ── PHASE 4: Guardar todo ─────────────────────────────────────────
     # Fixed: Removed the overlapping positional argument

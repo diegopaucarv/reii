@@ -17,6 +17,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
 from reii.quality import calibration as cal
 from reii.quality import consensus as cons
 from reii.quality import metrics as M
@@ -197,7 +198,9 @@ def build_extras(
     # Silhouette de las clases (nivel UCE) en espacio χ², coseno binario y, si el
     # pipeline usó PPMI, coseno PPMI. Nunca interrumpe el guardado de la corrida.
     try:
-        labelled = [u for u in stable_uces if getattr(u, "cluster_id", None) is not None]
+        labelled = [
+            u for u in stable_uces if getattr(u, "cluster_id", None) is not None
+        ]
         if labelled:
             sil_terms = [_terms(u) for u in labelled]
             if vocab:
@@ -270,6 +273,15 @@ def save_quality_run(
         vocab = getattr(wf, "_vocab", None) or wf.db.data.get("vocabulario")
         extras = build_extras(wf, stable_uces, uces, vocab)
         extras["comparaciones_disponibles"] = avail
+
+        # Eleccion de metodo (modo "select"): se persiste con la corrida para
+        # poder auditar despues si el ganador cambia entre especificaciones.
+        _sel = getattr(getattr(wf, "double_clf", None), "last_selection", None)
+        if _sel is not None:
+            try:
+                extras["method_selection"] = _sel.to_dict()
+            except Exception:  # pragma: no cover - defensivo
+                pass
 
         owns = store is None
         store = store or QualityStore.open()

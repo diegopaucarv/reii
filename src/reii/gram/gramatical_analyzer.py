@@ -67,6 +67,7 @@ from reii.config import (
     USE_WORDNET_QUANTIFIERS,
     WORD_EMBEDDINGS_PATH,
 )
+from reii.hf_local import resolve_model_dir
 from reii.lang.es import (
     ADVERB_BLOCKED,
     ADVERB_CATEGORIES,
@@ -720,8 +721,9 @@ class SurprisalCalculator:
 
     def __init__(self, model_name: str, device: str = "cpu"):
         self.device = device
-        self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
-        self.model = GPT2LMHeadModel.from_pretrained(model_name).to(device)
+        model_src = resolve_model_dir(model_name) or model_name
+        self.tokenizer = GPT2Tokenizer.from_pretrained(model_src)
+        self.model = GPT2LMHeadModel.from_pretrained(model_src).to(device)
         self.model.eval()
 
     def compute_surprisal(self, context: str, target: str) -> Tuple[float, float]:

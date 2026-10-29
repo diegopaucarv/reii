@@ -64,6 +64,21 @@ CONFIG_CATEGORIES: Dict[str, List[str]] = {
         "hdbscan_uce_epsilon",
         "hdbscan_uce_min_samples",
         "hdbscan_uce_metric",
+        # ── v5: knobs que el optimizador mueve y best_params.json persiste.
+        # Faltaban aqui aunque el camino de aplicacion los honra (filtra por
+        # __dataclass_fields__): la asimetria era solo de ESCRITURA, asi que
+        # el dashboard no podia fijarlos (#24-#27).
+        "hdbscan_uce_min_cluster_frac",
+        "hdbscan_uce_min_cluster_frac_loose",
+        "hdbscan_uce_min_cluster_floor",
+        "hdbscan_uce_min_samples_ratio",
+        "cdh_enforce_min_leaf",
+        "method_c_backend",
+        "method_c_hdbscan_selectable",
+        "method_c_target_k",
+        "dense_cdh_min_r2_1d",
+        "dense_cdh_min_r2_dense",
+        "dense_cdh_loose_factor",
     ],
     "afc_y_proyeccion": [
         "use_projection",
@@ -109,6 +124,36 @@ CONFIG_CATEGORIES: Dict[str, List[str]] = {
         "embedding_model_name",
     ],
     "estabilidad": ["use_term_stability", "term_stability_n_iter"],
+    "seleccion_de_metodo": [
+        # Politica select-v4: sin esto, el gate de dominancia y el modo del
+        # nulo solo se pueden fijar por codigo o por CLI.
+        "method_selection_margin",
+        "method_selection_coverage_floor",
+        "method_selection_null_mode",
+        "method_selection_stability_boot",
+        "method_selection_stability_perm",
+        "method_selection_stability_min_n",
+        "method_selection_k_bounds",
+        "method_selection_min_class_share",
+        "method_selection_noise_max",
+        "method_selection_max_class_share",
+    ],
+    "lexico_y_gramatica": [
+        # Vocabulario de formas activas y su cache. `retention_policy` tiene
+        # precedencia Config > ia/gramatica.json > default, asi que una fila
+        # de la BD SI surte efecto.
+        "retention_policy",
+        "token_table_path",
+        "use_token_table_cache",
+        # NO se exponen aqui (a proposito):
+        #   content_pos   -> load_gramatica() lo pisa siempre con
+        #                    ia/gramatica.json: una fila de la BD seria muerta.
+        #   run_mode      -> lo manda `--mode`; una fila cambiaria el escenario
+        #                    (classic vs modern) sin pasar por el CLI.
+        #   corpus_name / n_entrevistas / fecha_analisis -> procedencia.
+        #   palabras_excluir / sinonimos / stopwords_extra / expresiones
+        #                 -> overrides de corpus, viven en ia/*.json.
+    ],
     "optimizacion": [
         "optimize",
         "optimize_trials",
@@ -122,6 +167,13 @@ CONFIG_CATEGORIES: Dict[str, List[str]] = {
         "optimize_directions",
         "optimize_preference",
         "optimize_coverage_gate",
+        "optimize_coverage_gate_all",
+        "optimize_coverage_gate_select",
+        "optimize_stage1_fraction",
+        "optimize_two_stage",
+        "optimize_n_ei_candidates",
+        "optimize_warm_start_max",
+        "optimize_freeze_inert",
     ],
     "general": [
         "db_local_path",

@@ -1,0 +1,5 @@
+{
+  "retention_policy": "tool_adverb_filtered",
+  "content_pos": ["NOUN", "VERB", "ADJ", "ADV"],
+  "tool_adverb_lemmas": []
+}

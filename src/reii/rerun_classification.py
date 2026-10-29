@@ -48,6 +48,7 @@ from reii.main_workflow import (
     RetrofittingConfig,
     UCBuilderConfig,
     WorkflowOrchestrator,
+    _cdh_frac_from_params,
     _corpus_fingerprint,
     obtener_llave_maestra,
 )
@@ -169,7 +170,11 @@ def apply_best_params(orchestrator: WorkflowOrchestrator, bp: Dict[str, Any]) ->
     cfg.min_forms_uc = [mf1, mf1 + gap]
     cfg.tsj = bp.get("tsj", cfg.tsj)
     cfg.pseudocount = 0.0
-    cfg.min_cluster_size_cdh = bp.get("min_cluster_size_cdh", cfg.min_cluster_size_cdh)
+    # Acepta la parametrización nueva (cdh_target_k -> frac=1/(2K)) y la
+    # legacy (min_cluster_size_cdh como fracción directa).
+    cfg.min_cluster_size_cdh = _cdh_frac_from_params(
+        bp, default=cfg.min_cluster_size_cdh
+    )
     cfg.swap_iterations = bp.get("swap_iterations", cfg.swap_iterations)
     cfg.min_r2_threshold = bp.get("min_r2_threshold", cfg.min_r2_threshold)
     if "similarity_threshold" in bp:
