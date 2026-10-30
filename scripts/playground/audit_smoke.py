@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src"
-AUDIT = SRC / "9_selection_audit.py"
+AUDIT = SRC / "reii" / "diag" / "selection_audit.py"
 DOC = ROOT / "docs" / "design_v5" / "AUDIT_V4.md"
 FIXTURES = Path(__file__).resolve().parent / "audit_fixtures"
 DOC_MARKER = "<!-- audit-v4-source -->"

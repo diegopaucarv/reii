@@ -453,6 +453,7 @@ _CLI_FLAGS_SIN_VALOR = {
     "--no-optuna-warm-start",
     "--single-stage",
     "--stability-bootstrap",
+    "--no-stability-bootstrap",
     "--allow-unknown-flags",
 }
 
@@ -497,8 +498,10 @@ Method C y gate de seleccion:
                                  (pre-registrado en el paper: 0.70)
 
 Estabilidad:
-  --stability-bootstrap          bootstrap real; solo en el select final
-                                 (incompatible con --optimize-only)
+  --stability-bootstrap          bootstrap real (default desde v6); solo en el
+                                 select final (incompatible con --optimize-only)
+  --no-stability-bootstrap       opt-out explicito: informe de estabilidad con
+                                 perturbacion, sin bootstrap (comportamiento v5)
 
 Otros:
   -h, --help                     esta ayuda
@@ -639,6 +642,12 @@ def _cli_overrides(cfg):
     if _SINGLE_STAGE:
         upd["optimize_two_stage"] = False
         print("   [CLI] --single-stage: una sola etapa (mode=select)")
+    if "--stability-bootstrap" in sys.argv and "--no-stability-bootstrap" in sys.argv:
+        print(
+            "   [ERROR] --stability-bootstrap y --no-stability-bootstrap son"
+            " excluyentes: elige uno."
+        )
+        sys.exit(2)
     if "--stability-bootstrap" in sys.argv:
         if _OPTIMIZE_ONLY:
             print(
@@ -649,6 +658,21 @@ def _cli_overrides(cfg):
             )
             sys.exit(2)
         upd["stability_bootstrap"] = True
+    if "--no-stability-bootstrap" in sys.argv:
+        # El default de Config ya es True (v6). El flag existe para que la
+        # decision quede ESCRITA en el comando, sin depender del default, y para
+        # recuperar el comportamiento v5 sin tocar CLASSIC_OVERRIDES.
+        upd["stability_bootstrap"] = False
+        print(
+            "   [CLI] --no-stability-bootstrap: informe de estabilidad sin"
+            " bootstrap real (perturbacion)"
+        )
+    if _OPTIMIZE_ONLY:
+        # stability_bootstrap es True por defecto (v6). El optimizador NO debe
+        # correr bootstrap real en cada trial de etapa 2 (1-10 s x cientos) ni
+        # mover su objetivo: se fuerza False. El bootstrap queda reservado al
+        # select final (--mode select sin --optimize-only).
+        upd["stability_bootstrap"] = False
 
     _backend = _cli_val("--method-c-backend")
     if _backend is not None:
@@ -1236,12 +1260,14 @@ class Config:
     method_selection_stability_boot: int = 10
     method_selection_stability_perm: int = 50
     method_selection_stability_min_n: int = 30
-    #: Opt-in del bootstrap real de estabilidad (submuestra + reajuste)
-    #: que alimenta ``DoubleClassifier._stability_spaces``. Con False no
-    #: se construye ningun espacio y ``_stability_blocks`` devuelve
-    #: ``{}``: comportamiento identico al anterior (la corrida congelada
-    #: no cambia). Ver docs/design_v5/BOOTSTRAP_WIRING.md.
-    stability_bootstrap: bool = False
+    #: Bootstrap real de estabilidad (submuestra + reajuste) que alimenta
+    #: ``DoubleClassifier._stability_spaces``. Default True desde v6: el
+    #: bootstrap fue validado como criterio superior a la perturbacion
+    #: (ronda 2c: ganador C, K=3, bootstrap ARI 0.926). Con False no se
+    #: construye ningun espacio y ``_stability_blocks`` devuelve ``{}``.
+    #: El optimizador (--optimize-only) lo fuerza a False en _cli_overrides
+    #: para no mover el objetivo de la etapa 2. Ver docs/design_v5/BOOTSTRAP_WIRING.md.
+    stability_bootstrap: bool = True
     method_selection_k_bounds: Tuple[int, int] = (3, 20)
     method_selection_min_class_share: float = 0.01
     method_selection_noise_max: float = 0.50
@@ -5897,8 +5923,9 @@ class DoubleClassifier:
     ) -> Optional[Dict[str, Tuple[Any, List[str], Dict[str, int], Any]]]:
         """Espacios ``(X, ids, cluster_of, predict_fn)`` del bootstrap.
 
-        Opt-in: con ``config.stability_bootstrap`` en False devuelve ``None``
-        y ``_stability_blocks`` recibe ``None`` -> ``{}``, que es el
+        Default True desde v6. Con ``config.stability_bootstrap`` en False
+        (opt-out explicito, o forzado por ``--optimize-only``) devuelve
+        ``None`` y ``_stability_blocks`` recibe ``None`` -> ``{}``, que es el
         comportamiento previo byte a byte. Con True se intenta cada metodo por
         separado: el que no se pueda construir se OMITE (su ``bootstrap_ari``
         queda ``nan`` = "no disponible" y la regla no descarta por eso) y se
@@ -6603,7 +6630,7 @@ class DoubleClassifier:
         """Persiste la eleccion junto al corpus al que se aplico.
 
         Snapshot (sobrescrito) + historial JSONL (append-only) para que el
-        auditor ``9_selection_audit.py`` pueda detectar si el ganador cambia
+        auditor ``python -m reii.diag selection-audit`` pueda detectar si el ganador cambia
         entre targets vecinos. Un fallo de escritura nunca aborta el run.
         """
         if str(getattr(self.config, "run_mode", "modern")) == "classic":
@@ -7304,6 +7331,11 @@ class TermAnalyzer:
                 tabla = np.array([[a, b], [c, d]])
                 chi2y, pv, _, _ = chi2_contingency(tabla, correction=True)
                 phi = np.sqrt(chi2y / total) if chi2y > 0 else 0.0
+                # φ sin corrección de continuidad: ALCESTE no aplica Yates, de
+                # modo que esta es la única columna comparable en magnitud con
+                # su φ. Yates deflacta φ ~9 %.
+                chi2_raw, pv_raw, _, _ = chi2_contingency(tabla, correction=False)
+                phi_raw = np.sqrt(chi2_raw / total) if chi2_raw > 0 else 0.0
                 signo = 1 if (a / (a + c)) > (presencia_global[j] / n_ucs) else -1
                 cv = np.sqrt(chi2y / (total * (min(tabla.shape) - 1)))
 
@@ -7319,6 +7351,9 @@ class TermAnalyzer:
                         "chi2_yates": round(chi2y, 4),
                         "p_valor": pv,
                         "phi": round(signo * phi, 4),
+                        "chi2_sin_yates": round(chi2_raw, 4),
+                        "p_valor_sin_yates": pv_raw,
+                        "phi_sin_yates": round(signo * phi_raw, 4),
                         "cramer_v": round(cv, 4),
                         "C": round(C, 4),
                         "asignado_estricto": (
@@ -7333,6 +7368,7 @@ class TermAnalyzer:
             return df
         df["p_adj"] = np.nan
         df["significativo"] = False
+        df["significativo_fdr"] = False
         for k in unique_labels:
             mask = df["cluster"] == k
             if not mask.any():
@@ -7343,8 +7379,15 @@ class TermAnalyzer:
                 method="fdr_bh",
             )
             df.loc[mask, "p_adj"] = p_adj
+            # `significativo` es el flag histórico y usa el p-valor CRUDO: no
+            # es un hallazgo corregido por comparaciones múltiples. Se conserva
+            # para no alterar el resto del pipeline; para publicar debe usarse
+            # `significativo_fdr`, que aplica Benjamini-Hochberg por clase.
             df.loc[mask, "significativo"] = (
                 df.loc[mask, "p_valor"] < self.config.fdr_alpha
+            )
+            df.loc[mask, "significativo_fdr"] = (
+                df.loc[mask, "p_adj"] < self.config.fdr_alpha
             )
         return df
 
@@ -8491,6 +8534,27 @@ class SynthesisGenerator:
 # ══════════════════════════════════════════════════════════════════════
 
 
+def _presence_level_coords(cc, voc):
+    """Coordenadas de columna del nivel de PRESENCIA (indicador = 1).
+
+    ``prince.MCA.column_coordinates`` devuelve una fila por columna de la
+    matriz indicadora. Cada variable binaria genera dos columnas, ordenadas
+    (nivel 0, nivel 1), etiquetadas ``<variable>__0`` y ``<variable>__1``. Si
+    se dibujan todas, cada término aparece dos veces y el nivel de ausencia
+    queda pegado al origen.
+
+    Devuelve las filas del nivel 1 en el orden de ``voc``. Si la matriz no
+    está duplicada, devuelve ``cc`` sin tocar.
+    """
+    if len(cc) != 2 * len(voc):
+        return cc
+    labels = [str(i) for i in cc.index]
+    keep = [i for i, lbl in enumerate(labels) if lbl.endswith("__1")]
+    if len(keep) == len(voc):
+        return cc.iloc[keep]
+    return cc.iloc[1::2]
+
+
 class MultivariateAnalyzer:
     def __init__(self, config: Config):
         self.config = config
@@ -8505,16 +8569,32 @@ class MultivariateAnalyzer:
         rc = mca.row_coordinates(df_full[voc])
         cc = mca.column_coordinates(df_full[voc])
         eigen = mca.eigenvalues_
-        exp = eigen / eigen.sum()
+        # La inercia explicada es eigen[i] / inercia TOTAL del MCA, no la parte
+        # relativa entre los ejes retenidos. Con `eigen / eigen.sum()` (solo dos
+        # autovalores) los porcentajes salen inflados (55 % / 43 %) cuando los
+        # ejes explican menos del 2 % de la inercia. prince expone la inercia
+        # total; para variables binarias vale J/Q - 1 = 1,0.
+        total_inertia = float(getattr(mca, "total_inertia_", 0.0))
+        if total_inertia <= 0:
+            total_inertia = float(eigen.sum()) or 1.0
+        exp = eigen / total_inertia
+        # prince expande cada variable binaria en dos columnas indicadoras
+        # (nivel 0 = ausencia, nivel 1 = presencia), en ese orden. Se conserva
+        # el nivel de PRESENCIA: quedarse con [::2] (lo que hacían los
+        # consumidores) graficaba el nivel de ausencia y colapsaba los términos
+        # en el origen.
+        cc_presence = _presence_level_coords(cc, voc)
         print(f"   MCA: eje1={exp[0]:.2%}, eje2={exp[1]:.2%}")
         for i, uc in enumerate(ucs):
             uc.coordinates["mca_row"] = rc.iloc[i].tolist()
 
         return {
             "row_coords": rc.values.tolist(),
-            "col_coords": cc.values.tolist(),
+            "col_coords": cc_presence.values.tolist(),
+            "column_labels": list(voc),
             "explained_inertia": exp.tolist(),
             "eigenvalues": eigen.tolist(),
+            "total_inertia": total_inertia,
             "cluster_labels": [
                 uc.cluster_id if uc.cluster_id is not None else -1 for uc in ucs
             ],
@@ -8816,7 +8896,7 @@ def _cdh_frac_from_params(params: Dict[str, Any], default: float = 0.10) -> floa
     Prioridad: si ``min_cluster_size_cdh`` está presente se respeta tal cual
     (fracción explícita). Eso cubre los estudios y ``best_params.json``
     previos y, sobre todo, permite que las sondas que editan el archivo a
-    mano (``8_probe_b_permissive.py``) sigan teniendo la última palabra:
+    mano (hoy archivadas en ``tools/archive/diag/``) sigan teniendo la última palabra:
     ``save_pareto_front`` escribe las dos claves y la explícita gana.
     """
     legacy = params.get("min_cluster_size_cdh")
@@ -9953,7 +10033,7 @@ class Optimizador:
             sel = self._last_selection
             if sel is None or sel.winner is None:
                 # Abstención (ningun metodo viable). Se registra el motivo: si
-                # el 100% de los trials son centinela, 3_diagnose_optuna_db.py
+                # el 100% de los trials son centinela, `python -m reii.diag optuna-db`
                 # puede distinguir "gates infactibles" de "abstencion".
                 if sel is not None:
                     trial.set_user_attr("abstained", True)

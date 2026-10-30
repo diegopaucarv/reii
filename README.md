@@ -10,7 +10,6 @@ REII is a production‑grade NLP pipeline for Spanish discourse analysis, implem
 
 ![1](docs/img/1.png)
 
-
 ## 🧠 Core NLP Capabilities
 
 ### Advanced Text Segmentation with Sliding Window
@@ -175,6 +174,23 @@ export REII_DATA_DIR=./data/input
 python src/reii/main_workflow_clasico.py
 ```
 
+### Diagnostic CLI
+
+Los análisis de diagnóstico (estudio de Optuna, tamaño de UCE, preflight de artefactos, higiene de
+la BD, multiverso de calidad, auditoría de selección) están en un CLI aparte que nunca se ejecuta
+durante el pipeline:
+
+```bash
+python diag.py                          # lista los comandos (o: python -m reii.diag)
+python -m reii.diag preflight           # ¿coinciden los artefactos con el corpus en disco?
+python -m reii.diag optuna-db           # inspección de solo lectura de la BD del optimizador
+python -m reii.diag optuna-db --help    # ayuda de un comando concreto
+```
+
+Con el paquete instalado o dentro del contenedor sirve `python -m reii.diag`; en el host sin
+`pip install -e .`, usa el shim `python diag.py`. Detalle, riesgos y resultados ya fijados:
+[`docs/DIAG_CLI.md`](docs/DIAG_CLI.md).
+
 #### Environment Variables
 
 | Variable                  | Default                                       | Description                                                            |
@@ -197,6 +213,7 @@ reii/
 │   ├── gram/               # Grammar analysis, UCE extraction, NLP pipeline
 │   ├── lang/               # Spanish language rules & custom lexicons
 │   ├── seg/                # Progressive text segmentation (sliding window)
+│   ├── diag/               # Diagnostic CLI (`python -m reii.diag`), not used by the pipeline
 │   ├── dashboard.py        # Streamlit interactive dashboard
 │   ├── main_workflow.py    # Transformer‑based pipeline (heavy)
 │   ├── main_workflow_clasico.py  # Statistical pipeline (light)

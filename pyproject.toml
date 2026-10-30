@@ -11,6 +11,9 @@ requires-python = ">=3.10"
 license = { text = "Proprietary" }
 authors = [{ name = "REII Team" }]
 
+[project.scripts]
+reii-diag = "reii.diag.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

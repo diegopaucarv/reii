@@ -1,31 +1,17 @@
 """Tests de la atribución de centinelas y del detector de sign flip entre etapas.
 
 No tocan la BD real: construyen una BD SQLite temporal con el esquema de Optuna
-(el mismo de ``data/reii_optuna.db``) y ejercitan ``3_diagnose_optuna_db.py``
-por su ``main(argv)``.
-
-El script empieza por un dígito y vive en la raíz, así que se carga con
-``importlib`` (igual que otros tests de scripts de ``scripts/``) y se inserta la
-raíz en ``sys.path`` para que ``diag_common`` resuelva.
+(el mismo de ``data/reii_optuna.db``) y ejercitan ``reii.diag.optuna_db`` por su
+``main(argv)``. El módulo vive en el paquete, así que basta el import normal
+(pytest añade ``src`` al ``sys.path`` vía ``pyproject.toml``).
 """
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import sqlite3
-import sys
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-_SPEC = importlib.util.spec_from_file_location(
-    "diag_optuna_db_under_test", ROOT / "3_diagnose_optuna_db.py"
-)
-D = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(D)
+from reii.diag import optuna_db as D
 
 # Esquema exacto de data/reii_optuna.db (solo las tablas que lee el script).
 DDL = """

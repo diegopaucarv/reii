@@ -7,7 +7,7 @@
 > ALCESTE 2012 (**13.95** / **0.537**) se declara cuantificada en §4.2; no se
 > corrige ajustando la métrica.
 
-Documento asociado al patch `docs/patches/13_retention_policy.patch`, que se
+Documento asociado al patch `tools/archive/patchset_v5_v6/patches/13_retention_policy.patch`, que se
 aplica **después** de `11_formas_activas.patch` y cuyo **default no cambia la
 retención actual** (`pos_only`).
 
@@ -428,14 +428,14 @@ for p in 01_quality_metrics 02_method_selection 02b_tests_method_selection \
          02d_tests_backend_hardening 02e_tests_stability_null \
          02f_tests_kach_objective 09_fix44_classic_guard \
          10_hardening_ward_max_n 11_formas_activas; do
-  git apply -p1 /c/Users/Julia/Downloads/reii/docs/patches/$p.patch || echo "FAIL $p"
+  git apply -p1 /c/Users/Julia/Downloads/reii/tools/archive/patchset_v5_v6/patches/$p.patch || echo "FAIL $p"
 done
 
 # 2. aplicar el 13 y testear (PITFALL: -o pythonpath= no funciona)
 cp -r /c/Users/Julia/AppData/Local/Temp/b2 /c/Users/Julia/AppData/Local/Temp/b3
 cd /c/Users/Julia/AppData/Local/Temp/b3
-git apply --check -p1 /c/Users/Julia/Downloads/reii/docs/patches/13_retention_policy.patch
-git apply      -p1 /c/Users/Julia/Downloads/reii/docs/patches/13_retention_policy.patch
+git apply --check -p1 /c/Users/Julia/Downloads/reii/tools/archive/patchset_v5_v6/patches/13_retention_policy.patch
+git apply      -p1 /c/Users/Julia/Downloads/reii/tools/archive/patchset_v5_v6/patches/13_retention_policy.patch
 PYTHONPATH=src python -m pytest -q tests/test_retention_policy.py
 
 # 3. medir (modo residuo; determinista, sin red)

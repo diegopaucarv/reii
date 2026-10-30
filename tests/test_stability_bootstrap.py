@@ -29,10 +29,10 @@ import numpy as np
 import pytest
 
 from reii.main_workflow import (
+    _CLI_FLAGS_SIN_VALOR,
+    UC,
     Config,
     DoubleClassifier,
-    UC,
-    _CLI_FLAGS_SIN_VALOR,
     _cli_overrides,
 )
 from reii.method_selection import MethodMetrics
@@ -69,10 +69,11 @@ def _spec(X, y):
     ids = [f"u{i}" for i in range(len(y))]
     return ids, {u: int(c) for u, c in zip(ids, y)}
 
+
 # ── (a) flag apagado: nada cambia ──────────────────────────────────────
 def test_flag_off_builds_no_space_and_keeps_perturbation():
-    assert Config().stability_bootstrap is False
-    dc = _dc()  # default: False
+    assert Config().stability_bootstrap is True  # default desde v6
+    dc = _dc(stability_bootstrap=False)  # opt-out explicito
 
     # Corta ANTES de validar argumentos: no toca ucs/voc/labels.
     assert dc._build_stability_spaces(None, None, None) is None
@@ -144,9 +145,7 @@ def test_one_bad_space_does_not_block_the_rest():
     bad = (np.zeros((1, X.shape[1])), ids, cmap, _predict_thirds)
     good = (X, ids, cmap, _predict_thirds)
 
-    out = dc._stability_blocks(
-        {"A": bad, "B": good}, n_boot=5, n_perm=5, min_n=30
-    )
+    out = dc._stability_blocks({"A": bad, "B": good}, n_boot=5, n_perm=5, min_n=30)
     assert set(out) == {"A", "B"}
     assert out["A"] == {}
     assert np.isfinite(float(out["B"]["bootstrap_ari"]))
@@ -176,8 +175,11 @@ def _uc_corpus(n: int = 40):
 
 
 def test_build_spaces_off_by_default_and_degrades_per_method():
-    # flag off: ni siquiera se mira el resultado
-    assert _dc()._build_stability_spaces(_uc_corpus(), None, None) is None
+    # flag off (opt-out): ni siquiera se mira el resultado
+    assert (
+        _dc(stability_bootstrap=False)._build_stability_spaces(_uc_corpus(), None, None)
+        is None
+    )
 
     dc = _dc(stability_bootstrap=True)
     spaces = dc._build_stability_spaces(_uc_corpus(), None, None, min_n=30)
@@ -247,5 +249,34 @@ def test_cli_flag_declared_and_applied(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["reii", "--stability-bootstrap"])
     assert _cli_overrides(Config()).stability_bootstrap is True
 
+    # default True desde v6: sin flag sigue True
     monkeypatch.setattr(sys, "argv", ["reii"])
+    assert _cli_overrides(Config()).stability_bootstrap is True
+
+
+def test_optimize_only_forces_bootstrap_off(monkeypatch):
+    # Con default True, --optimize-only debe forzar False: el optimizador no
+    # puede correr bootstrap real en cada trial de etapa 2.
+    monkeypatch.setattr("reii.main_workflow._OPTIMIZE_ONLY", True)
+    monkeypatch.setattr(sys, "argv", ["reii", "--optimize-only"])
     assert _cli_overrides(Config()).stability_bootstrap is False
+
+
+def test_no_bootstrap_flag_declared_and_applied(monkeypatch):
+    # Declarado: si no, `_warn_unknown_cli_flags` lo reporta como ignorado.
+    assert "--no-stability-bootstrap" in _CLI_FLAGS_SIN_VALOR
+
+    # Opt-out explicito del default True: recupera el informe por perturbacion.
+    monkeypatch.setattr(sys, "argv", ["reii", "--no-stability-bootstrap"])
+    assert _cli_overrides(Config()).stability_bootstrap is False
+
+
+def test_no_stability_bootstrap_conflicts_with_stability_bootstrap(monkeypatch):
+    # Los dos flags se contradicen: abortar (exit 2) en vez de que gane el
+    # ultimo de argv, que dejaria la decision a merced del orden de los flags.
+    monkeypatch.setattr(
+        sys, "argv", ["reii", "--stability-bootstrap", "--no-stability-bootstrap"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        _cli_overrides(Config())
+    assert exc.value.code == 2

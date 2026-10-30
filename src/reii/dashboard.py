@@ -5304,13 +5304,15 @@ def make_mca_plot(
         if col_coords.shape[1] < 2:
             col_coords = np.hstack([col_coords, np.zeros((col_coords.shape[0], 1))])
 
-        # Fix indicator matrix duplication (prince.MCA returns 2×n_terms)
+        # Fix indicator matrix duplication (prince.MCA returns 2×n_terms).
+        # El nivel de PRESENCIA es el segundo de cada par (…__1): tomar [::2]
+        # dejaba el nivel de ausencia, con todos los términos en el origen.
         if len(col_coords) == 2 * len(terms):
-            col_coords = col_coords[::2]
+            col_coords = col_coords[1::2]
             if term_cluster and len(term_cluster) == 2 * len(terms):
-                term_cluster = term_cluster[::2]
+                term_cluster = term_cluster[1::2]
             if term_phi and len(term_phi) == 2 * len(terms):
-                term_phi = term_phi[::2]
+                term_phi = term_phi[1::2]
 
         # Align lengths
         if len(col_coords) != len(terms):

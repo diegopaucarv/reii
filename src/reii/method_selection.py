@@ -220,7 +220,9 @@ class MethodMetrics:
     @property
     def stability_kind(self) -> str:
         """``"bootstrap"`` | ``"perturbation"`` (lo que mide ``stability``)."""
-        return "bootstrap" if math.isfinite(float(self.bootstrap_ari)) else "perturbation"
+        return (
+            "bootstrap" if math.isfinite(float(self.bootstrap_ari)) else "perturbation"
+        )
 
     def as_row(self) -> Dict[str, Any]:
         row = asdict(self)
@@ -370,9 +372,7 @@ class Selection:
             f"coverage={self.winner_coverage:.3f}  "
             f"usable={self.winner_usable_coverage:.3f}  K={self.winner_k}"
         )
-        out.append(
-            f"     nulo: p={_fmt(self.winner_null_p, '.3f')}"
-        )
+        out.append(f"     nulo: p={_fmt(self.winner_null_p, '.3f')}")
         _win_row = next((r for r in self.all_metrics if r["method"] == self.winner), {})
         out.append(
             f"     clase mayor={float(_win_row.get('max_class_share') or 0.0):.2f} "
@@ -404,8 +404,7 @@ class Selection:
                 )
             if (
                 math.isfinite(float(self.runner_up_usable_coverage))
-                and self.runner_up_usable_coverage
-                > self.winner_usable_coverage + 1e-12
+                and self.runner_up_usable_coverage > self.winner_usable_coverage + 1e-12
             ):
                 out.append(
                     f"  [!] conflicto de criterios: {self.runner_up} tiene mas "
@@ -482,7 +481,8 @@ def _feasibility(
 ) -> Optional[str]:
     """``None`` si el método es viable; si no, el motivo del descarte.
 
-    Los cinco primeros parámetros conservan nombre y posición: ``9_selection_audit``
+    Los cinco primeros parámetros conservan nombre y posición: el auditor
+    (``python -m reii.diag selection-audit``)
     los pasa posicionalmente y lee el umbral del payload. Todo lo de v4 es
     keyword-only, de modo que una llamada vieja sigue funcionando.
     """
@@ -668,8 +668,7 @@ def select_method(
         runner is not None and win.stability_kind != runner.stability_kind
     )
     coverage_conflict = bool(
-        runner is not None
-        and runner.usable_effective > win.usable_effective + 1e-12
+        runner is not None and runner.usable_effective > win.usable_effective + 1e-12
     )
     conflict = bool(runner is not None and (kinds_differ or coverage_conflict))
 
@@ -751,7 +750,7 @@ def persist_selection(
     """Escribe el snapshot (sobrescribe) y, si se pide, una línea de historial.
 
     El historial es JSONL *append-only*: una línea por corrida. Es la materia
-    prima del auditor (``9_selection_audit.py``), que detecta si el ganador
+    prima del auditor (``python -m reii.diag selection-audit``), que detecta si el ganador
     cambia entre especificaciones vecinas.
     """
     ctx = dict(context or {})

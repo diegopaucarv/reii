@@ -510,7 +510,7 @@ Hechos frente a inferencias:
 
 ## 7. Resumen del parche
 
-`docs/patches/11_formas_activas.patch` — 3 hunks, 2 ficheros, LF.
+`tools/archive/patchset_v5_v6/patches/11_formas_activas.patch` — 3 hunks, 2 ficheros, LF.
 
 | Fichero                     |     Línea | Cambio                                             |
 | --------------------------- | --------: | -------------------------------------------------- |
@@ -518,5 +518,5 @@ Hechos frente a inferencias:
 | `src/reii/main_workflow.py` |      1048 | ídem en `Config` (coherencia declarativa)          |
 | `src/reii/main_workflow.py` | 2520-2531 | marcadores sólo por POS; activa = `pos ∧ is_alpha` |
 
-Verificación: `git apply --check docs/patches/11_formas_activas.patch` → **OK** sobre el
+Verificación: `git apply --check tools/archive/patchset_v5_v6/patches/11_formas_activas.patch` → **OK** sobre el
 árbol actual. No modifica los 9 patches existentes ni toca `data/`.

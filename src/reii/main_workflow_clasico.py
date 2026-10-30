@@ -1786,6 +1786,10 @@ class TermAnalyzer:
                 tabla = np.array([[a, b], [c, d]])
                 chi2y, pv, _, _ = chi2_contingency(tabla, correction=True)
                 phi = np.sqrt(chi2y / total) if chi2y > 0 else 0.0
+                # φ sin corrección de continuidad (comparable con ALCESTE, que
+                # no aplica Yates). Yates deflacta φ ~9 %.
+                chi2_raw, pv_raw, _, _ = chi2_contingency(tabla, correction=False)
+                phi_raw = np.sqrt(chi2_raw / total) if chi2_raw > 0 else 0.0
                 signo = 1 if (a / (a + c)) > (presencia_global[j] / n_ucs) else -1
                 cv = np.sqrt(chi2y / (total * (min(tabla.shape) - 1)))
 
@@ -1801,6 +1805,9 @@ class TermAnalyzer:
                         "chi2_yates": round(chi2y, 4),
                         "p_valor": pv,
                         "phi": round(signo * phi, 4),
+                        "chi2_sin_yates": round(chi2_raw, 4),
+                        "p_valor_sin_yates": pv_raw,
+                        "phi_sin_yates": round(signo * phi_raw, 4),
                         "cramer_v": round(cv, 4),
                         "C": round(C, 4),
                         "asignado_estricto": (
@@ -1815,6 +1822,7 @@ class TermAnalyzer:
             return df
         df["p_adj"] = np.nan
         df["significativo"] = False
+        df["significativo_fdr"] = False
         for k in unique_labels:
             mask = df["cluster"] == k
             if not mask.any():
@@ -1825,8 +1833,13 @@ class TermAnalyzer:
                 method="fdr_bh",
             )
             df.loc[mask, "p_adj"] = p_adj
+            # `significativo` usa el p CRUDO (flag histórico); para publicar
+            # úsese `significativo_fdr` (Benjamini-Hochberg por clase).
             df.loc[mask, "significativo"] = (
                 df.loc[mask, "p_valor"] < self.config.fdr_alpha
+            )
+            df.loc[mask, "significativo_fdr"] = (
+                df.loc[mask, "p_adj"] < self.config.fdr_alpha
             )
         return df
 
