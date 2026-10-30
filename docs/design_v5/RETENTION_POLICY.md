@@ -506,12 +506,12 @@ Config(retention_policy="pos_plus_propn")
 
 ### 10.2 Nuevo estado
 
-| punto de definición                             | antes   | ahora                 |
-| ----------------------------------------------- | ------- | --------------------- |
-| `retention_policy.DEFAULT_RETENTION_POLICY`      | `pos_only` | `tool_adverb_filtered` |
-| `gramatica.DEFAULT_GRAMATICA["retention_policy"]`| `pos_only` | `tool_adverb_filtered` |
-| `ia/gramatica.json` → `retention_policy`         | `pos_only` | `tool_adverb_filtered` |
-| `Config.retention_policy`                        | `None`  | `None` (sin cambio)   |
+| punto de definición                               | antes      | ahora                  |
+| ------------------------------------------------- | ---------- | ---------------------- |
+| `retention_policy.DEFAULT_RETENTION_POLICY`       | `pos_only` | `tool_adverb_filtered` |
+| `gramatica.DEFAULT_GRAMATICA["retention_policy"]` | `pos_only` | `tool_adverb_filtered` |
+| `ia/gramatica.json` → `retention_policy`          | `pos_only` | `tool_adverb_filtered` |
+| `Config.retention_policy`                         | `None`     | `None` (sin cambio)    |
 
 Precedencia resultante (sin cambios en su semántica):
 
@@ -554,10 +554,20 @@ re-optimización son pasos manuales posteriores (y quedan fuera de este patch).
 Con `tool_adverb_filtered` el corpus queda en **12.24** lemas/UCE (retención
 **0.451**), frente a **13.95** / **0.537** de ALCESTE 2012:
 
-| magnitud  | `tool_adverb_filtered` | ALCESTE 2012 | diferencia | relativa  |
-| --------- | ---------------------- | ------------ | ---------- | --------- |
+| magnitud  | `tool_adverb_filtered` | ALCESTE 2012 | diferencia | relativa    |
+| --------- | ---------------------- | ------------ | ---------- | ----------- |
 | lemas/UCE | 12.24                  | 13.95        | **−1.71**  | **−12.3 %** |
 | retención | 0.451                  | 0.537        | **−0.086** | **−16.0 %** |
 
 La desviación se declara cuantificada (como ya hacía §4.2); no se corrige
 ajustando la métrica, el umbral (0.30) ni los valores de referencia.
+
+### 10.5 Enmienda 2026-10-30: segunda causa de invalidación de `best_params.json`
+
+§10.3 invalidó `best_params.json` por el vocabulario. Hay una segunda causa,
+independiente: el tercer objetivo del optimizador pasa de `-K` a `-K_util`. El
+detalle está pre-registrado en `docs/design_v5/AHORRO_K_Y_PERSISTENCIA.md`.
+
+Este documento no reabre §2 ni cambia la política de retención: solo anota que
+el archivado de §10.3 se repite, con estudio nuevo, porque los `best_values`
+anteriores ya no son comparables en su tercer slot.

@@ -174,6 +174,11 @@ CONFIG_CATEGORIES: Dict[str, List[str]] = {
         "optimize_n_ei_candidates",
         "optimize_warm_start_max",
         "optimize_freeze_inert",
+        # Piso de cdh_target_k y fallback automatico (ver
+        # docs/design_v5/AHORRO_K_Y_PERSISTENCIA.md §4).
+        "optimize_k_floor",
+        "optimize_k_floor_min",
+        "optimize_k_floor_fallback",
     ],
     "general": [
         "db_local_path",

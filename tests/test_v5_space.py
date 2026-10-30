@@ -350,18 +350,18 @@ def test_boundary_audit_flags_expandable_and_structural_edges():
         },
     }
     chosen = {
-        "tsj": 6,                                    # techo: declinado
-        "coref_weight": 0.0,                         # piso: ampliable
-        "swap_iterations": 5,                        # techo: estructural
-        "cdh_target_k": 3,                           # piso: estructural
-        "min_forms_uc_1": 12,                        # interior
-        "forms_gap": 7,                              # techo: censurado-declarado
-        "similarity_threshold": 0.45,                # interior
-        "min_r2_threshold": 0.03,                    # piso: ampliable
-        "coref_context_units_loose": 5,              # interior (driver)
-        "coref_context_units_tight": 4,              # hi=loose-1: estructural
+        "tsj": 6,  # techo: declinado
+        "coref_weight": 0.0,  # piso: ampliable
+        "swap_iterations": 5,  # techo: estructural
+        "cdh_target_k": 3,  # piso: fallback (ver abajo)
+        "min_forms_uc_1": 12,  # interior
+        "forms_gap": 7,  # techo: censurado-declarado
+        "similarity_threshold": 0.45,  # interior
+        "min_r2_threshold": 0.03,  # piso: ampliable
+        "coref_context_units_loose": 5,  # interior (driver)
+        "coref_context_units_tight": 4,  # hi=loose-1: estructural
         "hdbscan_uce_min_cluster_frac_loose": 0.01,  # interior (driver)
-        "hdbscan_uce_min_cluster_frac": 0.04,        # techo: estructural
+        "hdbscan_uce_min_cluster_frac": 0.04,  # techo: estructural
     }
 
     hits = audit(space, chosen)
@@ -399,10 +399,27 @@ def test_boundary_audit_flags_expandable_and_structural_edges():
     assert "NO se amplia" in rec, rec
     assert by_name["forms_gap"][0] == "7"
 
+    # `cdh_target_k` en el PISO ya no es "estructural": el pipeline relanza
+    # la etapa 2 una vez por abajo (fallback automatico, §4.5 de
+    # AHORRO_K_Y_PERSISTENCIA.md), asi que es una decision reversible.
+    rec = by_name["cdh_target_k"][1]
+    assert rec.startswith("fallback:"), rec
+    assert "piso" in rec, rec
+    assert "K=2" in rec, rec
+    assert by_name["cdh_target_k"][0] == "3"
+
+    # El TECHO sigue siendo estructural (por encima el CDH sale del gate).
+    at_hi = dict(chosen)
+    at_hi["cdh_target_k"] = 12
+    hi_hits = {name: (value, rec) for name, value, rec in audit(space, at_hi)}
+    rec = hi_hits["cdh_target_k"][1]
+    assert rec.startswith("estructural:"), rec
+    assert "NO se amplia" in rec, rec
+    assert "TECHO" in rec, rec
+
     # Estructurales: el auditor dice explicitamente que NO se amplia.
     for name in (
         "swap_iterations",
-        "cdh_target_k",
         "coref_context_units_tight",
         "hdbscan_uce_min_cluster_frac",
     ):

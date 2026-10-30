@@ -526,6 +526,129 @@ _CONFIDENCE_RANK = {"alta": 3, "media": 2, "baja": 1}
 
 
 # ─────────────────────────────────────────────────────────────
+# VISTA POR METODO (selector de particion)
+# ─────────────────────────────────────────────────────────────
+#: Etiquetas visibles del selector lateral. `__stored__` es la particion
+#: persistida en `uces[].cluster_id` (la del ganador de `select-v4`).
+METHOD_PARTITION_LABELS: Dict[str, str] = {
+    "__stored__": "Particion persistida (ganador)",
+    "A": "A · word-count (ALCESTE A1/A2)",
+    "B": "B · similitud/coref (B1/B2)",
+    "C": "C · embeddings (C1/C2)",
+}
+
+_METHOD_PARTITION_ORDER: Tuple[str, ...] = ("A", "B", "C")
+
+
+def method_partition_label(method: str) -> str:
+    """Etiqueta legible de una opcion del selector de particion."""
+    return METHOD_PARTITION_LABELS.get(method, str(method))
+
+
+def method_winner(data: Dict[str, Any]) -> Optional[str]:
+    """Metodo ganador persistido (`method_selection.winner`), o None."""
+    selection = data.get("method_selection") if isinstance(data, dict) else None
+    if isinstance(selection, dict):
+        winner = selection.get("winner")
+        if isinstance(winner, str):
+            return winner
+    return None
+
+
+def method_labels_options(data: Dict[str, Any]) -> Tuple[List[str], str]:
+    """Opciones del selector de particion y opcion por defecto.
+
+    El primer elemento es SIEMPRE ``"__stored__"`` (particion persistida);
+    despues van, en orden A/B/C, los metodos con etiquetas no vacias en
+    ``data["method_labels"]``. El defecto es el ganador si tiene etiquetas y
+    ``"__stored__"`` si no.
+    """
+    raw = data.get("method_labels") if isinstance(data, dict) else None
+    available: List[str] = []
+    if isinstance(raw, dict):
+        for method in _METHOD_PARTITION_ORDER:
+            labels = raw.get(method)
+            if isinstance(labels, dict) and labels:
+                available.append(method)
+    if not available:
+        return ["__stored__"], "__stored__"
+    options = ["__stored__", *available]
+    winner = method_winner(data)
+    return options, (winner if winner in options else "__stored__")
+
+
+def apply_method_labels(data: Dict[str, Any], method: str) -> Dict[str, Any]:
+    """Vista de ``data`` con ``cluster_id`` remapeado a la particion ``method``.
+
+    Nunca muta el snapshot cacheado: con ``"__stored__"`` (o si el metodo no
+    tiene etiquetas) devuelve el MISMO objeto ``data``; en otro caso devuelve un
+    dict nuevo cuya ``"uces"`` es una lista nueva de dicts nuevos. Las UCEs
+    ausentes de la particion quedan con ``cluster_id = -1``.
+
+    ``"terminos"``, ``"ucs"`` y ``"method_selection"`` se conservan tal cual:
+    describen la particion del ganador persistido y las tablas de terminos por
+    clase no se re-derivan para la vista de comparacion.
+    """
+    if not method or method == "__stored__":
+        return data
+    raw = data.get("method_labels") if isinstance(data, dict) else None
+    labels = raw.get(method) if isinstance(raw, dict) else None
+    if not isinstance(labels, dict) or not labels:
+        return data
+    new_uces: List[Dict[str, Any]] = []
+    for uce in data.get("uces") or []:
+        try:
+            cid = int(labels.get(str(uce.get("id")), -1))
+        except (TypeError, ValueError):
+            cid = -1
+        new_uces.append({**uce, "cluster_id": cid})
+    out = dict(data)
+    out["uces"] = new_uces
+    return out
+
+
+def method_labels_summary(data: Dict[str, Any], method: str) -> Dict[str, Any]:
+    """Resumen de la vista: ``{method, n_total, n_classified, k, sizes, coverage}``.
+
+    Devuelve ``{}`` si el metodo no tiene etiquetas. Para ``"__stored__"``
+    resume la particion persistida en ``uces[].cluster_id``.
+    """
+    uces = data.get("uces") or []
+    labels: Dict[str, Any] | None = None
+    if method != "__stored__":
+        raw = data.get("method_labels") if isinstance(data, dict) else None
+        candidate = raw.get(method) if isinstance(raw, dict) else None
+        if not isinstance(candidate, dict) or not candidate:
+            return {}
+        labels = candidate
+
+    assigned: list[int] = []
+    for uce in uces:
+        if labels is None:
+            value = uce.get("cluster_id")
+        else:
+            value = labels.get(str(uce.get("id")), -1)
+        try:
+            cluster = int(value)
+        except (TypeError, ValueError):
+            cluster = -1
+        if cluster >= 0:
+            assigned.append(cluster)
+
+    counts = Counter(assigned)
+    total = len(uces)
+    n_classified = len(assigned)
+    return {
+        "method": method,
+        "n_total": total,
+        "n_classified": n_classified,
+        "k": len(counts),
+        "sizes": dict(sorted(counts.items())),
+        "coverage": (n_classified / total) if total else 0.0,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
 # DATA LOADING (SQLite-backed, version-keyed)
 # ─────────────────────────────────────────────────────────────
 def _wf_version() -> str:
@@ -591,6 +714,38 @@ if annotations_by_uce:
             normalized.append(ann)
         uce["discourse_annotations"] = normalized
     data["annotations_by_uce"] = annotations_by_uce
+
+# ── Selector de particion por metodo (barra lateral) ─────────────
+# `method_labels` trae las tres particiones A/B/C del pipeline en modo
+# `select`; `uces[].cluster_id` solo guarda la del ganador. Con "__stored__"
+# no se copia nada: `apply_method_labels` devuelve el MISMO objeto y los
+# numeros del dashboard son identicos a la vista historica.
+_method_options, _method_default = method_labels_options(data)
+if st.session_state.get("selected_method_view") not in _method_options:
+    st.session_state["selected_method_view"] = _method_default
+_method_view = st.session_state.get("selected_method_view", _method_default)
+if len(_method_options) > 1:
+    _method_view = st.sidebar.selectbox(
+        "Particion (metodo)",
+        options=_method_options,
+        format_func=method_partition_label,
+        key="selected_method_view",
+    )
+    _method_summary = method_labels_summary(data, _method_view)
+    if _method_summary:
+        st.sidebar.caption(
+            f"{method_partition_label(_method_view)}: "
+            f"K={_method_summary['k']} · "
+            f"{_method_summary['n_classified']} UCE "
+            f"(coverage {_method_summary['coverage']:.1%})"
+        )
+    if _method_view != "__stored__":
+        st.sidebar.warning(
+            "vista de comparacion: las tablas de terminos por clase siguen "
+            "siendo las del ganador persistido"
+        )
+# Sin etiquetas (snapshot antiguo) esto es identidad: misma particion de siempre.
+data = apply_method_labels(data, _method_view)
 
 uces = data.get("uces", [])
 

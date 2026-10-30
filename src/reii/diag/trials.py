@@ -21,8 +21,12 @@ Diseno (verificado contra src/reii/main_workflow.py):
      `trial_values` (NO de `trials.value`, que es NULL en multiobjetivo).
      Imprime validez % por etapa autodescubriendo el sufijo del nombre
      (_stage1_wc / _stage2_select).
-  5. Copia best_params.json a data/diag/best_params_seed{N}.json y analiza los
-     params realmente escritos; K = -best_values[2] (objetivos = obj0,obj1,-K).
+  5. Copia best_params.json a data/diag/best_params_seed*.json y analiza los
+     params realmente escritos. El tercer valor es ``-K_util`` (clases con
+     peso suficiente), no el K bruto: ``K_util <= K real``, asi que
+     `-best_values[2]` SUBESTIMA el K de la particion cuando el metodo dejo
+     clases por debajo del piso. El nombre exacto esta en ``objectives``.
+     Ver docs/design_v5/AHORRO_K_Y_PERSISTENCIA.md §3.
      Avisa si sd=0 en todas las semillas (estudio reutilizado / no ejecutado).
 
 Uso:
@@ -282,11 +286,15 @@ def analyze(files: List[Path]) -> None:
             f"objetivo {obj_name:16s}: media={st.mean(values):+.4f} sd={sd:.4f} "
             f"min={min(values):+.4f} max={max(values):+.4f}"
         )
-        if idx == 2:  # neg_k
+        if idx == 2:  # neg_k_util (rama "all" legacy: neg_k)
             ks = [-v for v in values]
             print(
-                f"K = -best_values[2]   : media={st.mean(ks):.2f} "
+                f"K_util = -best_values[2]: media={st.mean(ks):.2f} "
                 f"min={min(ks):.2f} max={max(ks):.2f}"
+            )
+            print(
+                "    (K_util <= K real: las clases bajo el piso de masa no "
+                "cuentan; el nombre exacto esta en 'objectives')"
             )
 
     if len(rows) >= 3 and sds and all(sd == 0.0 for sd in sds):

@@ -21,7 +21,8 @@ Cubre:
 (iii) estructura sintetica: ci_low >= 0.50      -> `test_estructura_sintetica_estable`
 (iv) `null_p` NO gatea por defecto              -> `test_null_p_no_gatea_por_defecto`
 (v) `null_mode="gate"` con `null_p` inyectado   -> ``test_gate_con_null_p_inyectado_descarta``
-(vi) `nan` nunca descarta                       -> ``test_nan_nunca_descarta``
+(vi) `nan` nunca descarta (salvo backend denso) -> ``test_nan_nunca_descarta``
+(vi-b) backend denso sin bootstrap no compite  -> ``test_dense_cdh_sin_bootstrap``
 (vii) piso 0.30 sobre el ARI bootstrap          -> ``test_piso_030_descarta``
 (viii) precondiciones devuelven NaN/None        -> `TestPrecondiciones`
 
@@ -251,7 +252,22 @@ def test_gate_con_null_p_inyectado_descarta():
 
 
 def test_nan_nunca_descarta():
-    """``bootstrap_ari`` y ``null_p`` ausentes: C sigue siendo viable."""
+    """``bootstrap_ari`` y ``null_p`` ausentes: A y B siguen siendo viables.
+
+    La excepcion deliberada son los backends densos (``dense_cdh``, ``ward``,
+    ``kmeans_spherical``): sin ``bootstrap_ari`` su ARI tight/loose no es
+    conmensurable con A/B, asi que no compiten. Eso se cubre en el test
+    siguiente y en ``tests/test_select_v4.py::TestBackendsNoConmensurables``.
+    """
+    a = _m("A", 5, 0.300, 0.500, bootstrap_ari=NAN, null_p=NAN)
+    b = _m("B", 4, 0.620, 0.800, bootstrap_ari=NAN, null_p=NAN)
+    sel = select_method([a, b])
+    assert sel.winner == "B"
+    assert not any(d["method"] in {"A", "B"} for d in sel.discarded)
+
+
+def test_dense_cdh_sin_bootstrap():
+    """``dense_cdh`` sin ``bootstrap_ari`` no compite (politica de patch 16)."""
     a = _m("A", 5, 0.300, 0.500, bootstrap_ari=0.30)
     c = _m(
         "C",
@@ -263,8 +279,10 @@ def test_nan_nunca_descarta():
         null_p=NAN,
     )
     sel = select_method([a, c])
-    assert sel.winner == "C"
-    assert not any(d["method"] == "C" for d in sel.discarded)
+    assert sel.winner == "A"
+    why = [d["why"] for d in sel.discarded if d["method"] == "C"]
+    assert why and "conmensurable" in why[0]
+    assert "bootstrap_ari" in why[0]
 
 
 # ══════════════════════════════════════════════════════════════════════════

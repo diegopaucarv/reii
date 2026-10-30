@@ -1184,7 +1184,13 @@ class Config:
     # v5: congelar los parametros inertes (rho~0) en get_search_space().
     optimize_freeze_inert: bool = True
     optimize_prune_n_startup: int = 15
-    # Multi-objective: (ARI↑, coverage↑, −K↑  ≡ K↓)
+    # Multi-objective: (ARI↑, coverage↑, −K_util↑  ≡ K_util↓)
+    # El tercer objetivo NO es -K: es -K_util, el numero de clases de la
+    # particion del ganador con masa >= ``max(2, int(min_class_share*n))``.
+    # Con -K el sampler podia mejorar el tercer objetivo partiendo en clases
+    # diminutas que no son interpretables; con -K_util la recompensa por subir
+    # K se corta en cuanto las clases nuevas no alcanzan el piso
+    # (docs/design_v5/AHORRO_K_Y_PERSISTENCIA.md §3).
     optimize_directions: Tuple[str, ...] = ("maximize", "maximize", "minimize")
     # Preferencia sobre el frente de Pareto al seleccionar la solución final
     optimize_preference: str = "max_ari"  # "max_ari" | "max_coverage" | "knee"
@@ -1200,6 +1206,19 @@ class Config:
     # sentineliza trials legítimos. 0.10 filtra degenerados extremos
     # (K=1, todos en un cluster) sin matar soluciones reales.
     optimize_coverage_gate_all: float = 0.10
+
+    # ── Piso de `cdh_target_k` y fallback automatico ─────────────────────
+    # El espacio muestrea cdh_target_k en [optimize_k_floor, min(12, n//10)].
+    # Si el ganador de la etapa 2 queda PEGADO al piso, el piso puede estar
+    # recortando el optimo: con optimize_k_floor_fallback se relanza UNA sola
+    # vez la etapa 2 con piso optimize_k_floor_min y estudio NUEVO
+    # (..._stage2_select_k2). El resultado se ADOPTA solo si su ganador elige
+    # el piso nuevo; si vuelve al piso viejo o mas arriba, el piso no era
+    # vinculante y se conserva el original. Nunca baja de 2 (gate duro K>=2).
+    # Pre-registro: docs/design_v5/AHORRO_K_Y_PERSISTENCIA.md §4.
+    optimize_k_floor: int = 3
+    optimize_k_floor_min: int = 2
+    optimize_k_floor_fallback: bool = True
 
     # Modo del veredicto final de estabilidad:
     #   "all"           → triple intersección (dentro + cross). Default, ALCESTE puro.
@@ -6199,6 +6218,10 @@ class DoubleClassifier:
         n_total = len(all_uids)
         _stab = stability_blocks or {}
         selection: Optional[Selection] = None
+        #: Particiones de los TRES metodos ({metodo: {uce_id: clase}}). Solo se
+        #: llena en modo "select": es lo que consume el dashboard para el
+        #: selector A/B/C y lo que se persiste en `data["method_labels"]`.
+        method_labels: Dict[str, Dict[str, int]] = {}
 
         # ── Resolve primary set and cluster reference ─────────────────────
         emb_available = bool(stable_emb)
@@ -6245,25 +6268,43 @@ class DoubleClassifier:
             _share = float(
                 getattr(self.config, "method_selection_min_class_share", 0.01)
             )
-            _min_class = max(2, int(n_total * _share))
+            _min_class = max(2, int(math.ceil(n_total * _share)))
 
             def _class_stats(stable: Dict[str, int]):
-                """(min_size, mediana, tiny_frac) de las clases del método.
+                """(min_size, mediana, tiny_frac, n_useful) de las clases del metodo.
 
                 `tiny_frac` = UCEs estables en clases menores que
                 `min_class_share * n_total`, sobre `n_total`. Es el ruido real
                 de A/B, que el CDH nunca reporta como -1.
+                `n_useful` = numero de clases que SI alcanzan ese piso; es el
+                `K` que paga el tercer objetivo del optimizador (`-K_util`).
                 """
                 if not stable:
-                    return 0, 0.0, 0.0
-                counts: Dict[int, int] = {}
+                    return 0, 0.0, 0.0, 0
+                counts: dict[int, int] = {}
                 for cid in stable.values():
                     counts[int(cid)] = counts.get(int(cid), 0) + 1
                 sizes = sorted(counts.values())
                 tiny = sum(s for s in sizes if s < _min_class)
-                return sizes[0], float(sizes[len(sizes) // 2]), tiny / max(1, n_total)
+                useful = sum(1 for s in sizes if s >= _min_class)
+                return (
+                    sizes[0],
+                    float(sizes[len(sizes) // 2]),
+                    tiny / max(1, n_total),
+                    int(useful),
+                )
 
             _stats = {m: _class_stats(_stable_by_method[m]) for m in ("A", "B", "C")}
+            # Particiones completas de los tres metodos: se calculan igual en
+            # cada trial, pero solo se PERSISTEN al final del run (dashboard),
+            # y no se usan para elegir (la regla sigue siendo select-v4).
+            method_labels = {
+                _m: {
+                    str(k): int(v) for k, v in dict(_stable_by_method[_m] or {}).items()
+                }
+                for _m in ("A", "B", "C")
+                if _stable_by_method[_m]
+            }
             _noise = {"A": noise_wc, "B": noise_coref, "C": noise_emb}
             _ari = {"A": ari_wc, "B": ari_sim, "C": ari_emb}
             _pert = {"A": "A1<->A2", "B": "B1<->B2", "C": "C1<->C2"}
@@ -6307,6 +6348,7 @@ class DoubleClassifier:
                     assigned_frac=max(0.0, 1.0 - float(_noise[_m])),
                     min_class_size=int(_stats[_m][0]),
                     median_class_size=float(_stats[_m][1]),
+                    n_useful_classes=int(_stats[_m][3]),
                     max_class_share=_max_share(_m),
                     **_raw_stats(_m),
                     backend=(
@@ -6624,6 +6666,9 @@ class DoubleClassifier:
             "selection": selection,
             "stability_blocks": _stab,
             "selected_method": selection.winner if selection is not None else None,
+            # Solo en modo "select": las tres particiones completas. Con otros
+            # modos queda {} y el dashboard degrada a la vista persistida.
+            "method_labels": method_labels,
         }
 
     def persist_method_selection(self, selection: Selection, n_total: int) -> None:
@@ -6966,6 +7011,10 @@ class DoubleClassifier:
             partition_sizes=_raw_sizes,
             stability_blocks=stability_blocks,
         )
+
+        # Particiones de los tres metodos (modo "select"); el dashboard las
+        # usa para el selector A/B/C. Con otros modos llega {} y degrada.
+        self.last_method_labels = dict(report.get("method_labels") or {})
 
         primary_stable = report["primary_stable_uces"]
         if self.quiet_selection:
@@ -8886,6 +8935,39 @@ def _sentinel_breakdown(trials) -> Tuple[int, int, List[str]]:
 _CDH_TARGET_K_HI = 12
 
 
+def _useful_k(sizes: Iterable[Any], min_class: int) -> int:
+    """``K_util``: numero de clases con al menos ``min_class`` UCEs.
+
+    Es el tercer objetivo del optimizador (``-K_util``). Con ``-K` el sampler
+    podia mejorar ese slot partiendo el corpus en clases diminutas que no son
+    interpretables; contar solo las clases con masa corta esa recompensa sin
+    tocar el gate de viabilidad (que sigue midiendo el K real). Por
+    construccion ``0 <= K_util <= K``.
+    """
+    floor = max(2, int(min_class))
+    total = 0
+    try:
+        for size in sizes:
+            if int(size) >= floor:
+                total += 1
+    except (TypeError, ValueError):
+        return 0
+    return int(total)
+
+
+def _useful_k_floor(n_total: int, min_class_share: float) -> int:
+    """Piso de masa de una clase: ``max(2, ceil(min_class_share * n_total))``.
+
+    Misma formula que ``_min_class`` en ``_triple_stability_verdicts`` y que
+    ``tiny_frac``, para que ``K_util`` y la cobertura util no se contradigan.
+    Se usa ``ceil`` por decision pre-registrada
+    (docs/design_v5/AHORRO_K_Y_PERSISTENCIA.md §2): con n=528 y share=0.01 el
+    piso es 6, no 5. La diferencia no cambia ninguna particion medida (la
+    clase menor de A/B/C supera ambas cotas).
+    """
+    return max(2, int(math.ceil(int(n_total) * float(min_class_share or 0.0))))
+
+
 def _cdh_frac_from_params(params: Dict[str, Any], default: float = 0.10) -> float:
     """Piso del CDH como fracción de n, resuelto desde los params de un trial.
 
@@ -8999,7 +9081,8 @@ _BOUNDARY_STRUCTURAL_WHY = {
     "cdh_target_k": (
         "no es un objetivo: fija min_cluster_size_cdh=1/(2K); pasado "
         "_CDH_TARGET_K_HI el CDH sale del gate k_bounds y el trial es "
-        "centinela por construccion"
+        "centinela por construccion. OJO: esto justifica solo el TECHO; "
+        "el piso lo trata el fallback automatico (ver _edge_recommendation)"
     ),
     "coref_context_units_tight": (
         "es el dependiente de coref_context_units_loose (tight < loose); "
@@ -9103,7 +9186,16 @@ def _edge_label(spec: Any, lo: Any = None, hi: Any = None) -> str:
 def _edge_recommendation(
     name: str, spec: Any, lo: Any, hi: Any, at_lo: bool, at_hi: bool
 ) -> str:
-    """Recomendacion; el prefijo declara la politica (4 categorias)."""
+    """Recomendacion; el prefijo declara la politica (5 categorias)."""
+    if name == "cdh_target_k" and at_lo:
+        # El PISO (a diferencia del techo) no es estructural: puede estar
+        # recortando el optimo, y el pipeline lo comprueba solo (fallback
+        # automatico, §4 de AHORRO_K_Y_PERSISTENCIA.md) con un study nuevo.
+        return (
+            f"fallback: piso del espacio {_edge_label(spec, lo, hi)}; la etapa 2 se "
+            "relanza UNA vez por abajo con study nuevo para comprobar si el piso "
+            "era vinculante (nunca por debajo de K=2)"
+        )
     if name in _BOUNDARY_STRUCTURAL:
         why = _BOUNDARY_STRUCTURAL_WHY.get(name, "el borde es un limite del metodo")
         return f"estructural: rango {_edge_label(spec, lo, hi)}; NO se amplia ({why})"
@@ -9524,9 +9616,12 @@ class Optimizador:
             "preference": self.config_base.optimize_preference,
             "directions": list(self.config_base.optimize_directions),
             "objectives": (
-                ["ari", "coverage", "neg_k"]
+                # El tercer objetivo solo es `neg_k_util` donde
+                # `_evaluate_trial` paga K_util (wc_only y select). La rama
+                # legacy "all" sigue pagando el K crudo: ahi es `neg_k`.
+                ["ari", "coverage", "neg_k_util"]
                 if getattr(self, "_current_stage_mode", "select") == "wc_only"
-                else ["coverage_primary", "ari_winner", "neg_k"]
+                else ["coverage_primary", "ari_winner", "neg_k_util"]
                 if getattr(self, "_current_stage_mode", "select") == "select"
                 else ["coverage_primary", "agreement_sym", "neg_k"]
             ),
@@ -9575,13 +9670,23 @@ class Optimizador:
                     "user_attrs": dict(t.user_attrs),
                 }
             )
+        stage_mode = getattr(self, "_current_stage_mode", "select")
         payload = {
-            "schema_version": 2,
+            # v3: el tercer objetivo es `neg_k_util` en wc_only/select (antes
+            # se escribia siempre `neg_k`). Un lector que compare valores entre
+            # ficheros debe mirar `objective_names`, no el indice.
+            "schema_version": 3,
             "corpus_fingerprint": _corpus_fingerprint(),
             "timestamp": datetime.now().isoformat(),
             "study_name": study.study_name,
             "directions": list(study.directions),
-            "objective_names": ["coverage_primary", "agreement_sym", "neg_k"],
+            "objective_names": (
+                ["ari", "coverage", "neg_k_util"]
+                if stage_mode == "wc_only"
+                else ["coverage_primary", "ari_winner", "neg_k_util"]
+                if stage_mode == "select"
+                else ["coverage_primary", "agreement_sym", "neg_k"]
+            ),
             "n_trials": len(study.trials),
             "n_completed": sum(
                 1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE
@@ -9737,6 +9842,17 @@ class Optimizador:
         frac_eps = round(1.0 / n_emb, 5) if n_emb > 0 else 0.002
         frac_eps = max(0.0005, frac_eps)
 
+        # Piso vigente. Es un ATRIBUTO y no una constante porque el fallback
+        # automatico (optimizar()) lo baja de 3 a 2 y vuelve a muestrear con
+        # estudio nuevo; nunca baja de 2 (gate duro K>=2).
+        k_lo = int(
+            getattr(self, "_cdh_k_lo", 0)
+            or getattr(self.config_base, "optimize_k_floor", 3)
+            or 3
+        )
+        k_lo = max(2, k_lo)
+        k_hi = max(k_lo, k_hi)
+
         space: Dict[str, Any] = {
             "min_forms_uc_1": (max(2, f1 - 4), f1 + 4),
             # v6b (patch 19c): el piso NO se baja a 1. `mf2 = mf1 + gap`;
@@ -9754,7 +9870,7 @@ class Optimizador:
             # en el log de cada corrida; el techo se queda en 5.
             "tsj": (max(2, tsj - 2), tsj + 2),
             # pseudocount eliminado (BLOQUE 1: siempre 0.0)
-            "cdh_target_k": (3, k_hi),
+            "cdh_target_k": (k_lo, k_hi),
             # v6 (PRE-REGISTRADO antes del run v6): 0 fuera del espacio.
             # Con 0, `_partition` no llama a `_intercambio` (`if > 0`): la
             # particion es el corte k-means crudo. Eso quita varianza entre
@@ -9875,6 +9991,9 @@ class Optimizador:
         # Última selección de método (modo "select"): el objetivo de la
         # etapa 2 es (coverage, ARI del ganador, -K), no agreement_sym.
         self._last_selection = getattr(double_clf, "last_selection", None)
+        # Particiones A/B/C del trial: solo se usan al final del run (no son
+        # objetivo ni entran en la regla de seleccion).
+        self._last_method_labels = getattr(double_clf, "last_method_labels", None) or {}
         return resultados
 
     # ══════════════════════════════════════════════════════════════════════
@@ -9884,8 +10003,13 @@ class Optimizador:
         """
         Devuelve la tupla objetivo o un centinela dominado.
 
-        Etapa 1 (wc_only): (ARI, coverage, −K) — prior para la etapa 2.
-        Etapa 2 (all):     (coverage, agreement_sym, −K) — veredicto final.
+        Etapa 1 (wc_only): (ARI, coverage, −K_util) — prior para la etapa 2.
+        Etapa 2 (all):     (coverage, ARI_ganador, −K_util) — veredicto final.
+
+        El tercer objetivo es −K_util (clases con masa >= piso), no −K: un
+        sampler que persigue −K puede mejorar ese slot partiendo en clases
+        diminutas que no son interpretables. Ver
+        docs/design_v5/AHORRO_K_Y_PERSISTENCIA.md §3.
 
         Los gates duros (K fuera de [2,8], coverage < umbral, excepción
         en la evaluación) devuelven _SENTINEL_TRIAL en vez de lanzar
@@ -10079,7 +10203,8 @@ class Optimizador:
                 "selection_criteria_conflict", bool(sel.criteria_conflict)
             )
             # ── Kach vs target_k (CLASSIC_MODE.md §7) ────────────────────
-            # El objetivo −K debe ser el K REAL de la partición del ganador.
+            # El tercer objetivo es −K_util: el K REAL de la partición del
+            # ganador, descontando las clases que no alcanzan el piso de masa.
             # `n_clusters` cuenta sólo UCEs estables: un trial puede haber
             # pedido K=8 y producir 5 hojas. Se reporta la brecha en vez de
             # fingir que se alcanzó el objetivo del sampler.
@@ -10098,10 +10223,21 @@ class Optimizador:
                 int(_k_target) - _k_ach if _k_target is not None else 0,
             )
             trial.set_user_attr("k_stable", _k_stable)
+            # ── Tercer objetivo: −K_util, no −K ──────────────────────────
+            # `winner_k_util` lo calcula la regla (MethodMetrics.
+            # n_useful_classes). Si el payload no lo trae (Selection antigua o
+            # metrica ausente) se cae a K real: el objetivo nunca empeora por
+            # un dato faltante, y K_util <= K_ach por construccion.
+            _k_util = int(getattr(sel, "winner_k_util", 0) or 0)
+            if _k_util <= 0:
+                _k_util = _k_ach
+            _k_util = min(_k_util, _k_ach)
+            trial.set_user_attr("k_util", _k_util)
+            trial.set_user_attr("k_useless", int(_k_ach - _k_util))
             return (
                 float(coverage_primary),
                 float(sel.winner_ari),
-                -float(_k_ach),
+                -float(_k_util),
             )
 
         # ── Etapa 1 (wc_only): ARI como prior ─────────────────────────────
@@ -10136,7 +10272,21 @@ class Optimizador:
                 int(_k_target) - _k_ach if _k_target is not None else 0,
             )
             trial.set_user_attr("k_stable", _k_stable)
-            return ari, float(coverage_primary), -float(_k_ach)
+            # ── Tercer objetivo: −K_util (clases de A1 con masa suficiente) ──
+            # Se mide sobre la particion CRUDA de A1, que es la que fija el K
+            # de esta etapa. El piso de masa usa el n del CORPUS, no el de las
+            # UCEs validas, para que sea el mismo criterio que en la etapa 2.
+            _share = float(
+                getattr(self.config_base, "method_selection_min_class_share", 0.01)
+                or 0.01
+            )
+            _n_corpus = int(getattr(self, "total_uces", 0) or 0) or int(valid.sum())
+            _floor = _useful_k_floor(_n_corpus, _share)
+            _sizes = [int(c) for c in np.bincount(arr_a[valid].astype(int))]
+            _k_util = min(_k_ach, _useful_k(_sizes, _floor))
+            trial.set_user_attr("k_util", _k_util)
+            trial.set_user_attr("k_useless", int(_k_ach - _k_util))
+            return ari, float(coverage_primary), -float(_k_util)
 
         # ── Etapa 2 (all): veredicto final vía agreement simétrico ───────
         pairwise = self._last_pairwise or {}
@@ -10309,7 +10459,99 @@ class Optimizador:
             study_suffix="_stage2_select",
             perturb_warm_start=True,
         )
-        return stage2_params
+        return self._maybe_k_floor_fallback(stage2_params, stage1_pareto, n_stage2)
+
+    def _maybe_k_floor_fallback(
+        self,
+        params: Dict[str, Any],
+        warm_start: List,
+        n_trials: int,
+    ) -> Dict[str, Any]:
+        """Comprueba si el piso de `cdh_target_k` estaba recortando el optimo.
+
+        Un optimo pegado al piso del espacio no distingue "el sampler quiere
+        menos clases y no puede" de "quiere justo el piso". Regla
+        PRE-REGISTRADA (docs/design_v5/AHORRO_K_Y_PERSISTENCIA.md §4):
+
+          1. si el ganador de la etapa 2 tiene `cdh_target_k` == piso, se
+             relanza UNA sola vez la etapa 2 con piso `optimize_k_floor_min`
+             y un estudio NUEVO (sufijo `_stage2_select_k<N>`);
+          2. el resultado de la caida se ADOPTA solo si su ganador elige el
+             piso nuevo (evidencia de que el piso viejo era vinculante);
+          3. si vuelve al piso viejo o mas arriba, el piso no era vinculante
+             y se conserva el resultado original.
+
+        Nunca baja de 2 (el gate duro de la particion es K>=2). La caida
+        corre con `save_pareto=False`: `best_params.json` solo se reescribe si
+        el resultado se adopta, asi que no hay que restaurar nada.
+        """
+        cfg = self.config_base
+        if not params:
+            return params
+        if not bool(getattr(cfg, "optimize_k_floor_fallback", True)):
+            return params
+        floor = int(getattr(self, "_cdh_k_lo", 0) or 0)
+        if not floor:
+            floor = int(getattr(cfg, "optimize_k_floor", 3) or 3)
+        min_floor = max(2, int(getattr(cfg, "optimize_k_floor_min", 2) or 2))
+        if floor <= min_floor:
+            return params
+        try:
+            chosen = int(params.get("cdh_target_k"))
+        except (TypeError, ValueError):
+            return params
+        if chosen != floor:
+            return params
+
+        new_floor = max(min_floor, floor - 1)
+        print(
+            f"\n   [k-floor] el ganador de la etapa 2 esta PEGADO al piso "
+            f"cdh_target_k={floor}: el piso puede estar recortando el optimo."
+        )
+        print(
+            f"   [k-floor] relanzando la etapa 2 con piso {new_floor} en un study "
+            f"NUEVO ({n_trials} trials); el resultado solo se adopta si su "
+            f"ganador elige cdh_target_k={new_floor}."
+        )
+        self._cdh_k_lo = new_floor
+        self._search_space_cached = self.get_search_space()
+        try:
+            fb_params, _ = self._run_single_stage(
+                n_trials=n_trials,
+                mode="select",
+                warm_start_trials=warm_start,
+                study_suffix=f"_stage2_select_k{new_floor}",
+                perturb_warm_start=True,
+                save_pareto=False,
+            )
+        except Exception as exc:  # la caida nunca tumba la corrida
+            logger.warning("fallback de piso K fallo: %s", exc)
+            self._cdh_k_lo = floor
+            self._search_space_cached = self.get_search_space()
+            return params
+
+        try:
+            fb_chosen = int(fb_params.get("cdh_target_k")) if fb_params else -1
+        except (TypeError, ValueError):
+            fb_chosen = -1
+        if fb_chosen == new_floor:
+            print(
+                f"   [k-floor] ADOPTADO: el optimo se mueve a cdh_target_k="
+                f"{new_floor}; el piso {floor} era vinculante."
+            )
+            _study = getattr(self, "_last_stage_study", None)
+            if _study is not None:
+                self.save_pareto_front(_study)
+            return fb_params
+
+        print(
+            f"   [k-floor] NO adoptado: la caida vuelve a cdh_target_k="
+            f"{fb_chosen} >= {floor}; el piso no era vinculante. Se conserva el "
+            "resultado original (best_params.json intacto)."
+        )
+        self._cdh_k_lo = floor
+        self._search_space_cached = self.get_search_space()
+        return params
 
     def _run_single_stage(
         self,
@@ -10318,6 +10560,7 @@ class Optimizador:
         warm_start_trials: List,
         study_suffix: str = "",
         perturb_warm_start: bool = False,
+        save_pareto: bool = True,
     ) -> Tuple[Dict[str, Any], List]:
         self._current_stage_mode = mode
 
@@ -10467,8 +10710,11 @@ class Optimizador:
                 )
             return {}, []
 
-        # Persistir frente completo
-        self.save_pareto_front(study)
+        # Persistir frente completo. `save_pareto=False` lo usa la caida de
+        # piso K: si no se adopta, `best_params.json` no debe moverse.
+        self._last_stage_study = study
+        if save_pareto:
+            self.save_pareto_front(study)
 
         # Selección según preferencia
         best_idx = self._select_preference(best_trials)
@@ -10501,7 +10747,8 @@ class Optimizador:
         print(
             f"       coverage={best_trial.values[0]:.4f}  "
             f"agreement={best_trial.values[1]:.4f}  "
-            f"K={-best_trial.values[2]:.0f}"
+            f"K_util={-best_trial.values[2]:.0f}"
+            f"  (K real={best_trial.user_attrs.get('k_ach', '?')})"
         )
         print(f"       params: {best_trial.params}")
 
@@ -11464,6 +11711,19 @@ class WorkflowOrchestrator:
                     _sel, len({uce.id for doc in uces_por_doc for uce in doc})
                 )
 
+            # ── Persistir la particion de los TRES metodos ─────────────────
+            # Solo en modo select (con otros modos el dict llega vacio). Es lo
+            # que consume el selector A/B/C del dashboard; el ganador sigue
+            # mandando en `uces[].cluster_id`. Contrato y limitaciones en
+            # docs/design_v5/AHORRO_K_Y_PERSISTENCIA.md §5.
+            _labels = getattr(self.double_clf, "last_method_labels", None)
+            if _labels:
+                self.db.data["method_labels"] = {
+                    str(_m): {str(_k): int(_v) for _k, _v in dict(_rows).items()}
+                    for _m, _rows in _labels.items()
+                    if _rows
+                }
+
             # ── Estabilidad ALCESTE clásica (CR + ARI 10↔14) — §5 ────────
             if str(getattr(self.config, "run_mode", "modern")) == "classic":
                 _pairwise = (
@@ -11847,7 +12107,48 @@ class WorkflowOrchestrator:
         )
 
         self.db._save()
-        print("\\n=== Pipeline completado. Dashboard keys escritas. ===")
+        print("\n=== Pipeline completado. Dashboard keys escritas. ===")
+
+        # ── Higiene de temporales de data/ (mejor esfuerzo) ───────────────
+        # `data/` esta gitignored y acumula logs, sondas y checkpoints sin
+        # limite. La politica (keep_latest por glob, canonicos intactos,
+        # edad minima) vive en reii.diag.data_hygiene; aqui solo se APLICA al
+        # final del run. Desactivable con REII_DATA_HYGIENE=0. Un fallo de
+        # higiene nunca tumba el pipeline.
+        self._apply_data_hygiene()
+
+    @staticmethod
+    def _apply_data_hygiene() -> None:
+        """Rota los temporales de `data/` al terminar la corrida.
+
+        Import perezoso a proposito: `reii.diag` no debe ser requisito del
+        pipeline (y el modulo puede no existir en una instalacion vieja).
+        """
+        if str(os.environ.get("REII_DATA_HYGIENE", "1")).strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            return
+        try:
+            from pathlib import Path
+
+            from reii.diag.data_hygiene import apply_actions, build_inventory
+        except Exception:  # modulo ausente o roto: no es asunto del run
+            return
+        try:
+            entries = build_inventory(Path(REII_DATA_DIR), min_age_minutes=30.0)
+            stats = apply_actions(entries, Path(REII_DATA_DIR), backup_dir=None)
+            _n = int(stats.get("deleted") or 0)
+            if _n:
+                _mb = float(stats.get("bytes") or 0) / (1024.0 * 1024.0)
+                print(
+                    f"   [higiene] data/: {_n} temporal(es) rotado(s), "
+                    f"{_mb:.1f} MiB liberados."
+                )
+        except Exception as exc:  # nunca rompe el pipeline
+            logger.debug("higiene de data/ omitida: %s", exc)
 
     # ── Helper: rebuild PPMI matrix from stable UCEs ─────────────────────────
     def _rebuild_ppmi_matrix(self) -> Optional[csr_matrix]:

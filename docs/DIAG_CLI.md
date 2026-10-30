@@ -31,6 +31,7 @@ sin instalar el paquete, usa `python diag.py`: ese shim añade `src/` a `sys.pat
 | `trials`          | estabilidad del optimizador entre semillas TPE; ¿los ganadores tocan bordes?                            | `data/reii_optuna.db` + `data/best_params.json` | mueve/restaura `best_params.json`, escribe `data/diag/best_params_seed*.json` | **alto**: lanza `--optimize-only` por semilla (horas)          |
 | `preflight`       | ¿`best_params`, estudio y selección son del corpus en disco? Gates G1/G2                                | artefactos en `data/`                           | nada sin `--exec`                                                             | **alto** solo con `--exec` (lanza el plan)                     |
 | `db-hygiene`      | inventario / backup / borrado / vacuum de la BD de Optuna                                               | `data/reii_optuna.db`                           | copias `.bak-*`; **borra** con `--delete`                                     | **alto** solo con `--delete`/`--vacuum`                        |
+| `data-hygiene`    | rotación de los temporales de `data/`: inventario, plan y borrado acotado (nunca canónicos)             | `data/**`                                       | mueve a `--backup-dir` o **borra** con `--apply`                              | **alto** solo con `--apply` (por defecto es dry-run)           |
 | `multiverse`      | una fila por especificación × target: retención y niveles de calidad                                    | PostgreSQL (`--dsn`)                            | `--out` (JSON)                                                                | ninguno (solo lee)                                             |
 | `selection-audit` | ¿la elección de método (A/B/C) es estable entre targets vecinos?                                        | `data/method_selection*.json(l)`                | `--json` (opcional)                                                           | ninguno                                                        |
 | `term-metrics`    | φ sin Yates, flag FDR y plano factorial F9 desde el artefacto persistido                                | `data/workflow_data.json`                       | `data/diag/paper_terms.json`, `--figure`                                      | ninguno (solo lee)                                             |
@@ -50,6 +51,7 @@ Windows no tiene los glifos de check ni de flecha.
 | `src/7_quality_multiverse.py`  | `python -m reii.diag multiverse`                |
 | `src/9_selection_audit.py`     | `python -m reii.diag selection-audit`           |
 | (nuevo, sin predecesor)        | `python -m reii.diag term-metrics`              |
+| (nuevo, sin predecesor)        | `python -m reii.diag data-hygiene`              |
 | `diag_common.py`               | `reii/diag/common.py` (eliminado el de la raíz) |
 | `5_s2_power_analysis.py`       | archivado en `tools/archive/diag/` (ver abajo)  |
 | `8_probe_b_permissive.py`      | archivado en `tools/archive/diag/` (ver abajo)  |
@@ -100,6 +102,64 @@ Resultado sobre la corrida `93fabdc4d0ff6590` (528 UCE, 503 con clase): 214 tér
 p crudo < 0,05 pasan a **74** con FDR < 0,05 (33 / 37 / 4). La deflación de Yates depende de
 la fuerza: mediana 0,89 en |φ| ≥ 0,10, 0,95 en |φ| ≥ 0,15, 0,98 en los más fuertes, y anula
 705 de las 2 115 filas término-clase.
+
+## `data-hygiene`: rotación de los temporales de `data/`
+
+`data/` está entero en `.gitignore` y acumula logs, sondas y checkpoints sin límite. Este comando
+inventaría esos ficheros y, si se le pide, los rota de forma **declarativa**: la política vive en la
+constante `POLICY` de `reii/diag/data_hygiene.py`, no en la cabeza de quien lo lanza.
+
+```bash
+python diag.py data-hygiene                                  # dry-run (por defecto)
+python diag.py data-hygiene --apply --backup-dir ../data_bak # mueve en vez de borrar
+python diag.py data-hygiene --json | python -m json.tool     # inventario parseable
+```
+
+### Política (`POLICY`)
+
+Cada regla es `(glob, keep_latest, nota)`. Por cada glob se ordenan sus ficheros por `mtime`
+descendente y se conservan los `keep_latest` más nuevos; el resto pasa a candidato a borrado.
+**Gana la primera regla que casa**, así que va lo específico antes que lo genérico y cada fichero
+pertenece a un solo grupo.
+
+| glob                            | keep_latest | nota                                      |
+| ------------------------------- | ----------- | ----------------------------------------- |
+| `diag/*.dryrun.log`             | 8           | logs de dry-run                           |
+| `diag/*.log`                    | 8           | logs de corridas (`seed*`, bench, select) |
+| `diag/tmp_*`                    | 0           | restos de sesión (siempre sobran)         |
+| `diag/best_params_seed*.json`   | 5           | `best_params` por semilla de `trials`     |
+| `diag/*.json`                   | 12          | sondas y artefactos sueltos               |
+| `diag/*.png`                    | 10          | figuras sueltas                           |
+| `diag/*.html`                   | 10          | informes HTML sueltos                     |
+| `*.pre_v4`                      | 2           | snapshots previos al tag v4               |
+| `*.pre_probe_b`                 | 2           | snapshots previos a la sonda B            |
+| `*.pre_script2`                 | 2           | snapshots previos al script 2             |
+| `*.pre_script*`                 | 2           | snapshots previos a cualquier script N    |
+| `*.ctx*.json`                   | 2           | checkpoints de coref por ventana (`ctxN`) |
+| `*.round*.json`                 | 2           | rondas de `method_selection`              |
+| `best_params.v3_censurado.json` | 1           | copia censurada (una sola)                |
+| `comparative_results.json`      | 1           | comparativa (una sola)                    |
+
+Los globs sin `/` solo casan en la raíz de `data/` (`*.ctx*.json` no alcanza `diag/x.ctx1.json`).
+Lo que no casa ninguna regla se queda quieto y aparece como `(sin regla)`.
+
+### Garantías
+
+1. **Canónicos intactos.** `CANONICAL` fija lo que no se toca nunca: `workflow_data.json`,
+   `workflow_data.db`, `best_params.json`, `method_selection.json`, `method_selection_log.jsonl`,
+   `reii_optuna.db`, `uce_calibration.json`, `token_table.jsonl`, `entrevistas.json`,
+   `SUBTLEX-ESP.xlsx` y `query_db.py`, más los directorios `entrevistas/`, `txt_outputs/` y
+   `checkpoints/`, que ni siquiera se recorren. Se comprueba antes y después de casar el glob: el
+   inventario los marca `[keep]` y el borrado los salta aunque una regla los case.
+2. **Edad mínima.** `--min-age-minutes` (10 por defecto): un fichero modificado hace menos de N
+   minutos se marca `[skip: reciente]` y no se toca, para no pisar una corrida en curso.
+3. **Dry-run por defecto.** Solo `--apply` borra; con `--backup-dir X`, `shutil.move` a
+   `X/<ruta relativa a data/>` en vez de borrar. Toda ruta se resuelve y se valida con
+   `is_relative_to(DATA_DIR)`: si no cuelga de la raíz, se rechaza y no se toca nada.
+
+Salida ASCII en consola (`[keep]`, `[del]`, `[skip: reciente]`, `[moved]`, `[X]`) y resumen final de
+dos líneas con ficheros/MB inventariados y ficheros/MB que se borrarían o se borraron. Códigos de
+salida: 0 ok, 1 error de IO, 2 flag inválido (argparse).
 
 ## Notas de mantenimiento
 

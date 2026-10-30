@@ -1,5 +1,6 @@
 """Pruebas de la capa de datos de reii.pipelines (sin Streamlit)."""
 
+import calendar
 import json
 import os
 import time
@@ -20,6 +21,12 @@ CREATE TABLE annotations(annotation_id INTEGER PRIMARY KEY AUTOINCREMENT, uce_id
 CREATE TABLE kv_store(key TEXT PRIMARY KEY, value_json TEXT, updated_at TEXT);
 """
 
+#: ``created_at`` de las UCEs del fixture. Ancla temporal unica: el chequeo
+#: `input_freshness` compara `last_uces` (MAX(created_at)) contra el mtime de
+#: workflow_data.json, asi que el test no puede usar "hace N dias" relativo a
+#: hoy (dejaria de ser anterior a esta fecha en cuanto pasara un mes).
+UCE_CREATED_AT = "2026-10-10 10:00:00"
+
 
 @pytest.fixture
 def conn():
@@ -29,8 +36,8 @@ def conn():
         [("1", 0, 0), ("1", 0, 1), ("2", 0, 0), ("2", 1, 0)]
     ):
         c.raw.execute(
-            "INSERT INTO uces VALUES (?,?,?,?,1,'2026-10-10 10:00:00',?)",
-            (f"{doc}_{sec}_{loc}", doc, loc, sec, i % 2),
+            "INSERT INTO uces VALUES (?,?,?,?,1,?,?)",
+            (f"{doc}_{sec}_{loc}", doc, loc, sec, UCE_CREATED_AT, i % 2),
         )
     c.raw.execute("INSERT INTO clusters VALUES (0)")
     return c
@@ -208,7 +215,10 @@ def test_diff_channels_only_reports_real_differences():
 def test_status_flags_stale_input_and_unsynced_annotations(conn, tmp_path):
     wf = tmp_path / "workflow_data.json"
     wf.write_text("{}")
-    old = time.time() - 7 * 86400
+    # Una hora ANTES de `UCE_CREATED_AT`: 3600 s > TOLERANCE_S (60) => warn.
+    # `timegm` interpreta la fecha en UTC, igual que `status.file_info` y
+    # `status.parse_ts`; `mktime` desplazaria el instante en husos != UTC.
+    old = calendar.timegm(time.strptime(UCE_CREATED_AT, "%Y-%m-%d %H:%M:%S")) - 3600
     os.utime(wf, (old, old))
     st_path = tmp_path / "state.json"
     st_path.write_text(

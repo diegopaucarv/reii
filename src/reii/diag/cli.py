@@ -10,6 +10,8 @@
                    (lee ``data/diag/bench_uce*.log``).
   trials           estabilidad del optimizador entre semillas TPE.
   db-hygiene       inventario / backup / borrado / vacuum de la BD de Optuna.
+  data-hygiene     inventario / rotacion de los temporales de data/ (no toca
+                   los canonicos).
   multiverse       multiverso de calidad sobre PostgreSQL (una fila por
                    especificación × target).
   selection-audit  auditoría de la selección de método persistida.
@@ -41,6 +43,10 @@ COMMANDS = {
     "uce-size": ("uce_size", "forma y coste de la segmentación por uce_target_size"),
     "trials": ("trials", "estabilidad del optimizador entre semillas"),
     "db-hygiene": ("db_hygiene", "inventario/backup/borrado de la BD de Optuna"),
+    "data-hygiene": (
+        "data_hygiene",
+        "inventario/rotacion de los temporales de data/ (no toca los canonicos)",
+    ),
     "multiverse": ("multiverse", "multiverso de calidad (PostgreSQL)"),
     "selection-audit": ("selection_audit", "auditoría de la selección de método"),
     "term-metrics": (

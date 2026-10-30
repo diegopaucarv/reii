@@ -147,6 +147,11 @@ class MethodMetrics:
     assigned_frac: Optional[float] = None
     min_class_size: int = 0
     median_class_size: float = 0.0
+    #: Clases con masa suficiente (>= ``max(2, ceil(min_class_share*n_total))``).
+    #: Es el ``K`` que paga el tercer objetivo del optimizador (``-K_util``):
+    #: las clases por debajo del piso son polvo y no cuentan. Siempre
+    #: ``n_useful_classes <= k`` (ver docs/design_v5/AHORRO_K_Y_PERSISTENCIA.md).
+    n_useful_classes: int = 0
     #: Tamaño de la clase mayor / UCEs asignadas (partición cruda del método).
     #: Alimenta el gate de no dominancia; también se imprime.
     max_class_share: float = 0.0
@@ -244,6 +249,10 @@ class Selection:
     winner_coverage: float
     winner_k: int
     winner_usable_coverage: float = float("nan")
+    #: ``K_util`` del ganador: clases con masa >= el piso de ``min_class_share``.
+    #: Es lo que el optimizador minimiza como tercer objetivo (``-K_util``), no
+    #: ``winner_k``; ambos se persisten para que la brecha sea auditable.
+    winner_k_util: int = 0
     runner_up: Optional[str] = None
     runner_up_ari: float = float("nan")
     runner_up_coverage: float = float("nan")
@@ -696,6 +705,7 @@ def select_method(
         # ``usable`` del ganador = cobertura efectiva (coincide con v3 cuando
         # ``coverage_stable`` no existe).
         winner_usable_coverage=float(win.usable_effective),
+        winner_k_util=int(win.n_useful_classes or 0),
         runner_up=runner.method if runner else None,
         runner_up_ari=float(runner.ari) if runner else float("nan"),
         runner_up_coverage=float(runner.coverage) if runner else float("nan"),
