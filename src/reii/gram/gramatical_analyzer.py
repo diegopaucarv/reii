@@ -59,6 +59,11 @@ from reii.config import (
     SENTENCE_EMBEDDER_MODEL,
     SPACY_MODEL,
     STANZA_LANG,
+    STANZA_SERVER_COREF_REMOTE_BATCH,
+    STANZA_SERVER_FALLBACK_LOCAL,
+    STANZA_SERVER_TIMEOUT,
+    STANZA_SERVER_TOKEN,
+    STANZA_SERVER_URL,
     STANZA_USE_GPU,
     SUBTLEX_PATH,
     USE_COREF,
@@ -119,6 +124,7 @@ from reii.lang.es import (
     uce_to_global_annotations,
     verificar_concordancia_participio,
 )
+from reii.seg.coref_remote import RemoteCorefClient
 from reii.seg.stanza_pipeline import build_stanza_pipeline
 
 logging.basicConfig(
@@ -512,6 +518,10 @@ class UCE:
     is_ambiguous: bool = False
     is_top: bool = False
     stability: Optional[float] = None
+    # `_triple_stability_verdicts` lo asigna dinámicamente, pero `to_dict()` es
+    # `asdict(self)`: sin declararlo aquí no se serializa y migrate_uces escribe
+    # NULL en la columna `stability_method`.
+    stability_method: str = ""
     phi_coefficients: Dict[str, float] = field(default_factory=dict)
     coordinates: Dict[str, List[float]] = field(
         default_factory=dict
@@ -756,21 +766,48 @@ class CoreferenceResolver:
     No concatenation – uses character‑range windows to preserve offsets perfectly.
     """
 
-    def __init__(self, stanza_pipeline, context_units: int = 2):
+    def __init__(
+        self,
+        stanza_pipeline=None,
+        context_units: int = 2,
+        remote_client=None,
+        remote_batch_size: int = 1,
+        local_pipeline_factory=None,
+        remote_fallback_local: bool = True,
+    ):
         """
         Args:
-            stanza_pipeline: Stanza pipeline with coref processor.
+            stanza_pipeline: Stanza pipeline with coref processor. Puede ser
+                ``None`` si se pasa ``remote_client``.
             context_units: Number of UCEs to keep as context on each side.
+            remote_client: alternativa HTTP al pipeline local (ver
+                ``reii.seg.coref_remote.RemoteCorefClient``). Si se indica, no
+                se carga Stanza local.
+            remote_batch_size: ventanas por petición HTTP al servidor remoto.
+            local_pipeline_factory: callable que devuelve (y cachea) el pipeline
+                Stanza local. Se invoca **solo** si el servidor remoto falla y
+                el fallback está habilitado, así que en operación normal no se
+                carga Stanza local.
+            remote_fallback_local: si el servidor remoto falla, procesar esas
+                ventanas con Stanza local (``STANZA_SERVER_FALLBACK_LOCAL``).
         """
         self.nlp = stanza_pipeline
+        self.remote_client = remote_client
+        self.remote_batch_size = max(1, int(remote_batch_size))
+        self.local_pipeline_factory = local_pipeline_factory
+        self.remote_fallback_local = remote_fallback_local
         self.context_units = context_units
         self._global_chains = []  # all chains across the whole document
         self._buffer = []  # list of (global_start, global_end) of buffered UCEs
+        # True si el coref quedó incompleto (servidor caído y sin Stanza local):
+        # permite al llamador NO persistir el resultado parcial como completo.
+        self.last_extraction_incomplete = False
 
     def reset(self) -> None:
         """Clear all accumulated chains and buffer – call before processing a new document."""
         self._global_chains = []
         self._buffer = []
+        self.last_extraction_incomplete = False
 
     def _insert_mention_sorted(self, mentions: List[Dict], new_mention: Dict) -> None:
         """Insert a mention while keeping the list sorted by start_char."""
@@ -804,16 +841,19 @@ class CoreferenceResolver:
                 - "mentions": list of {"text", "start_char", "end_char"} (global offsets)
         """
         self.reset()
+        if self.remote_client is not None:
+            return self._resolve_remote(full_doc_text, segments)
         for uce_text, uce_start in segments:
             uce_end = uce_start + len(uce_text)
             self._resolve_uce(full_doc_text, uce_text, uce_start, uce_end)
         return self._global_chains
 
-    def _resolve_uce(
-        self, full_doc_text: str, uce_text: str, uce_start: int, uce_end: int
-    ) -> None:
-        """
-        Process a single UCE: update buffer, run Stanza on the window, and merge new chains.
+    def _window(self, full_doc_text: str, uce_start: int, uce_end: int):
+        """Ventana deslizante de ``context_units + 1`` UCEs.
+
+        Devuelve ``(window_text, window_start)`` o ``None`` si la ventana no es
+        utilizable (offsets invertidos o texto vacío). Avanza el buffer, así que
+        debe llamarse una vez por UCE y en orden.
         """
         self._buffer.append((uce_start, uce_end))
         if len(self._buffer) > self.context_units + 1:
@@ -824,13 +864,125 @@ class CoreferenceResolver:
         if window_start >= window_end:
             # Inverted window (offsets desynced). Skip rather than feed Stanza
             # an empty slice, which raises torch.cat() errors.
-            return
+            return None
         window_text = full_doc_text[window_start:window_end]
         if not window_text.strip():
             # Whitespace-only window: nothing for Stanza to resolve. Feeding it
             # would make the coref model receive an empty document and raise
             # ``torch.cat(): expected a non-empty list of Tensors``.
+            return None
+        return window_text, window_start
+
+    def _resolve_remote(
+        self, full_doc_text: str, segments: List[Tuple[str, int]]
+    ) -> List[Dict]:
+        """Resuelve el documento por HTTP en vez de con Stanza local.
+
+        Arma las mismas ventanas que ``_resolve_uce`` (una por UCE) y las envía
+        en lotes al servidor. Los offsets locales que devuelve se mapean a
+        globales y se fusionan con ``_merge_chains``, idéntico al camino local.
+        Un lote que falla se degrada (se pierden solo sus cadenas), igual que
+        un error de Stanza por ventana en el camino local.
+        """
+        windows = []
+        for uce_text, uce_start in segments:
+            window = self._window(full_doc_text, uce_start, uce_start + len(uce_text))
+            if window is not None:
+                windows.append(window)
+
+        for start in range(0, len(windows), self.remote_batch_size):
+            chunk = windows[start : start + self.remote_batch_size]
+            try:
+                results = self.remote_client.chains_for_texts(
+                    [text for text, _ in chunk]
+                )
+            except Exception as e:
+                print(
+                    f"Stanza remoto error en ventanas [{start}:{start + len(chunk)}]: {e}"
+                )
+                if not self._fallback_to_local(chunk):
+                    # Igual que el segmentador: sin fallback posible el resto del
+                    # documento queda incompleto, así que se corta aquí en vez de
+                    # acumular timeouts ventana a ventana.
+                    self.last_extraction_incomplete = True
+                    return self._global_chains
+                continue
+
+            for (window_text, window_start), chains in zip(chunk, results):
+                window_mapper = OffsetMapper(window_start)
+                new_chains = []
+                for chain in chains:
+                    mentions = []
+                    for mention in chain.get("mentions", []):
+                        m_start_local = mention.get("start_char")
+                        m_end_local = mention.get("end_char")
+                        if m_start_local is None or m_end_local is None:
+                            continue
+                        m_start_global, m_end_global = window_mapper.to_global(
+                            m_start_local, m_end_local
+                        )
+                        mentions.append(
+                            {
+                                "text": window_text[m_start_local:m_end_local],
+                                "start_char": m_start_global,
+                                "end_char": m_end_global,
+                            }
+                        )
+                    if mentions:
+                        new_chains.append(
+                            {
+                                "representative": chain.get("representative", ""),
+                                "mentions": mentions,
+                            }
+                        )
+                self._merge_chains(new_chains)
+
+        return self._global_chains
+
+    def _fallback_to_local(self, chunk) -> bool:
+        """Procesa con Stanza local un lote de ventanas que falló por HTTP.
+
+        Devuelve ``False`` si no hay fallback posible (deshabilitado o Stanza
+        local no disponible), para que el llamador marque la extracción como
+        incompleta.
+        """
+        if not self.remote_fallback_local:
+            print("✗ Fallback local deshabilitado — saltando ventanas.")
+            return False
+
+        if self._local_pipeline() is None:
+            print("✗ Stanza local no disponible — saltando ventanas.")
+            return False
+
+        print(f"→ Usando Stanza local para {len(chunk)} ventana(s).")
+        for window_text, window_start in chunk:
+            self._resolve_window(window_text, window_start)
+        return True
+
+    def _local_pipeline(self):
+        """Pipeline Stanza local, cargado a la primera (solo para el fallback)."""
+        if self.nlp is None and self.local_pipeline_factory is not None:
+            try:
+                self.nlp = self.local_pipeline_factory()
+            except Exception as e:
+                print(f"Stanza local no disponible: {e}")
+                self.nlp = None
+        return self.nlp
+
+    def _resolve_uce(
+        self, full_doc_text: str, uce_text: str, uce_start: int, uce_end: int
+    ) -> None:
+        """
+        Process a single UCE: update buffer, run Stanza on the window, and merge new chains.
+        """
+        window = self._window(full_doc_text, uce_start, uce_end)
+        if window is None:
             return
+        self._resolve_window(*window)
+
+    def _resolve_window(self, window_text: str, window_start: int) -> None:
+        """Corre Stanza local sobre UNA ventana y fusiona sus cadenas."""
+        window_end = window_start + len(window_text)
 
         # The whole per-window processing lives inside the try/except: a
         # degenerate input (e.g. a window that tokenizes to zero sentences) can
@@ -3842,8 +3994,11 @@ class NLPProvider:
     def get_sentence_embedder(cls, config: "Config") -> Optional[SentenceTransformer]:
         if cls._sentence_embedder is None:
             try:
+                # Ruta local si está cacheado: evita la consulta a hub (falla
+                # sin DNS en el contenedor) al cargar el modelo.
                 cls._sentence_embedder = SentenceTransformer(
-                    config.sentence_embedder_model
+                    resolve_model_dir(config.sentence_embedder_model)
+                    or config.sentence_embedder_model
                 )
             except Exception as e:
                 logger.warning(f"No se pudo cargar SentenceTransformer: {e}")
@@ -5523,12 +5678,36 @@ class PipelineGramatical:
             self.surprisal_source = None
 
         # Coreferencias
-        self.stanza_pipeline = NLPProvider.get_stanza(config)
-        self.coref_resolver = (
-            CoreferenceResolver(self.stanza_pipeline, context_units=2)
-            if self.stanza_pipeline
-            else None
-        )
+        # Con servidor remoto (Colab) el coref se resuelve por HTTP: cargar un
+        # pipeline Stanza local aquí duplicaría el trabajo del segmentador y su
+        # RAM en CPU. Sin remoto, Stanza local como siempre.
+        if STANZA_SERVER_URL and config.use_coref:
+            self.stanza_pipeline = None
+            self.coref_resolver = CoreferenceResolver(
+                None,
+                context_units=2,
+                remote_client=RemoteCorefClient(
+                    STANZA_SERVER_URL,
+                    token=STANZA_SERVER_TOKEN,
+                    lang=config.stanza_lang,
+                    timeout=STANZA_SERVER_TIMEOUT,
+                ),
+                remote_batch_size=STANZA_SERVER_COREF_REMOTE_BATCH,
+                # Perezoso: Stanza local solo se carga si el servidor falla.
+                local_pipeline_factory=lambda: NLPProvider.get_stanza(config),
+                remote_fallback_local=STANZA_SERVER_FALLBACK_LOCAL,
+            )
+            logger.info(
+                "Coref del analizador gramatical vía servidor remoto: %s",
+                STANZA_SERVER_URL,
+            )
+        else:
+            self.stanza_pipeline = NLPProvider.get_stanza(config)
+            self.coref_resolver = (
+                CoreferenceResolver(self.stanza_pipeline, context_units=2)
+                if self.stanza_pipeline
+                else None
+            )
         # Matchers y analizadores
         self.corpus_verbal_frames = []  # para almacenar frames del último procesamiento
         self.marcadores_matcher = build_discourse_matcher(self.nlp)
@@ -5682,6 +5861,12 @@ class PipelineGramatical:
                 # Process entire document at once – returns all global chains
                 all_chains = self.coref_resolver.resolve(full_text, segments)
                 all_chains = [_to_dict_chain(ch) for ch in all_chains]
+                if self.coref_resolver.last_extraction_incomplete:
+                    logger.warning(
+                        "Coref incompleto para doc %s: el servidor remoto falló "
+                        "y no hay Stanza local disponible. Cadenas parciales.",
+                        origen_key,
+                    )
             # ──────────────────────────────────────────────────────────────
             # 2. Assign chains to each UCE (full and filtered)
             # ──────────────────────────────────────────────────────────────

@@ -1,0 +1,50 @@
+diff --git a/src/reii/gramatica.py b/src/reii/gramatica.py
+--- a/src/reii/gramatica.py
++++ b/src/reii/gramatica.py
+@@ -19,7 +19,7 @@
+ from reii.config import GRAMATICA_PATH
+ 
+ DEFAULT_GRAMATICA: Dict[str, Any] = {
+-    "content_pos": ["NOUN", "VERB", "ADJ", "ADV"],
++    "content_pos": ["NOUN", "VERB", "ADJ", "ADV", "PROPN", "X"],
+     "stopwords_extra": [],
+     "expresiones": [],
+     "palabras_activas": {},
+diff --git a/src/reii/main_workflow.py b/src/reii/main_workflow.py
+--- a/src/reii/main_workflow.py
++++ b/src/reii/main_workflow.py
+@@ -1045,7 +1045,7 @@
+     # ── Gramática personalizable (capa de personalización léxica) ──────────
+     # content_pos: POS que se consideran "activas" (entran al vocabulario).
+     content_pos: List[str] = field(
+-        default_factory=lambda: ["NOUN", "VERB", "ADJ", "ADV"]
++        default_factory=lambda: ["NOUN", "VERB", "ADJ", "ADV", "PROPN", "X"]
+     )
+     # stopwords_extra: palabras tratadas como suplementarias (además de is_stop).
+     stopwords_extra: List[str] = field(default_factory=list)
+@@ -2513,22 +2513,19 @@
+                             "pos_idx": i,
+                         }
+                     )
+                 elif (
+                     is_forced_supp
+                     or is_extra_stop
+                     or (
+                         is_alpha
+-                        and (
+-                            is_stop
+-                            or pos
+-                            in {"PRON", "SCONJ", "CCONJ", "DET", "AUX", "ADP", "INTJ"}
+-                        )
++                        and pos
++                        in {"PRON", "SCONJ", "CCONJ", "DET", "AUX", "ADP", "INTJ"}
+                     )
+                 ):
+                     marcadores.append(
+                         {"forma": text.lower(), "lemma": resolved_lemma, "pos": pos}
+                     )
+-                elif pos in self.content_pos and not is_stop and is_alpha:
++                elif pos in self.content_pos and is_alpha:
+                     stem = stemmer.stem(resolved_lemma) if stemmer else resolved_lemma
+                     lemmas.append(resolved_lemma)
+                     stems.append(stem)

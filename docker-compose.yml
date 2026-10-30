@@ -88,6 +88,12 @@ services:
       - REII_SUBTLEX_PATH=/d/SUBTLEX-ESP.xlsx
       - REII_WORD_EMBEDDINGS_PATH=/d/cc.es.300.bin
       - REII_USE_GENSIM_EMBEDDINGS=false
+      # Sin DNS en el contenedor: hub/sentence-transformers resuelven desde
+      # el volumen D:/Python/HF_Cache en vez de intentar la red (y fallar
+      # tras N reintentos). Poner HF_HUB_OFFLINE=0 en el .env para re-habilitar.
+      - HF_HOME=/root/.cache/huggingface
+      - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+      - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
       - HF_TOKEN=${HF_TOKEN:-}
       - REII_CODE_VERSION=${REII_CODE_VERSION:-}
       - STANZA_SERVER_URL=${STANZA_SERVER_URL:-}
@@ -97,6 +103,13 @@ services:
       - REII_ROOTS_SKIP_COREF=${REII_ROOTS_SKIP_COREF:-true}
       - REII_ROOTS_BATCH_SIZE=${REII_ROOTS_BATCH_SIZE:-32}
       - REII_COREF_BATCH_SIZE=${REII_COREF_BATCH_SIZE:-1}
+      # Workers de sklearn en RobustRFShapAnalyzer. -1 (todos los núcleos)
+      # lanza un proceso loky por CPU y agota la RAM de la VM de Docker
+      # Desktop/WSL2 durante el tuning del RF (la daemon muere con
+      # "error waiting for container: unexpected EOF"). 1 = secuencial.
+      - REII_RF_N_JOBS=${REII_RF_N_JOBS:-1}
+    # /dev/shm por defecto son 64MB en Docker y torch/joblib lo usan.
+    shm_size: 2gb
     profiles: ["batch"]
     depends_on:
       reii-db:

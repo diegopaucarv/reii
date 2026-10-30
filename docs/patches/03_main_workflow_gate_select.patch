@@ -1,0 +1,126 @@
+diff --git a/src/reii/main_workflow.py b/src/reii/main_workflow.py
+--- a/src/reii/main_workflow.py
++++ b/src/reii/main_workflow.py
+@@ -1002,6 +1002,8 @@ class Config:
+     method_selection_noise_max: float = 0.50
+-    # Gate de no dominancia: si la clase mayor se come mas de esta fraccion de
+-    # las UCEs ASIGNADAS (particion cruda), la particion es degenerada
+-    # (una clase + satelites) y el metodo se descarta.
+-    method_selection_max_class_share: float = 0.90
++    # Gate de no dominancia: si la clase mayor ocupa mas de esta fraccion del
++    # CORPUS (c = max_class_share * (1 - noise_frac), particion cruda), la
++    # particion es degenerada (una clase + satelites) y el metodo se descarta.
++    # Medir sobre el corpus y no sobre lo asignado evita que el ruido de
++    # HDBSCAN decida el veredicto (ver docs/design_v5/GATE_NOISE.md).
++    method_selection_max_class_share: float = 0.70
+     optimize_coverage_gate_select: float = 0.10
+@@ -1038,3 +1040,37 @@ class Config:
+     hdbscan_uce_metric: str = "euclidean"  # "euclidean" | "cosine"
++
++    # ── Method C — backend de clasificación densa (BACKEND_C.md §2, hunk #21)
++    # Valores y rol:
++    #   "dense_cdh"        bisección best-first por PC1 local con gate r2_dense.
++    #                      Controla K, no emite -1, O(n·d²) con d fijo. DEFAULT.
++    #   "ward"             AgglomerativeClustering(n_clusters=K, linkage=ward).
++    #                      K exacto, sin RNG, O(n²) en memoria: 144 MiB en el
++    #                      camino condensado y 275 MiB en el cuadrado a n=6000
++    #                      (HARDENING.md §2.2). Guarda: _METHOD_C_WARD_MAX_N.
++    #   "kmeans_spherical" L2 + KMeans(n_init=10, random_state=42). K exacto.
++    #   "hdbscan"          comportamiento histórico. NO controla K (target_k sólo
++    #                      fija min_cluster_size) y emite -1. Diagnostic only
++    #                      salvo que method_c_hdbscan_selectable sea True.
++    # Valor desconocido: NO aborta la corrida. Se resuelve con
++    # method_c_policy.resolve_method_c_backend(source="persisted"), que degrada
++    # al DEFAULT_METHOD_C_BACKEND de la política y emite un aviso "[!]".
++    # La procedencia (persistida vs interna) y el resto de la regla viven en
++    # CLASSIC_MODE.md §6; aquí sólo se declara el campo, no se duplica.
++    method_c_backend: str = "dense_cdh"
++    # Escape hatch: True devuelve a hdbscan el derecho a competir en `select`.
++    # False => diagnostic_only=True y `select-v4` lo descarta por
++    # backend == "hdbscan" (SELECT_V4.md §2.1).
++    method_c_hdbscan_selectable: bool = False
++    # K objetivo de dense_cdh. None => se deriva del plumbing existente:
++    # min_cluster_size_cdh = frac = 1/(2K) => K = round(1/(2·frac)), acotado a
++    # [2, n//floor] por method_c_policy.effective_target_k. Ver §3.
++    method_c_target_k: Optional[int] = None
++    # Gates medidos en §6: r2_1d ≈ 2/π sobre ruido => inútil (0.0, apagado);
++    # r2_dense discrimina (null 0.036-0.064, real 0.103-0.142) => 0.08.
++    dense_cdh_min_r2_1d: float = 0.0
++    dense_cdh_min_r2_dense: float = 0.08
++    # Pase loose: piso × 0.75, nunca por debajo de
++    # hdbscan_uce_min_cluster_floor (§3). En los densos no cambia K.
++    dense_cdh_loose_factor: float = 0.75
+ 
+     # DSN de la base de datos (PostgreSQL). Si None, se deriva de db_local_path.
+@@ -5673,4 +5709,14 @@ class DoubleClassifier:
+                 tot = sum(sizes)
+                 return (max(sizes) / tot) if tot > 0 else 0.0
+ 
++            def _raw_stats(_m: str) -> Dict[str, int]:
++                sizes = [int(s) for s in (_raw_sizes.get(_m) or []) if int(s) > 0]
++                assigned = sum(sizes)
++                return {
++                    "n_total": int(n_total),
++                    "n_assigned": assigned,
++                    "n_noise": int(n_total) - assigned,
++                    "max_class_size": max(sizes) if sizes else 0,
++                }
++
+             metrics = [
+@@ -5687,5 +5733,19 @@ class DoubleClassifier:
+                     min_class_size=int(_stats[_m][0]),
+                     median_class_size=float(_stats[_m][1]),
+                     max_class_share=_max_share(_m),
++                    **_raw_stats(_m),
++                    backend=(
++                        str(getattr(self.config, "method_c_backend", "hdbscan"))
++                        if _m == "C"
++                        else ""
++                    ),
++                    diagnostic_only=bool(
++                        _m == "C"
++                        and getattr(self.config, "method_c_backend", "hdbscan")
++                        == "hdbscan"
++                        and not getattr(
++                            self.config, "method_c_hdbscan_selectable", False
++                        )
++                    ),
+                 )
+                 for _m in ("A", "B", "C")
+@@ -5703,7 +5763,7 @@ class DoubleClassifier:
+                 noise_max=float(
+                     getattr(self.config, "method_selection_noise_max", 0.50)
+                 ),
+                 max_class_share_max=float(
+-                    getattr(self.config, "method_selection_max_class_share", 0.90)
++                    getattr(self.config, "method_selection_max_class_share", 0.70)
+                 ),
+             )
+@@ -5964,8 +6024,17 @@ class DoubleClassifier:
+                 context={
+                     "corpus_fingerprint": _corpus_fingerprint(),
+                     "uce_target_size": target,
+                     "mode": "select",
+                     "n_uces": int(n_total),
+                     "seed": getattr(self.config, "random_state", None),
++                    "method_c_backend": str(
++                        getattr(self.config, "method_c_backend", "hdbscan")
++                    ),
++                    "spec_hash": hashlib.sha256(
++                        json.dumps(
++                            dataclasses.asdict(self.config), sort_keys=True,
++                            default=str,
++                        ).encode("utf-8")
++                    ).hexdigest()[:16],
+                 },
+             )
+@@ -8670,5 +8739,9 @@ class Optimizador:
+             trial.set_user_attr(
+                 "max_class_share_winner",
+                 float(_win_row.get("max_class_share") or 0.0),
+             )
++            trial.set_user_attr(
++                "dominance_corpus_winner",
++                float(_win_row.get("dominance_corpus_eff") or 0.0),
++            )
+             trial.set_user_attr("abstained", False)

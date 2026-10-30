@@ -1107,6 +1107,7 @@ def bootstrap_stability(
         "bootstrap_n_boot": int(n_boot) if isinstance(n_boot, int) else 0,
         "bootstrap_std": float("nan"),
         "coverage_stable": float("nan"),
+        "stable_mask": [],
         "stability_kind": "",
         "stability_verdict": "NO_DISPONIBLE",
         "n": 0,
@@ -1208,6 +1209,7 @@ def bootstrap_stability(
         need = np.ceil(float(stable_threshold) * np.maximum(seen, 1))
         ok_rows = (seen > 0) & (hits >= need) & assigned
         out["coverage_stable"] = float(int(ok_rows.sum()) / float(n))
+        out["stable_mask"] = [bool(v) for v in ok_rows]
     out["stability_kind"] = "bootstrap"
     out["stability_verdict"] = _stability_verdict(
         out["bootstrap_ari"], out["bootstrap_ari_ci_low"]

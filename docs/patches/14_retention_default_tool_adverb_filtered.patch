@@ -1,0 +1,223 @@
+--- a/ia/gramatica.json
++++ b/ia/gramatica.json
+@@ -1,5 +1,5 @@
+ {
+-  "retention_policy": "pos_only",
++  "retention_policy": "tool_adverb_filtered",
+   "content_pos": ["NOUN", "VERB", "ADJ", "ADV"],
+   "tool_adverb_lemmas": []
+ }
+--- a/src/reii/gramatica.py
++++ b/src/reii/gramatica.py
+@@ -24,8 +24,9 @@
+     # docs/design_v5/RETENTION_POLICY.md).
+     "content_pos": ["NOUN", "VERB", "ADJ", "ADV"],
+     # Política de formas activas: pos_only | pos_plus_propn |
+-    # tool_adverb_filtered. Default = pos_only (comportamiento pre-11).
+-    "retention_policy": "pos_only",
++    # tool_adverb_filtered. Default = tool_adverb_filtered (conservadora;
++    # enmienda 2026-10-28, RETENTION_POLICY.md §10).
++    "retention_policy": "tool_adverb_filtered",
+     # Override opcional de la lista cerrada de adverbios-herramienta
+     # (vacío = usar TOOL_ADVERB_LEMMAS, que está pre-registrada).
+     "tool_adverb_lemmas": [],
+--- a/src/reii/main_workflow.py
++++ b/src/reii/main_workflow.py
+@@ -1142,7 +1142,8 @@
+     #   "pos_plus_propn"       núcleo + PROPN/X, sin is_stop (13.16).
+     #   "tool_adverb_filtered" idem, menos adverbios-herramienta (12.24).
+     # None = sin elección programática: manda ia/gramatica.json y, si
+-    # tampoco hay valor, "pos_only". A diferencia de content_pos, este
++    # tampoco hay valor, "tool_adverb_filtered" (default adoptado en la
++    # enmienda 2026-10-28). A diferencia de content_pos, este
+     # knob NO se pisa en silencio (ver reii.retention_policy).
+     retention_policy: Optional[str] = None
+     # Caché de tokens por UCE ({forma, lemma, pos, is_stop, is_alpha} de
+@@ -2279,7 +2280,7 @@
+         # guardan como atributos de instancia para que lematizar_uces los use.
+         gramatica = load_gramatica()
+         # Precedencia del knob (RETENTION_POLICY.md §2.0):
+-        #   Config.retention_policy > ia/gramatica.json > "pos_only"
++        #   Config.retention_policy > ia/gramatica.json > "tool_adverb_filtered"
+         # A diferencia de content_pos (que load_gramatica pisa SIEMPRE),
+         # una elección programática explícita aquí no se pierde.
+         self.retention_policy = resolve_retention_policy(
+--- a/src/reii/retention_policy.py
++++ b/src/reii/retention_policy.py
+@@ -15,7 +15,11 @@
+ Precedencia del knob (documentada para NO repetir el footgun de
+ ``Config.content_pos``, que ``load_gramatica`` pisa siempre):
+ 
+-    Config.retention_policy (si no es None)  >  ia/gramatica.json  >  "pos_only"
++    Config.retention_policy (si no es None)  >  ia/gramatica.json  >  "tool_adverb_filtered"
++
++El default es la política conservadora (``tool_adverb_filtered``), adoptada por
++la enmienda del 2026-10-28 (``RETENTION_POLICY.md`` §10). ``pos_only`` sigue
++disponible como elección explícita.
+ 
+ ``content_pos`` sigue viniendo de ``load_gramatica`` (JSON > default) y
+ describe el **núcleo** categorial; ``PROPN``/``X`` no se declaran allí: los
+@@ -30,7 +34,7 @@
+ from typing import Any, Dict, Iterable, List, Optional, Set
+ 
+ RETENTION_POLICIES = ("pos_only", "pos_plus_propn", "tool_adverb_filtered")
+-DEFAULT_RETENTION_POLICY = "pos_only"
++DEFAULT_RETENTION_POLICY = "tool_adverb_filtered"
+ 
+ # POS del núcleo activo. PROPN/X se añaden por política, nunca por content_pos.
+ BASE_CONTENT_POS = ("NOUN", "VERB", "ADJ", "ADV")
+--- a/tests/test_retention_policy.py
++++ b/tests/test_retention_policy.py
+@@ -64,15 +64,34 @@
+         resolve_retention_policy(None, "no_existe")
+ 
+ 
+-def test_default_policy_does_not_change_current_result():
+-    # Default efectivo = pos_only (baseline pre-11).
+-    assert DEFAULT_RETENTION_POLICY == "pos_only"
+-    assert resolve_retention_policy(None, None) == "pos_only"
++def test_effective_default_and_precedence():
++    # (1) Sin Config ni gramática: default efectivo = conservadora.
++    assert DEFAULT_RETENTION_POLICY == "tool_adverb_filtered"
++    assert resolve_retention_policy(None, None) == "tool_adverb_filtered"
++
++    # (2) ia/gramatica.json manda sobre el default del código.
+     assert resolve_retention_policy(None, "pos_only") == "pos_only"
+-    # Config manda sobre ia/gramatica.json: no repetimos el footgun de
++    assert (
++        resolve_retention_policy(None, "tool_adverb_filtered")
++        == "tool_adverb_filtered"
++    )
++
++    # (3) Config manda sobre ia/gramatica.json: no repetimos el footgun de
+     # content_pos (que load_gramatica pisa siempre).
+     assert resolve_retention_policy("pos_plus_propn", "pos_only") == "pos_plus_propn"
+-
++    assert resolve_retention_policy("pos_only", "tool_adverb_filtered") == "pos_only"
++
++
++def test_default_is_the_same_in_code_gramatica_and_json():
++    # Las tres definiciones del default (código, DEFAULT_GRAMATICA, JSON)
++    # deben coincidir; si divergen, la precedencia miente.
++    from reii.gramatica import DEFAULT_GRAMATICA, load_gramatica
++
++    assert DEFAULT_GRAMATICA["retention_policy"] == DEFAULT_RETENTION_POLICY
++    assert load_gramatica()["retention_policy"] == DEFAULT_RETENTION_POLICY
++
++
++def test_policies_keep_their_semantics():
+     kwargs = dict(pos="ADV", lemma="no", is_stop=True, is_alpha=True)
+     # Baseline: el stopword de contenido cae en marcadores (predicado muerto).
+     assert token_decision(policy="pos_only", **kwargs) == "marker"
+--- a/docs/design_v5/RETENTION_POLICY.md
++++ b/docs/design_v5/RETENTION_POLICY.md
+@@ -10,6 +10,11 @@
+ Documento asociado al patch `docs/patches/13_retention_policy.patch`, que se
+ aplica **después** de `11_formas_activas.patch` y cuyo **default no cambia la
+ retención actual** (`pos_only`).
++
++> **Enmienda 2026-10-28:** el default adoptado ya **no** es `pos_only`, sino
++> `tool_adverb_filtered` (patch
++> `14_retention_default_tool_adverb_filtered`). El texto de arriba y el de §5.1
++> se conservan como histórico; ver §10.
+ 
+ ---
+ 
+@@ -462,3 +467,97 @@
+ | PROPN/X en `marcadores`                   | 15                            |
+ | herramienta rescatada (agresiva)          | 484                           |
+ | PROPN `-ción/-sión` en el residuo         | 166 / 278 (59.7 %), 51 formas |
++
++---
++
++## 10. Enmienda 2026-10-28: default adoptado
++
++**Decisión.** El default efectivo de `retention_policy` pasa de `pos_only` a
++**`tool_adverb_filtered`**. No es una política nueva: es aplicar el veredicto ya
++registrado en §4.1 (única candidata no trivial admitida por la restricción dura
++y, entre las admitidas, la de menor `|retención − 0.537|`). `pos_only` y
++`pos_plus_propn` siguen **disponibles** como elección explícita vía
++`Config(retention_policy=...)` o `ia/gramatica.json`.
++
++Esta enmienda **supersede** §5.1, el punto 2 de §5.3 y el bullet de §7 sobre
++re-baselinizar `best_params.json`. **No** toca §2: la restricción de cuota de
++palabras herramienta sigue en **0.30**, la regla de no-ajuste sigue vigente y
++los valores de referencia de ALCESTE siguen siendo **13.95** lemas/UCE y
++**0.537** de retención.
++
++### 10.1 Texto anterior (histórico, §5.1 literal)
++
++Se conserva tal cual, como registro de lo pre-registrado antes de esta
++enmienda:
++
++````markdown
++### 5.1 Default: sin cambios de retención
++
++`pos_only` es el default efectivo. `11_formas_activas` **solo**, deja la
++retención en 13.16; `11 + 13` la devuelve a **10.72**. Esto es deliberado:
++`best_params.json` se tuneó con el baseline y cambiarlo en silencio lo
++invalidaría. La agresiva y la conservadora quedan **opt-in**:
++
++```python
++Config(retention_policy="tool_adverb_filtered")   # o
++Config(retention_policy="pos_plus_propn")
++```
++````
++
++### 10.2 Nuevo estado
++
++| punto de definición                             | antes   | ahora                 |
++| ----------------------------------------------- | ------- | --------------------- |
++| `retention_policy.DEFAULT_RETENTION_POLICY`      | `pos_only` | `tool_adverb_filtered` |
++| `gramatica.DEFAULT_GRAMATICA["retention_policy"]`| `pos_only` | `tool_adverb_filtered` |
++| `ia/gramatica.json` → `retention_policy`         | `pos_only` | `tool_adverb_filtered` |
++| `Config.retention_policy`                        | `None`  | `None` (sin cambio)   |
++
++Precedencia resultante (sin cambios en su semántica):
++
++```text
++Config.retention_policy (si no es None)  >  ia/gramatica.json  >  "tool_adverb_filtered"
++```
++
++El diagrama equivalente de §2.0 se conserva **literal**: §2 es texto
++pre-registrado y no se edita en silencio (ver §7). Su tercer término
++(`"pos_only"`) queda sustituido por el de arriba; esta sección es la enmienda
++declarada.
++
++Vocabulario: pasan a activas **6465** formas frente a las **5658** del baseline
++(+807, las rescatadas de §3.3). Los tests de `tests/test_retention_policy.py`
++fijan las tres vías (default, JSON y `Config`) y comprueban que
++`DEFAULT_RETENTION_POLICY`, `DEFAULT_GRAMATICA` y `ia/gramatica.json` coinciden.
++
++### 10.3 Consecuencia operativa: invalidación de `best_params.json`
++
++`min_forms_uc_1` y `forms_gap` cuentan **formas distintas por UC**, así que
++cambiar el vocabulario de formas activas mueve las fronteras de UC y cambia el
++significado del espacio de parámetros. Los artefactos tuneados con el baseline
++quedan **inválidos** y el procedimiento es:
++
++1. archivar `data/reii_optuna.db`, `data/best_params.json`,
++   `data/quality_multiverse.json` y `data/method_selection.*`;
++2. re-optimizar con `--study-name reii_probe_v5`. El `corpus_fingerprint` **no**
++   cambia con el vocabulario, de modo que reutilizar `reii_probe_v4`
++   contaminaría el estudio con trials medidos bajo otro vocabulario.
++
++**No** se invalidan `data/uce_calibration.json` ni `data/coref_chains_cache.json`:
++la segmentación en UCEs no depende del léxico y la clave del cache es
++`fingerprint:target:min_uce_words`.
++
++Esta enmienda **declara** el procedimiento; **no** lo ejecuta. El archivado y la
++re-optimización son pasos manuales posteriores (y quedan fuera de este patch).
++
++### 10.4 Desviación declarada frente a ALCESTE
++
++Con `tool_adverb_filtered` el corpus queda en **12.24** lemas/UCE (retención
++**0.451**), frente a **13.95** / **0.537** de ALCESTE 2012:
++
++| magnitud  | `tool_adverb_filtered` | ALCESTE 2012 | diferencia | relativa  |
++| --------- | ---------------------- | ------------ | ---------- | --------- |
++| lemas/UCE | 12.24                  | 13.95        | **−1.71**  | **−12.3 %** |
++| retención | 0.451                  | 0.537        | **−0.086** | **−16.0 %** |
++
++La desviación se declara cuantificada (como ya hacía §4.2); no se corrige
++ajustando la métrica, el umbral (0.30) ni los valores de referencia.

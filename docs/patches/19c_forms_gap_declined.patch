@@ -1,0 +1,91 @@
+--- a/src/reii/main_workflow.py
++++ b/src/reii/main_workflow.py
+@@ -8855,7 +8855,6 @@
+ #: muestreados de espacios distintos).
+ _BOUNDARY_EXPANDABLE = (
+     "min_forms_uc_1",
+-    "forms_gap",
+     "similarity_threshold",
+     "min_r2_threshold",
+     "coref_weight",
+@@ -8906,6 +8905,17 @@
+         "endpoint registrado (0.451 frente a 0.537 de ALCESTE). Ganar "
+         "estabilidad podando retencion es el intercambio que este auditor "
+         "existe para hacer visible, no para firmar"
++    ),
++    "forms_gap": (
++        "el piso se mantiene: `gap` separa los pisos de la pasada 1 y la "
++        "pasada 2 (mf2 = mf1 + gap). Con gap<2 las dos pasadas producen casi "
++        "la misma particion y el ARI de 2 pasadas sube por construccion: es "
++        "la misma familia de artefacto que swap_iterations=0 (patch 19), no "
++        "un hiperparametro. gap=2 es el minimo que las mantiene distintas. "
++        "Desviacion declarada: ALCESTE usa 10/14 (gap=4) y el default del "
++        "codigo [13, 17] (gap=4); el optimo de v6 corre con (10, 12). La "
++        "sensibilidad gap=2 vs gap=4 se mide en "
++        "docs/design_v5/EXPERIMENTO_SENSIBILIDAD_FORMS_GAP.md"
+     ),
+ }
+ 
+@@ -9612,6 +9622,11 @@
+ 
+         space: Dict[str, Any] = {
+             "min_forms_uc_1": (max(2, f1 - 4), f1 + 4),
++            # v6b (patch 19c): el piso NO se baja a 1. `mf2 = mf1 + gap`;
++            # con gap<2 las dos pasadas son casi la misma particion y el ARI
++            # de 2 pasadas sube por construccion (misma familia que
++            # swap_iterations=0). El optimo de v6 cayo en 2 (=piso): se
++            # declara en _BOUNDARY_DECLINED, no se amplia.
+             "forms_gap": (2, 7),
+             # v6 (PRE-REGISTRADO antes del run v6): en v5 el optimo de `tsj`
+             # quedo CENSURADO al techo en AMBAS etapas (tsj=5, rango [2, 5]).
+--- a/tests/test_v5_space.py
++++ b/tests/test_v5_space.py
+@@ -310,6 +310,18 @@
+     assert opt._search_space_cached["tsj"] == (max(2, cfg.tsj - 2), cfg.tsj + 2)
+     assert "tsj" in _need("_BOUNDARY_DECLINED")
+     assert "tsj" not in _need("_BOUNDARY_EXPANDABLE")
++
++
++def test_forms_gap_floor_is_declared_not_widened(opt):
++    """El piso de `forms_gap` no se amplia: gap<2 colapsa las pasadas.
++
++    Con `mf2 = mf1 + gap`, un gap menor hace que la pasada 2 construya casi
++    las mismas UC que la pasada 1 y el ARI de 2 pasadas sube por
++    construccion: misma familia de artefacto que `swap_iterations=0`.
++    """
++    assert opt._search_space_cached["forms_gap"] == (2, 7)
++    assert "forms_gap" in _need("_BOUNDARY_DECLINED")
++    assert "forms_gap" not in _need("_BOUNDARY_EXPANDABLE")
+ 
+ 
+ def test_boundary_audit_flags_expandable_and_structural_edges():
+@@ -343,7 +355,7 @@
+         "swap_iterations": 5,                        # techo: estructural
+         "cdh_target_k": 3,                           # piso: estructural
+         "min_forms_uc_1": 12,                        # interior
+-        "forms_gap": 7,                              # techo: ampliable
++        "forms_gap": 7,                              # techo: censurado-declarado
+         "similarity_threshold": 0.45,                # interior
+         "min_r2_threshold": 0.03,                    # piso: ampliable
+         "coref_context_units_loose": 5,              # interior (driver)
+@@ -367,7 +379,6 @@
+     by_name = {name: (value, rec) for name, value, rec in hits}
+     # Ampliables: la recomendacion propone ensanchar el rango.
+     for name, expected in (
+-        ("forms_gap", "(2, 8)"),
+         ("coref_weight", "por debajo del minimo"),
+         ("min_r2_threshold", "por debajo del minimo"),
+     ):
+@@ -381,6 +392,12 @@
+     assert rec.startswith("censurado-declarado:"), rec
+     assert "NO se amplia" in rec, rec
+     assert by_name["tsj"][0] == "6"
++
++    # `forms_gap` en el piso: censurado declarado (gap<2 colapsa las pasadas).
++    rec = by_name["forms_gap"][1]
++    assert rec.startswith("censurado-declarado:"), rec
++    assert "NO se amplia" in rec, rec
++    assert by_name["forms_gap"][0] == "7"
+ 
+     # Estructurales: el auditor dice explicitamente que NO se amplia.
+     for name in (

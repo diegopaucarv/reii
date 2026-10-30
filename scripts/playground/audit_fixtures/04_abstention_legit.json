@@ -1,0 +1,135 @@
+{
+  "name": "04_abstention_legit",
+  "note": "Ningun metodo viable: A fuera de k_bounds, B por ruido, C por coverage util. winner=null CON abstained=true y motivo declarado es una abtencion legitima, no un error: veredicto abstain, sin [X].",
+  "rule": "current",
+  "expect": {
+    "verdict": "abstain",
+    "exit_strict": 0,
+    "invariants": {
+      "reproducibility": "ok",
+      "discard_reason": "ok",
+      "denominator": "ok",
+      "backend_coherente": "ok",
+      "abstention": "ok",
+      "no_intersection": "ok",
+      "traceability": "ok"
+    }
+  },
+  "best_params": {
+    "path": "data/best_params.json",
+    "exists": true,
+    "mtime": "2026-10-26T09:00:00+00:00",
+    "size": 4096
+  },
+  "history": [
+    {
+      "rule_version": "select-v3",
+      "context": {
+        "corpus_fingerprint": "fp-smoke-0004",
+        "uce_target_size": 30,
+        "mode": "select",
+        "n_uces": 528,
+        "seed": 42,
+        "written_at": "2026-10-27T10:15:00+00:00",
+        "method_c_backend": "dense_cdh",
+        "spec_hash": "sha256:0000aaaa1111eeee"
+      },
+      "selection": {
+        "winner": null,
+        "winner_ari": null,
+        "winner_coverage": null,
+        "winner_k": 0,
+        "winner_usable_coverage": null,
+        "runner_up": null,
+        "runner_up_ari": null,
+        "runner_up_coverage": null,
+        "runner_up_k": 0,
+        "runner_up_usable_coverage": null,
+        "delta_ari": null,
+        "delta_coverage": null,
+        "ambiguous": false,
+        "criteria_conflict": false,
+        "abstained": true,
+        "reason": "ningun metodo cumple viabilidad",
+        "discarded": [
+          {"method": "A", "why": "K=2 fuera de [3, 20]"},
+          {
+            "method": "B",
+            "why": "ruido 0.620 > max 0.50 (mas de la mitad del corpus sin clasificar)"
+          },
+          {
+            "method": "C",
+            "why": "coverage util 0.040 < umbral 0.15 (coverage 0.050 menos tiny 0.010)"
+          }
+        ],
+        "rule_version": "select-v3",
+        "margin": 0.02,
+        "coverage_floor": 0.15,
+        "min_class_share": 0.01,
+        "noise_max": 0.5,
+        "k_bounds": [3, 20],
+        "all_metrics": [
+          {
+            "method": "A",
+            "k": 2,
+            "ari": 0.71,
+            "coverage": 0.4,
+            "tiny_frac": 0.0,
+            "noise_frac": 0.0,
+            "perturbation": "A1<->A2",
+            "available": true,
+            "assigned_frac": 1.0,
+            "min_class_size": 201,
+            "median_class_size": 245.0,
+            "max_class_share": 0.6193,
+            "usable": 0.4,
+            "n_total": 528,
+            "n_assigned": 528,
+            "n_noise": 0,
+            "max_class_size": 327
+          },
+          {
+            "method": "B",
+            "k": 9,
+            "ari": 0.3,
+            "coverage": 0.32,
+            "tiny_frac": 0.0,
+            "noise_frac": 0.62,
+            "perturbation": "B1<->B2",
+            "available": true,
+            "assigned_frac": 0.38,
+            "min_class_size": 8,
+            "median_class_size": 22.0,
+            "max_class_share": 0.44,
+            "usable": 0.32,
+            "n_total": 528,
+            "n_assigned": 200,
+            "n_noise": 328,
+            "max_class_size": 88
+          },
+          {
+            "method": "C",
+            "k": 4,
+            "ari": 0.12,
+            "coverage": 0.05,
+            "tiny_frac": 0.01,
+            "noise_frac": 0.0,
+            "perturbation": "C1<->C2",
+            "available": true,
+            "assigned_frac": 1.0,
+            "min_class_size": 106,
+            "median_class_size": 132.0,
+            "max_class_share": 0.2008,
+            "usable": 0.04,
+            "backend": "dense_cdh",
+            "diagnostic_only": false,
+            "n_total": 528,
+            "n_assigned": 528,
+            "n_noise": 0,
+            "max_class_size": 106
+          }
+        ]
+      }
+    }
+  ]
+}

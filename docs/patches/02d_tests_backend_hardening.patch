@@ -1,0 +1,42 @@
+diff --git a/tests/test_backend_hardening.py b/tests/test_backend_hardening.py
+--- a/tests/test_backend_hardening.py
++++ b/tests/test_backend_hardening.py
+@@ -213,15 +213,18 @@
+ 
+         labels, diag = guarded_fit("dense_cdh", X, target_k, floor, min_r2_dense=0.08)
+ 
+-        assert labels is not None
++        # La politica endurecida NO entrega particion con K<2 (BACKEND_C.md
++        # §7): devuelve None pero CONSERVA el diagnostico medido, que es lo
++        # que este test verifica (target_k != n_clusters).
++        assert labels is None
+         pre = diag["precondition"]
++        assert pre["reason"] == "below_kmin"
+         assert pre["k_requested"] == target_k
+         assert diag["n_clusters"] == 1  # K real, medido sobre ruido puro
+         assert diag["n_clusters"] != pre["k_requested"]
+         # El aviso hace visible la brecha en vez de fingir que se alcanzo K.
+-        assert any(
+-            f"target_k={target_k}" in msg and "clases" in msg for msg in diag["notices"]
+-        )
++        assert "n_clusters=1" in pre["message"]
++        assert "sin particion" in pre["message"]
+         assert diag.get("n_noise") == 0  # dense_cdh no emite -1
+ 
+     def test_aviso_canonico_de_la_brecha(self):
+@@ -314,10 +317,12 @@
+     assert pre.ok is False
+     assert pre.reason in ("k_below_gate", "k_below_kmin")
+ 
+-    # ward acota a K_MIN en vez de emitir K=1 (HARDENING.md §4).
++    # K<2 no es particion en NINGUN backend: la politica lo rechaza en vez
++    # de dejar que ward acote a K_MIN y fabrique el corte minimo
++    # (BACKEND_C.md §7).
+     pre_w = preflight("ward", 200, 1, FLOOR)
+-    assert pre_w.ok is True
+-    assert int(pre_w.k_effective) >= K_MIN
++    assert pre_w.ok is False
++    assert pre_w.reason == "k_below_kmin"
+ 
+ 
+ def test_ceros_por_encima_del_umbral_devuelve_none():

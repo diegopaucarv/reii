@@ -37,6 +37,7 @@ from reii.config import (
     OUTPUT_LEXICAL_JSON,
     OUTPUT_LEXICAL_XLSX,
     OUTPUT_NETWORK_GEXF,
+    RF_N_JOBS,
     SPACY_MODEL,
     TOGETHER_API_KEY,
     TOGETHER_BASE_URL,
@@ -312,6 +313,9 @@ class Config:
     rf_impute_strategy: str = "median"  # 'median', 'mean', 'constant'
     rf_cat_encoding: str = "frequency"  # 'onehot', 'frequency', 'target'
     rf_min_samples_for_tuning: int = 30
+    # Workers de sklearn (-1 = todos los núcleos). Ver RF_N_JOBS en config.py:
+    # con -1 en el contenedor puede agotar la RAM y matar la daemon de Docker.
+    rf_n_jobs: int = RF_N_JOBS
 
     optimize: bool = False
     optimize_trials: int = 50
@@ -2082,6 +2086,7 @@ class RobustRFShapAnalyzer:
         self.impute_strategy = config.rf_impute_strategy
         self.cat_encoding = config.rf_cat_encoding
         self.min_samples_for_tuning = config.rf_min_samples_for_tuning
+        self.n_jobs = config.rf_n_jobs
 
     def _preprocess(
         self, X_raw: pd.DataFrame, y: np.ndarray
@@ -2182,7 +2187,7 @@ class RobustRFShapAnalyzer:
             n_iter=self.n_iter_tune,
             cv=cv,
             scoring="balanced_accuracy",
-            n_jobs=-1,
+            n_jobs=self.n_jobs,
             random_state=self.random_state,
         )
         search.fit(X, y)
@@ -2230,8 +2235,23 @@ class RobustRFShapAnalyzer:
         if len(X) < 10 or len(np.unique(y)) < 2:
             return {"error": "Después de preprocesamiento, datos insuficientes"}
 
-        # Tune hyperparameters
-        best_params = self._tune_hyperparams(X, y)
+        # Tune hyperparameters. Si el tuning falla (p. ej. joblib no puede
+        # crear workers por falta de memoria), seguimos con los valores por
+        # defecto: perder el tuning es preferible a abortar aquí la corrida
+        # completa, con todo el pipeline ya calculado.
+        try:
+            best_params = self._tune_hyperparams(X, y)
+        except Exception as exc:  # noqa: BLE001 - degradar, no abortar
+            print(
+                f"[RF] WARNING: tuning falló ({type(exc).__name__}: {exc}); "
+                "usando hiperparámetros por defecto."
+            )
+            best_params = {
+                "n_estimators": self.n_estimators,
+                "max_depth": self.max_depth,
+                "min_samples_split": 2,
+                "min_samples_leaf": 1,
+            }
         clf = RandomForestClassifier(
             **best_params, random_state=self.random_state, class_weight="balanced"
         )
@@ -2277,7 +2297,7 @@ class RobustRFShapAnalyzer:
 
         # Permutation importance
         perm_imp = permutation_importance(
-            clf, X, y, n_repeats=10, random_state=self.random_state, n_jobs=-1
+            clf, X, y, n_repeats=10, random_state=self.random_state, n_jobs=self.n_jobs
         )
         perm_imp_df = pd.DataFrame(
             {

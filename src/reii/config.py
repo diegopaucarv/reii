@@ -231,6 +231,22 @@ STANZA_SERVER_COREF_REMOTE_BATCH: int = int(
 STANZA_SERVER_CONCURRENCY: int = int(os.environ.get("STANZA_SERVER_CONCURRENCY", "1"))
 
 # ---------------------------------------------------------------------------
+# Random Forest (sklearn)
+# ---------------------------------------------------------------------------
+# Workers de sklearn en RandomizedSearchCV / permutation_importance.
+#
+# Con -1, joblib lanza cpu_count() procesos loky (~250 MB cada uno) ADEMÁS del
+# proceso padre, que ya tiene torch+spaCy+Stanza+embeddings y el corpus en
+# memoria. En Docker Desktop/WSL2 eso agota la RAM de la VM: la daemon muere y
+# el CLI aborta con "error waiting for container: unexpected EOF" (no llega a
+# haber traceback de Python).
+#
+# Con ~400 UCEs y una decena de features el paralelismo no aporta, así que el
+# default es 1 (secuencial, memoria acotada). Subir solo con datos grandes y
+# RAM de sobra.
+RF_N_JOBS: int = int(os.environ.get("REII_RF_N_JOBS", "1"))
+
+# ---------------------------------------------------------------------------
 # API keys / tokens
 # ---------------------------------------------------------------------------
 TOGETHER_API_KEY: str = os.environ.get("TOGETHER_API_KEY", "")

@@ -1,0 +1,31 @@
+--- a/tests/test_stability_null.py
++++ b/tests/test_stability_null.py
+@@ -6,7 +6,7 @@
+ 
+     quality.metrics.bootstrap_stability  +  null_partition_test
+     method_selection.select_method(..., null_mode=...)
+-    method_selection.stability_mean_min
++    method_selection.STABILITY_MEAN_MIN
+ 
+ Hasta entonces todos los tests se **saltan** (la suite queda verde) en vez de
+ fallar: los diffs los aplica el usuario a mano sobre `src/**`, que es un scope
+@@ -40,7 +40,9 @@
+ # ``import *``-equivalente tolerante: con solo el diff de v4 aplicado (o con
+ # ninguno), el modulo no tiene estas funciones y el fichero debe poder
+ # COLECTARSE para que el ``skipif`` lo marque como saltado.
+-stability_mean_min = getattr(_ms, "stability_mean_min", float("nan"))
++stability_mean_min = getattr(
++    _ms, "STABILITY_MEAN_MIN", getattr(_ms, "stability_mean_min", float("nan"))
++)
+ MethodMetrics = _ms.MethodMetrics
+ select_method = _ms.select_method
+ 
+@@ -288,7 +290,7 @@
+ 
+ def test_piso_coincide_entre_modulos():
+     """El piso de la regla y el del motor no pueden divergir."""
+-    assert float(_ms.stability_mean_min) == pytest.approx(float(STABILITY_MEAN_MIN))
++    assert float(stability_mean_min) == pytest.approx(float(STABILITY_MEAN_MIN))
+ 
+ 
+ # ══════════════════════════════════════════════════════════════════════════

@@ -28,14 +28,15 @@ from reii.config import (
     ROOTS_SKIP_COREF,
     SEGMENTER_EMBEDDING_MODEL,
     SPACY_MODEL,
-    STANZA_SERVER_COREF_REMOTE_BATCH,
     STANZA_SERVER_CONCURRENCY,
+    STANZA_SERVER_COREF_REMOTE_BATCH,
     STANZA_SERVER_FALLBACK_LOCAL,
     STANZA_SERVER_TIMEOUT,
     STANZA_SERVER_TOKEN,
     STANZA_SERVER_URL,
     STANZA_USE_GPU,
 )
+from reii.hf_local import resolve_model_dir
 from reii.seg.coref_checkpoint import adaptive_coref_batch_size
 from reii.seg.root_cache import RootSubjectCache, StanzaRootExtractor
 from reii.seg.stanza_pipeline import COREF_PROCESSORS, build_stanza_pipeline
@@ -173,7 +174,9 @@ class ClassicSegmenter:
         self.embedding_model = embedding_model
         self.embedding_cache = {}
         self.nli_model = pipeline(
-            "zero-shot-classification", model=NLI_MODEL, device=device
+            "zero-shot-classification",
+            model=resolve_model_dir(NLI_MODEL) or NLI_MODEL,
+            device=device,
         )
 
     def semantic_cohesion_score(self, segment1, segment2):
@@ -326,7 +329,10 @@ class ProgressiveSegmenter:
                 "otra segmentación.",
                 stacklevel=2,
             )
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        # Ruta local si el modelo está cacheado: evita el model_info() que
+        # transformers hace dentro de _patch_mistral_regex (revienta sin DNS).
+        tokenizer_src = resolve_model_dir(model_name) or model_name
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_src, use_fast=True)
         self.max_depth = max_depth
         self.index = None
         self.embeddings = None
@@ -346,7 +352,9 @@ class ProgressiveSegmenter:
         # los llamadores NO persistir ese resultado parcial como si fuera completo.
         self.last_extraction_incomplete = False
 
-        self.model = SentenceTransformer(model_name).to(self.device)
+        self.model = SentenceTransformer(
+            resolve_model_dir(model_name) or model_name
+        ).to(self.device)
         self.classicseg = ClassicSegmenter(self.model, spacy_model=spacy_model)
         self.nlp = spacy.load(spacy_model)
         if "conversational_sbd" not in self.nlp.pipe_names:
@@ -568,9 +576,7 @@ class ProgressiveSegmenter:
 
         return [" ".join(seg) for seg in segments]
 
-    def detect_topic_shift(
-        self, segment1, segment2, last_n=3, min_content_tokens=None
-    ):
+    def detect_topic_shift(self, segment1, segment2, last_n=3, min_content_tokens=None):
         import math
         from collections import Counter
 
@@ -676,7 +682,11 @@ class ProgressiveSegmenter:
         """
         if not segments or len(segments) == 1:
             return list(segments)
-        min_ct = self.min_content_tokens if min_content_tokens is None else min_content_tokens
+        min_ct = (
+            self.min_content_tokens
+            if min_content_tokens is None
+            else min_content_tokens
+        )
         min_ch = self.min_segment_chars if min_chars is None else min_chars
 
         work = list(segments)
@@ -743,7 +753,11 @@ class ProgressiveSegmenter:
         pieza previa solo si el resultado cabe en ``max_tokens * max_overflow_ratio``
         (1.0 = cota estricta: preferimos una cola corta a violar el límite).
         """
-        min_ct = self.min_content_tokens if min_content_tokens is None else min_content_tokens
+        min_ct = (
+            self.min_content_tokens
+            if min_content_tokens is None
+            else min_content_tokens
+        )
         budget = max(1, max_tokens - self._special_tokens())
         sentences = self.classicseg.robust_sentence_split(text)
         if not sentences:
@@ -758,7 +772,10 @@ class ProgressiveSegmenter:
                 for k in range(0, len(ids), budget):
                     chunk = ids[k : k + budget]
                     expanded.append(
-                        (self.tokenizer.decode(chunk, skip_special_tokens=True), len(chunk))
+                        (
+                            self.tokenizer.decode(chunk, skip_special_tokens=True),
+                            len(chunk),
+                        )
                     )
 
         pieces, current, cur_tok = [], [], 0
@@ -1126,7 +1143,9 @@ class ProgressiveSegmenter:
         # timeout) a un túnel propio — vigilar que
         # REMOTE_BATCH × tiempo_por_texto < STANZA_SERVER_TIMEOUT.
         REMOTE_BATCH = STANZA_SERVER_COREF_REMOTE_BATCH
-        batches = [pending[i : i + REMOTE_BATCH] for i in range(0, len(pending), REMOTE_BATCH)]
+        batches = [
+            pending[i : i + REMOTE_BATCH] for i in range(0, len(pending), REMOTE_BATCH)
+        ]
 
         def _fetch_batch(batch):
             """Solo la llamada de red — SIN tocar seen_chain_keys/global_chains.
@@ -1173,7 +1192,9 @@ class ProgressiveSegmenter:
         # ── Merge: SIEMPRE secuencial, en el orden original de `batches` ──
         for batch, results, err in fetched:
             if err is not None:
-                self._dprint(f"    ✗ Stanza remoto falló ({err!r}); usando Stanza local.")
+                self._dprint(
+                    f"    ✗ Stanza remoto falló ({err!r}); usando Stanza local."
+                )
                 logging.warning("Stanza remoto falló (%s); usando Stanza local", err)
                 if not STANZA_SERVER_FALLBACK_LOCAL:
                     # Idéntico al comportamiento original: un fallo duro

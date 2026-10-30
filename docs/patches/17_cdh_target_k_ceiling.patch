@@ -1,0 +1,104 @@
+--- a/src/reii/main_workflow.py
++++ b/src/reii/main_workflow.py
+@@ -8358,6 +8358,16 @@
+     return n_gate, n_exc, detail
+ 
+ 
++#: Techo de `cdh_target_k` (piso del CDH expresado en clases objetivo).
++#: No es un objetivo: se convierte en `min_cluster_size_cdh = 1/(2K)`, así
++#: que subirlo REDUCE el piso de hoja y el CDH particiona más. Medido en
++#: `reii_probe_v5_stage1_wc` (n=528): kT<=12 -> K<=18 (viable); kT>=16 ->
++#: K=25..34, fuera del gate `k_bounds=(3,20)`, centinela garantizado. Con
++#: el techo anterior (20) se gastaba el 30 % del presupuesto de la etapa 1
++#: en trials infactibles por construcción.
++_CDH_TARGET_K_HI = 12
++
++
+ def _cdh_frac_from_params(params: Dict[str, Any], default: float = 0.10) -> float:
+     """Piso del CDH como fracción de n, resuelto desde los params de un trial.
+ 
+@@ -8972,9 +8972,14 @@
+         # Ahora el sampler elige el K objetivo y el piso se DERIVA:
+         #     min_cluster_size_cdh = 1 / (2K)      (piso ~ n/(2K))
+-        # El rango de K coincide con el gate de select-v2 (3..20) y se
+-        # recorta para que el piso absoluto (5 UCEs) sea alcanzable.
++        # El rango de K coincide con el gate de select-v2 (3..20) y se
++        # recorta para que el piso absoluto (5 UCEs) sea alcanzable; el techo
++        # lo acota además _CDH_TARGET_K_HI (kT no es un objetivo, ver allí).
+         n_total = int(getattr(self, "total_uces", 0) or 0)
+-        k_hi = 20 if n_total <= 0 else max(3, min(20, n_total // 10))
++        k_hi = (
++            _CDH_TARGET_K_HI
++            if n_total <= 0
++            else max(3, min(_CDH_TARGET_K_HI, n_total // 10))
++        )
+ 
+         # ── v5: separacion minima del par de fracciones = 1 UCE ──────────
+         # mcs = max(floor, round(frac*n_emb)). Sumar exactamente 1/n_emb
+--- a/tests/test_cdh_min_leaf_floor.py
++++ b/tests/test_cdh_min_leaf_floor.py
+@@ -10,7 +10,13 @@
+ import pytest
+ from scipy.sparse import csr_matrix
+ 
+-from reii.main_workflow import ClasificadorDescendente, Config
++from reii.main_workflow import (
++    ClasificadorDescendente,
++    Config,
++    Optimizador,
++    UCBuilderConfig,
++    _cdh_frac_from_params,
++)
+ 
+ FLOOR_FRAC = 0.10
+ N_UC = 400
+@@ -93,3 +93,49 @@
+ 
+     assert len(np.unique(labels)) == 1
+     assert int((labels >= 0).sum()) == 8
++
++
++# ── Techo de `cdh_target_k` (patch 17) ─────────────────────────────────
++# `cdh_target_k` NO es un objetivo: `_cdh_frac_from_params` lo convierte en
++# `min_cluster_size_cdh = 1/(2K)`, así que subirlo REDUCE el piso de hoja y
++# el CDH particiona MÁS. Medido en `reii_probe_v5_stage1_wc` (n=528):
++# kT<=12 -> K<=18 (viable); kT>=16 -> K=25..34, fuera del gate. El techo del
++# espacio se acota a `_CDH_TARGET_K_HI` (patch 17).
++
++
++def _search_space(total_uces):
++    """Espacio de búsqueda sin segmentar corpus (evita `Optimizador.__init__`)."""
++    opt = Optimizador.__new__(Optimizador)
++    opt.config_base = Config()
++    opt.uc_config = UCBuilderConfig()
++    opt.retrofitted_vectors = None
++    opt.total_uces = total_uces
++    return opt.get_search_space()
++
++
++def test_cdh_target_k_ceiling_on_probe_corpus():
++    """n=528 (reii_probe_v5_stage1_wc): el techo es el explícito, no 20."""
++    lo, hi = _search_space(528)["cdh_target_k"]
++    assert hi <= 12, f"cdh_target_k hi={hi} viola el techo medido"
++    assert lo == 3
++
++
++def test_cdh_target_k_ceiling_respects_small_corpus():
++    """Corpus pequeño: manda n//10 (8) y el mínimo nunca baja de 3."""
++    lo, hi = _search_space(80)["cdh_target_k"]
++    assert hi == 8 and lo == 3
++    lo2, hi2 = _search_space(10)["cdh_target_k"]
++    assert lo2 == 3 and hi2 == 3
++
++
++def test_cdh_target_k_ceiling_unknown_corpus_size():
++    """total_uces <= 0: techo nuevo (12), no el 20 anterior."""
++    lo, hi = _search_space(0)["cdh_target_k"]
++    assert hi == 12 and lo == 3
++
++
++def test_cdh_target_k_frac_at_ceiling_keeps_nonzero_floor():
++    """kT=12 -> frac=1/24; sobre n=528 el piso de hoja no degenera en 0."""
++    frac = _cdh_frac_from_params({"cdh_target_k": 12})
++    assert frac == pytest.approx(1.0 / 24.0)
++    assert int(round(frac * 528)) >= 1

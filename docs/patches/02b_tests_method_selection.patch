@@ -1,0 +1,40 @@
+diff --git a/tests/test_method_selection.py b/tests/test_method_selection.py
+--- a/tests/test_method_selection.py
++++ b/tests/test_method_selection.py
+@@ -195,21 +195,31 @@
+         assert "dominante" in sel.discarded[0]["why"]
+         assert "0.92" in sel.discarded[0]["why"]
+ 
+-    def test_dominancia_089_no_descarta(self):
+-        """0.89 <= 0.90 es una particion desbalanceada pero no degenerada."""
+-        c = MethodMetrics("C", 3, 0.785, 0.371, max_class_share=0.89)
++    def test_dominancia_089_con_ruido_no_descarta(self):
++        """0.89 de las asignadas con 30% de ruido = 0.62 del corpus: viable.
++
++        Reemplaza a ``test_dominancia_089_no_descarta``: el umbral ya no es
++        0.90 sobre lo asignado sino 0.70 sobre el corpus, asi que 0.89 sin
++        ruido SI se descarta; con ruido, no.
++        """
++        c = MethodMetrics(
++            "C", 3, 0.785, 0.371, noise_frac=0.30, max_class_share=0.89
++        )
+         a = _m("A", 4, 0.250, 0.574)
+         sel = select_method([a, c])
+         assert sel.winner == "C"
+         assert not any("dominante" in d["why"] for d in sel.discarded)
++        # c = 0.89 * (1 - 0.30) = 0.623 del corpus
++        assert sel.winner_dominance_corpus == pytest.approx(0.623)
+ 
+     def test_dominancia_gate_aparece_en_explain(self):
+-        """El umbral 0.90 se imprime junto al valor de la clase mayor."""
++        """El umbral se imprime en unidades del corpus (0.70)."""
+         c = MethodMetrics("C", 3, 0.785, 0.371, max_class_share=0.60)
+         sel = select_method([c])
+         text = sel.explain_text()
+         assert "clase mayor=0.60" in text
+-        assert "gate: >0.90" in text
++        assert "= 0.60 del corpus" in text
++        assert "gate: >0.70 del corpus" in text
+ 
+ 
+ class TestSerialization:

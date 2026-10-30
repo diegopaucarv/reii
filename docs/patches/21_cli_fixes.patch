@@ -1,0 +1,240 @@
+--- a/src/reii/main_workflow.py
++++ b/src/reii/main_workflow.py
+@@ -441,16 +441,87 @@
+     "--stage1-fraction",
+     "--coverage-gate",
+     "--coverage-gate-all",
++    "--method-c-backend",
++    "--max-class-share",
+ }
+ _CLI_FLAGS_SIN_VALOR = {
+     "--optimize-only",
+     "--no-optuna-warm-start",
+     "--single-stage",
+     "--stability-bootstrap",
++    "--allow-unknown-flags",
+ }
++
++#: Backends de Method C expuestos por CLI. Espejo de `Config.method_c_backend`;
++#: la autoridad final sigue siendo `method_c_policy.resolve_method_c_backend`.
++_METHOD_C_BACKENDS_CLI = {"dense_cdh", "ward", "kmeans_spherical", "hdbscan"}
++
++#: Ayuda en ASCII puro: en consola Windows con cp1252 los acentos y las
++#: flechas rompen el print justo cuando el usuario pide ayuda.
++_CLI_USAGE = """
++REII - main_workflow.py [flags]
++
++  --force | --reprocess          reprocesa documentos ya completos
++  --uce-target-size N            fija el target de UCE (desactiva la calibracion)
++
++--mode (modo de clasificacion):
++  select                         A | B | C: elige UNO con select-v4 y lo
++                                 persiste en data/method_selection.json
++  wc_only | coref_only | emb_only             un solo metodo (A | B | C)
++  wc_coref | wc_emb | coref_emb | all         interseccion de metodos
++  classic                        escenario A: ALCESTE 2012 aislado en data/classic/
++  alias: auto->select, both->wc_coref, sim_only->coref_only,
++         wc_sim->wc_coref, sim_emb->coref_emb
++
++Optimizador:
++  --optimize-only                ignora best_params.json y TERMINA tras optimizar
++  --trials N                     presupuesto (default operativo 300, >= 1)
++  --stage1-fraction f            reparto etapa 1 / etapa 2 (0 < f < 1, default 0.3)
++  --single-stage                 una sola etapa (mode=select), sin etapa 1
++  --study-name X                 prefijo del study; el codigo anade
++                                 _stage1_wc_<fp> y _stage2_select_<fp>
++  --seed N                       random_state (>= 0)
++  --no-optuna-warm-start         sin warm start
++  --verdict-mode all|two_of_three
++  --coverage-gate f              gate de cobertura del select (en [0, 1])
++  --coverage-gate-all f          gate de cobertura del modo all (en [0, 1])
++
++Method C y gate de seleccion:
++  --method-c-backend B           dense_cdh (default) | ward | kmeans_spherical
++                                 | hdbscan (diagnostico: no controla K, emite -1)
++  --max-class-share f            gate de dominancia sobre el CORPUS
++                                 (pre-registrado en el paper: 0.70)
++
++Estabilidad:
++  --stability-bootstrap          bootstrap real; solo en el select final
++                                 (incompatible con --optimize-only)
++
++Otros:
++  -h, --help                     esta ayuda
++  --allow-unknown-flags          ignora flags desconocidos en vez de abortar
++
++Notas:
++  * Este modulo escanea sys.argv a mano: un flag desconocido ABORTA la corrida
++    (antes se ignoraba en silencio y la corrida parecia valida).
++  * El default del entrypoint es `select`, pero ConfigStore (PostgreSQL) puede
++    pisarlo; --mode gana sobre ambos.
++  * Sin flag a proposito: optimize_preference (knee esta pre-registrado).
++"""
++
++
++def _print_cli_help() -> None:
++    print(_CLI_USAGE.strip("\n"))
++
++
+ _OPTIMIZE_ONLY = "--optimize-only" in sys.argv
+ _NO_OPTUNA_WARM_START = "--no-optuna-warm-start" in sys.argv
+ _SINGLE_STAGE = "--single-stage" in sys.argv
++
++# La ayuda se resuelve antes de construir Config, pero DESPUES de los imports
++# del modulo: no se puede evitar el coste de importar spacy/nltk.
++if __name__ == "__main__" and any(a in ("-h", "--help") for a in sys.argv[1:]):
++    _print_cli_help()
++    sys.exit(0)
+
+
+ def _cli_val(flag: str) -> Optional[str]:
+@@ -476,11 +547,65 @@
+
+
+ def _warn_unknown_cli_flags() -> None:
++    """Valida argv contra la lista de flags que este modulo conoce.
++
++    El escaneo de argv es manual: lo que no se reconocia se ignoraba en
++    silencio, de modo que un typo (`--stabilyty-bootstrap`) corria sin
++    bootstrap y el resultado parecia valido. Ahora aborta con exit 2, salvo
++    que se pida `--allow-unknown-flags`.
++    """
+     known = {"--force", "--reprocess", "--mode", "--uce-target-size"}
+     known |= _CLI_FLAGS_CON_VALOR | _CLI_FLAGS_SIN_VALOR
+-    unknown = [a for a in sys.argv[1:] if a.startswith("--") and a not in known]
+-    if unknown:
+-        print(f"   [WARNING] flags desconocidos (se ignoran): {unknown}")
++    known |= {"--help", "-h"}
++    unknown = [a for a in sys.argv[1:] if a.startswith("-") and a not in known]
++    if not unknown:
++        return
++    if "--allow-unknown-flags" in sys.argv:
++        print(
++            "   [WARNING] flags desconocidos (ignorados por "
++            f"--allow-unknown-flags): {unknown}"
++        )
++        return
++    print(f"   [ERROR] flags desconocidos: {unknown}")
++    print("           se aborta en vez de ignorarlos en silencio.")
++    print("           usa --help para la lista de flags validos, o")
++    print("           --allow-unknown-flags para ignorarlos a proposito.")
++    sys.exit(2)
++
++
++def _check_cli_ranges(upd: dict) -> None:
++    """Valida rangos de los overrides antes de pasarlos a Config.
++
++    El cast solo comprobaba el tipo: `--stage1-fraction 1.5` llegaba al
++    optimizador y el reparto de trials se "autocorregia" con un mensaje que
++    no describia el problema.
++    """
++    rules = (
++        ("optimize_trials", "--trials", lambda v: v >= 1, ">= 1"),
++        ("random_state", "--seed", lambda v: v >= 0, ">= 0"),
++        (
++            "optimize_stage1_fraction",
++            "--stage1-fraction",
++            lambda v: 0.0 < v < 1.0,
++            "0 < f < 1",
++        ),
++        (
++            "optimize_coverage_gate",
++            "--coverage-gate",
++            lambda v: 0.0 <= v <= 1.0,
++            "en [0, 1]",
++        ),
++        (
++            "optimize_coverage_gate_all",
++            "--coverage-gate-all",
++            lambda v: 0.0 <= v <= 1.0,
++            "en [0, 1]",
++        ),
++    )
++    for field, flag, ok, txt in rules:
++        if field in upd and not ok(upd[field]):
++            print(f"   [ERROR] {flag} debe ser {txt} (recibido: {upd[field]!r})")
++            sys.exit(2)
+
+
+ def _cli_overrides(cfg):
+@@ -499,6 +624,8 @@
+         value = _cli_cast(flag, cast)
+         if value is not None:
+             upd[field] = value
++    _check_cli_ranges(upd)
++
+     verdict = _cli_val("--verdict-mode")
+     if verdict is not None:
+         if verdict not in ("all", "two_of_three"):
+@@ -509,8 +636,54 @@
+         upd["optimize_two_stage"] = False
+         print("   [CLI] --single-stage: una sola etapa (mode=select)")
+     if "--stability-bootstrap" in sys.argv:
++        if _OPTIMIZE_ONLY:
++            print(
++                "   [ERROR] --stability-bootstrap no se combina con "
++                "--optimize-only: el bootstrap real cuesta 1-10 s por select, el"
++                " optimizador corre cientos, y ademas mueve el objetivo de la"
++                " etapa 2. Reservado para el select final."
++            )
++            sys.exit(2)
+         upd["stability_bootstrap"] = True
++
++    _backend = _cli_val("--method-c-backend")
++    if _backend is not None:
++        if _backend not in _METHOD_C_BACKENDS_CLI:
++            print(
++                f"   [ERROR] --method-c-backend invalido: {_backend!r}. "
++                f"Validos: {', '.join(sorted(_METHOD_C_BACKENDS_CLI))}"
++            )
++            sys.exit(2)
++        upd["method_c_backend"] = _backend
++        if _backend == "hdbscan":
++            print(
++                "   [!] --method-c-backend=hdbscan: no controla K y emite -1;"
++                " `select` lo descarta salvo method_c_hdbscan_selectable=True."
++            )
++
++    _max_share = _cli_cast("--max-class-share", float)
++    if _max_share is not None:
++        if not 0.0 < _max_share < 1.0:
++            print(
++                f"   [ERROR] --max-class-share debe cumplir 0 < share < 1 "
++                f"(recibido: {_max_share!r})"
++            )
++            sys.exit(2)
++        upd["method_selection_max_class_share"] = _max_share
++        print(
++            f"   [!] --max-class-share={_max_share}: el valor pre-registrado del"
++            " paper es 0.70 sobre el CORPUS. Cambiarlo rompe la comparacion con"
++            " la corrida registrada."
++        )
++
+     if _OPTIMIZE_ONLY:
++        _m = _parse_cli_mode()
++        if _m not in (None, "classic"):
++            print(
++                f"   [i] --mode {_m} es inerte con --optimize-only: la corrida"
++                " termina tras el optimizador y la etapa 2 optimiza siempre en"
++                " mode='select'."
++            )
+         print(
+             "   [CLI] --optimize-only: se ignora best_params.json "
+             "y se sale tras el optimizador"
+@@ -961,7 +1134,7 @@
+     optimize: bool = True
+     optimize_trials: int = 200
+     optimize_stage1_fraction: float = 0.3  # n_stage1 = max(20, int(n * frac))
+-    optimize_two_stage: bool = True  # False => una sola etapa (mode="all")
++    optimize_two_stage: bool = True  # False => una sola etapa (mode="select")
+     optimize_sampler: str = "tpe"  # "tpe" | "random" | "cmaes"
+     optimize_pruner: str = "median"  # "median" | "hyperband" | "none"
+     optimize_storage: Optional[str] = None  # ej. "sqlite:///reii_optuna.db"
+@@ -11792,6 +11965,7 @@
+
+     _mode_final = str(getattr(alceste_config, "classification_mode", "") or "")
+     _mode_final = {"auto": "select"}.get(_mode_final, _mode_final)
++    print(f"   [i] modo de clasificacion efectivo: {_mode_final}")
+     if _mode_final in (
+         "all",
+         "two_of_three",

@@ -1,0 +1,1446 @@
+diff --git a/ia/gramatica.json b/ia/gramatica.json
+new file mode 100644
+index 0000000..35de50c
+--- /dev/null
++++ b/ia/gramatica.json
+@@ -0,0 +1,5 @@
++{
++  "retention_policy": "pos_only",
++  "content_pos": ["NOUN", "VERB", "ADJ", "ADV"],
++  "tool_adverb_lemmas": []
++}
+diff --git a/scripts/retention_policy_report.py b/scripts/retention_policy_report.py
+new file mode 100644
+index 0000000..193b760
+--- /dev/null
++++ b/scripts/retention_policy_report.py
+@@ -0,0 +1,628 @@
++#!/usr/bin/env python3
++"""Medición offline de políticas de formas activas (fidelidad ALCESTE 2012).
++
++No importa ``reii.main_workflow``, no corre Stanza, no usa red y es
++determinista (semilla fija). Regla pre-registrada y veredicto:
++``docs/design_v5/RETENTION_POLICY.md``.
++
++Modos
++-----
++1. ``--token-table`` (exacto): JSONL escrito por ``TokenTableWriter`` con
++   ``{forma, lemma, pos, is_stop, is_alpha}`` de TODOS los tokens. Requiere una
++   pasada previa del pipeline (~13 s/UCE), pero mide sin aproximaciones.
++2. Sin ``--token-table`` (aproximado): reconstruye desde ``workflow_data.json``
++
++   - ``formas_tokens``                        -> activas del baseline
++   - ``marcadores`` con POS de contenido      -> rescatadas al quitar ``is_stop``
++   - ``marcadores`` con POS PROPN/X           -> rescatadas por ``pos_plus_propn``
++   - residuo ``tokens - (formas U marcadores)`` menos numerales -> PROPN
++
++   Esta reconstrucción reproduce las cifras publicadas (10.72 / 13.16 / 12.24
++   sobre 528 UCEs); el script lo verifica e imprime ``VALIDADA`` o ``FALLA``.
++
++Uso
++---
++    python scripts/retention_policy_report.py --input data/workflow_data.json
++    python scripts/retention_policy_report.py --input data/workflow_data.json \
++        --token-table data/token_table.jsonl --bootstrap 1000 --seed 42
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import random
++import sys
++from collections import Counter
++from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
++
++_HERE = os.path.dirname(os.path.abspath(__file__))
++_SRC = os.path.join(os.path.dirname(_HERE), "src")
++if os.path.isdir(_SRC) and _SRC not in sys.path:
++    sys.path.insert(0, _SRC)
++
++from reii.retention_policy import (  # noqa: E402
++    BASE_CONTENT_POS,
++    PROPN_LIKE_POS,
++    TOOL_ADVERB_LEMMAS,
++    fold,
++    is_tool_adverb,
++    policy_content_pos,
++    read_token_table,
++    token_decision,
++)
++
++POLICIES = ("pos_only", "pos_plus_propn", "tool_adverb_filtered")
++LABELS = {
++    "pos_only": "pos_only (baseline)",
++    "pos_plus_propn": "pos_plus_propn (agresiva)",
++    "tool_adverb_filtered": "tool_adverb_filtered (conservadora)",
++}
++
++ALCESTE_LEMMAS_PER_UCE = 13.95
++ALCESTE_RETENTION = 0.537
++TOOL_QUOTA_MAX = 0.30
++QUOTA_SENSITIVITY = (0.15, 0.25, 0.30, 0.35)
++
++# Contadores publicados en docs/design_v5/RETENTION_ROOTCAUSE.md §2 (528 UCEs).
++PUBLISHED_COUNTS = {
++    "pos_only": 5658,
++    "pos_plus_propn": 6949,
++    "tool_adverb_filtered": 6465,
++}
++PUBLISHED_UCES = 528
++
++# Numerales y fraccionarios: spaCy los etiqueta NUM y NO entran en ninguna
++# política (tampoco en ALCESTE). En el residuo hay que descartarlos para no
++# contarlos como PROPN. Lista cerrada, aplicada sobre formas plegadas.
++NUMERAL_FORMS = frozenset(
++    {
++        "cero",
++        "uno",
++        "una",
++        "un",
++        "dos",
++        "tres",
++        "cuatro",
++        "cinco",
++        "seis",
++        "siete",
++        "ocho",
++        "nueve",
++        "diez",
++        "once",
++        "doce",
++        "trece",
++        "catorce",
++        "quince",
++        "dieciseis",
++        "diecisiete",
++        "dieciocho",
++        "diecinueve",
++        "veinte",
++        "veintiuno",
++        "veintiun",
++        "veintidos",
++        "veintitres",
++        "veinticuatro",
++        "veinticinco",
++        "veintiseis",
++        "veintisiete",
++        "veintiocho",
++        "veintinueve",
++        "treinta",
++        "cuarenta",
++        "cincuenta",
++        "sesenta",
++        "setenta",
++        "ochenta",
++        "noventa",
++        "cien",
++        "ciento",
++        "doscientos",
++        "trescientos",
++        "cuatrocientos",
++        "quinientos",
++        "seiscientos",
++        "setecientos",
++        "ochocientos",
++        "novecientos",
++        "mil",
++        "millon",
++        "millones",
++        "billon",
++        "billones",
++        "medio",
++        "media",
++        "tercio",
++        "cuarto",
++        "mitad",
++    }
++)
++
++
++# ──────────────────────────────────────────────────────────────────────
++# Carga de datos
++# ----------------------------------------------------------------------
++def load_workflow(path: str) -> List[Dict[str, Any]]:
++    with open(path, "r", encoding="utf-8") as fh:
++        data = json.load(fh)
++    uces = data.get("uces") if isinstance(data, dict) else data
++    if not isinstance(uces, list):
++        raise SystemExit("La entrada no contiene una lista de UCEs: {}".format(path))
++    return uces
++
++
++# ──────────────────────────────────────────────────────────────────────
++# Modo 2: reconstrucción por residuo
++# ----------------------------------------------------------------------
++def _residue_propn(uce: Dict[str, Any]) -> List[str]:
++    """Formas del residuo que no son numerales (candidatas a PROPN/X)."""
++    used: Counter = Counter()
++    for forma in uce.get("formas_tokens") or []:
++        used[fold(forma.get("forma"))] += 1
++    for marcador in uce.get("marcadores") or []:
++        used[fold(marcador.get("forma"))] += 1
++
++    tokens: Counter = Counter(fold(token) for token in (uce.get("tokens") or []))
++    residue = tokens - used
++
++    out: List[str] = []
++    for form, count in residue.items():
++        if count <= 0 or not form or form in NUMERAL_FORMS:
++            continue
++        out.extend([form] * count)
++    return out
++
++
++def build_residue_records(uces: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    records: List[Dict[str, Any]] = []
++    for uce in uces:
++        words = len((uce.get("texto") or "").split())
++        if words == 0:
++            words = len(uce.get("tokens") or [])
++
++        base = [fold(item.get("forma")) for item in (uce.get("formas_tokens") or [])]
++        base = [form for form in base if form]
++        rescued: List[str] = []
++        rescued_tool: List[str] = []
++        propn: List[str] = []
++
++        for marcador in uce.get("marcadores") or []:
++            pos = marcador.get("pos")
++            form = fold(marcador.get("forma"))
++            if not form:
++                continue
++            lemma = marcador.get("lemma") or marcador.get("forma")
++            if pos in BASE_CONTENT_POS:
++                rescued.append(form)
++                if is_tool_adverb("tool_adverb_filtered", pos, lemma):
++                    rescued_tool.append(form)
++            elif pos in PROPN_LIKE_POS:
++                propn.append(form)
++
++        propn.extend(_residue_propn(uce))
++        records.append(
++            {
++                "id": uce.get("id"),
++                "words": words,
++                "base": base,
++                "rescued": rescued,
++                "rescued_tool": rescued_tool,
++                "propn": propn,
++            }
++        )
++    return records
++
++
++# ──────────────────────────────────────────────────────────────────────
++# Modo 1: tabla de tokens exacta
++# ----------------------------------------------------------------------
++def build_exact_records(table: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
++    content_pos = {policy: set(policy_content_pos(policy)) for policy in POLICIES}
++    records: List[Dict[str, Any]] = []
++
++    for uce_id, entry in table.items():
++        rows = entry.get("tokens") or []
++        words = entry.get("words")
++        if not words:
++            words = len(rows)
++
++        active = {policy: [] for policy in POLICIES}
++        rescued = 0
++        rescued_tool = 0
++        for row in rows:
++            pos = row.get("pos")
++            lemma = row.get("lemma") or row.get("forma") or ""
++            is_stop = bool(row.get("is_stop"))
++            is_alpha = bool(row.get("is_alpha"))
++            form = fold(row.get("forma"))
++            decisions = {}
++            for policy in POLICIES:
++                decisions[policy] = token_decision(
++                    policy=policy,
++                    pos=pos,
++                    lemma=lemma,
++                    is_stop=is_stop,
++                    is_alpha=is_alpha,
++                    content_pos=content_pos[policy],
++                )
++                if decisions[policy] == "active":
++                    active[policy].append(form)
++
++            if decisions["pos_plus_propn"] == "active":
++                if decisions["pos_only"] != "active":
++                    rescued += 1
++                    if is_tool_adverb("tool_adverb_filtered", pos, lemma):
++                        rescued_tool += 1
++
++        records.append(
++            {
++                "id": uce_id,
++                "words": words,
++                "base": active["pos_only"],
++                "rescued": [],
++                "rescued_tool": ["__tool__"] * rescued_tool,
++                "propn": [],
++                "forms_by_policy": active,
++                "rescued_n": rescued,
++            }
++        )
++    return records
++
++
++# ──────────────────────────────────────────────────────────────────────
++# Métricas
++# ----------------------------------------------------------------------
++def _subtract(forms: Sequence[str], remove: Iterable[str]) -> List[str]:
++    remaining = Counter(remove)
++    kept: List[str] = []
++    for form in forms:
++        if remaining.get(form, 0) > 0:
++            remaining[form] -= 1
++        else:
++            kept.append(form)
++    return kept
++
++
++def policy_forms(record: Dict[str, Any], policy: str) -> List[str]:
++    if "forms_by_policy" in record:
++        return record["forms_by_policy"][policy]
++    if policy == "pos_only":
++        return record["base"]
++    rescued = record["rescued"]
++    if policy == "tool_adverb_filtered":
++        rescued = _subtract(rescued, record["rescued_tool"])
++    return record["base"] + rescued + record["propn"]
++
++
++def _rescue_stats(record: Dict[str, Any], policy: str) -> Tuple[int, int, int]:
++    """(añadidas_totales, añadidas_is_stop, herramienta_añadida) por UCE."""
++    if policy == "pos_only":
++        return 0, 0, 0
++    if "forms_by_policy" in record:
++        added = len(record["forms_by_policy"][policy]) - len(record["base"])
++        isstop = record.get("rescued_n", 0)
++        tool = len(record["rescued_tool"])
++        if policy == "tool_adverb_filtered":
++            return added, isstop - tool, 0
++        return added, isstop, tool
++    rescued = record["rescued"]
++    tool = record["rescued_tool"]
++    if policy == "tool_adverb_filtered":
++        return (
++            len(rescued) - len(tool) + len(record["propn"]),
++            len(rescued) - len(tool),
++            0,
++        )
++    return len(rescued) + len(record["propn"]), len(rescued), len(tool)
++
++
++def measure(
++    records: Sequence[Dict[str, Any]], policy: str, bootstrap: int, seed: int
++) -> Dict[str, Any]:
++    forms_by_uce = [policy_forms(record, policy) for record in records]
++    words_by_uce = [record["words"] for record in records]
++    rescue_pairs = [_rescue_stats(record, policy) for record in records]
++
++    n = len(records)
++    total_lemmas = sum(len(forms) for forms in forms_by_uce)
++    total_words = sum(words_by_uce)
++    rescued = sum(pair[0] for pair in rescue_pairs)
++    rescued_isstop = sum(pair[1] for pair in rescue_pairs)
++    rescued_tool = sum(pair[2] for pair in rescue_pairs)
++
++    result = {
++        "policy": policy,
++        "n": n,
++        "lemmas": total_lemmas,
++        "words": total_words,
++        "lemas_uce": total_lemmas / n if n else 0.0,
++        "retention": total_lemmas / total_words if total_words else 0.0,
++        "distinct_uce": (
++            sum(len(set(forms)) for forms in forms_by_uce) / n if n else 0.0
++        ),
++        "rescued": rescued,
++        "rescued_isstop": rescued_isstop,
++        "rescued_tool": rescued_tool,
++        "quota": (rescued_tool / rescued) if rescued > 0 else 0.0,
++    }
++    result["ci"] = _bootstrap_ci(forms_by_uce, words_by_uce, bootstrap, seed)
++    return result
++
++
++def _bootstrap_ci(
++    forms_by_uce: List[List[str]], words_by_uce: List[int], bootstrap: int, seed: int
++) -> Dict[str, Tuple[float, float]]:
++    n = len(forms_by_uce)
++    if n == 0 or bootstrap <= 0:
++        return {"lemas_uce": (0.0, 0.0), "retention": (0.0, 0.0)}
++
++    rng = random.Random(seed)
++    means: List[float] = []
++    retentions: List[float] = []
++    for _ in range(bootstrap):
++        idx = [rng.randrange(n) for _ in range(n)]
++        lemmas = sum(len(forms_by_uce[i]) for i in idx)
++        words = sum(words_by_uce[i] for i in idx)
++        means.append(lemmas / n)
++        retentions.append(lemmas / words if words else 0.0)
++
++    def percentile(values: List[float]) -> Tuple[float, float]:
++        values.sort()
++        lo = values[int(0.025 * (len(values) - 1))]
++        hi = values[int(0.975 * (len(values) - 1))]
++        return lo, hi
++
++    return {"lemas_uce": percentile(means), "retention": percentile(retentions)}
++
++
++# ──────────────────────────────────────────────────────────────────────
++# Regla pre-registrada
++# ----------------------------------------------------------------------
++def apply_rule(
++    results: Sequence[Dict[str, Any]], threshold: float
++) -> Optional[Dict[str, Any]]:
++    eligible = [r for r in results if r["quota"] <= threshold + 1e-12]
++    if not eligible:
++        return None
++    return min(eligible, key=lambda r: abs(r["retention"] - ALCESTE_RETENTION))
++
++
++# ──────────────────────────────────────────────────────────────────────
++# Presentación
++# ----------------------------------------------------------------------
++def render(results: Sequence[Dict[str, Any]], meta: Dict[str, Any]) -> str:
++    lines: List[str] = []
++    lines.append("=" * 100)
++    lines.append(
++        "POLÍTICAS DE RETENCIÓN DE FORMAS ACTIVAS — medición offline  "
++        "(ALCESTE 2012 = 13.95 lemas/UCE / 0.537)"
++    )
++    lines.append("=" * 100)
++    lines.append("fuente        : {}".format(meta["input"]))
++    lines.append("modo          : {}".format(meta["mode"]))
++    lines.append(
++        "corpus        : {} UCEs | {} palabras crudas (texto.split) | "
++        "{} tokens alfa".format(meta["n"], meta["words"], meta["tokens"])
++    )
++    lines.append(
++        "bootstrap     : {} remuestreos, seed={}".format(
++            meta["bootstrap"], meta["seed"]
++        )
++    )
++    lines.append("")
++    header = "{:<36} {:>9} {:>19} {:>9} {:>17} {:>11} {:>8} {:>8} {:>7}".format(
++        "política",
++        "lemas/UCE",
++        "IC95% lemas/UCE",
++        "retención",
++        "IC95% retención",
++        "formas/UCE",
++        "rescat.",
++        "herr.",
++        "cuota",
++    )
++    lines.append(header)
++    lines.append("-" * len(header))
++    for result in results:
++        ci_lemas = result["ci"]["lemas_uce"]
++        ci_ret = result["ci"]["retention"]
++        lines.append(
++            "{:<36} {:>9.2f} {:>19} {:>9.3f} {:>17} {:>11.2f} {:>8} {:>8} {:>7.3f}".format(
++                LABELS[result["policy"]],
++                result["lemas_uce"],
++                "[{:.2f}, {:.2f}]".format(ci_lemas[0], ci_lemas[1]),
++                result["retention"],
++                "[{:.3f}, {:.3f}]".format(ci_ret[0], ci_ret[1]),
++                result["distinct_uce"],
++                result["rescued"],
++                result["rescued_tool"],
++                result["quota"],
++            )
++        )
++    lines.append(
++        "{:<36} {:>9} {:>19} {:>9} {:>17} {:>11} {:>8} {:>8} {:>7}".format(
++            "ALCESTE 2012 (referencia)", "13.95", "-", "0.537", "-", "-", "-", "-", "-"
++        )
++    )
++    lines.append("")
++    if meta.get("validation"):
++        lines.append(meta["validation"])
++        lines.append("")
++    return "\n".join(lines)
++
++
++def render_verdict(results: Sequence[Dict[str, Any]]) -> str:
++    lines: List[str] = []
++    lines.append("REGLA PRE-REGISTRADA (docs/design_v5/RETENTION_POLICY.md §2)")
++    lines.append(
++        "  [1] restricción dura: cuota de palabras herramienta sobre lo rescatado "
++        "<= {:.2f}".format(TOOL_QUOTA_MAX)
++    )
++    lines.append(
++        "  [2] criterio: entre las admitidas, min |retención - {:.3f}|".format(
++            ALCESTE_RETENTION
++        )
++    )
++    lines.append("")
++    for result in results:
++        admitted = result["quota"] <= TOOL_QUOTA_MAX + 1e-12
++        gap = abs(result["retention"] - ALCESTE_RETENTION)
++        lines.append(
++            "  {:<36} cuota={:.3f}  {}   |ret-ALCESTE|={:.3f}".format(
++                result["policy"],
++                result["quota"],
++                "ADMITIDA" if admitted else "EXCLUIDA",
++                gap,
++            )
++        )
++    lines.append("")
++    winner = apply_rule(results, TOOL_QUOTA_MAX)
++    if winner is None:
++        lines.append("  VEREDICTO: ninguna política cumple la restricción dura.")
++        lines.append(
++            "  -> se publica el baseline y la desviación cuantificada "
++            "(no se 'arregla' el número)."
++        )
++    else:
++        lines.append("  VEREDICTO: {}".format(LABELS[winner["policy"]]))
++    lines.append("")
++    lines.append("  Sensibilidad de la restricción dura (mismo criterio [2]):")
++    for threshold in QUOTA_SENSITIVITY:
++        selected = apply_rule(results, threshold)
++        lines.append(
++            "    cuota <= {:.2f} -> {}".format(
++                threshold,
++                LABELS[selected["policy"]] if selected else "ninguna",
++            )
++        )
++    lines.append("")
++    lines.append(
++        "  Denominadores de la cuota: (a) rescatadas totales = is_stop + PROPN; "
++        "(b) sólo is_stop."
++    )
++    for result in results:
++        if result["policy"] == "pos_only":
++            continue
++        isstop = result.get("rescued_isstop")
++        if isstop:
++            lines.append(
++                "    {:<36} (a) {}/{}={:.3f}  (b) {}/{}={:.3f}".format(
++                    result["policy"],
++                    result["rescued_tool"],
++                    result["rescued"],
++                    result["quota"],
++                    result["rescued_tool"],
++                    isstop,
++                    result["rescued_tool"] / isstop,
++                )
++            )
++    return "\n".join(lines)
++
++
++def main(argv: Optional[Sequence[str]] = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument(
++        "--input",
++        default="data/workflow_data.json",
++        help="workflow_data.json (528 UCEs)",
++    )
++    parser.add_argument(
++        "--token-table",
++        default=None,
++        help="JSONL de TokenTableWriter (medición exacta)",
++    )
++    parser.add_argument(
++        "--fingerprint", default="", help="corpus_fingerprint de la tabla de tokens"
++    )
++    parser.add_argument(
++        "--bootstrap", type=int, default=1000, help="remuestreos bootstrap (0 = sin IC)"
++    )
++    parser.add_argument("--seed", type=int, default=42)
++    parser.add_argument("--json", default=None, help="escribe las métricas a este JSON")
++    args = parser.parse_args(argv)
++
++    if not os.path.exists(args.input):
++        raise SystemExit("No existe --input: {}".format(args.input))
++
++    uces = load_workflow(args.input)
++    words = sum(len((uce.get("texto") or "").split()) for uce in uces)
++    tokens = sum(len(uce.get("tokens") or []) for uce in uces)
++
++    table = None
++    if args.token_table:
++        table = read_token_table(args.token_table, args.fingerprint)
++        if table is None:
++            raise SystemExit(
++                "Tabla de tokens ausente o con huella distinta: {}".format(
++                    args.token_table
++                )
++            )
++
++    if table is not None:
++        records = build_exact_records(table)
++        mode = "exacto (tabla de tokens)"
++    else:
++        records = build_residue_records(uces)
++        mode = "aproximado (reconstrucción por residuo)"
++
++    results = [
++        measure(records, policy, args.bootstrap, args.seed) for policy in POLICIES
++    ]
++
++    validation = None
++    if len(uces) == PUBLISHED_UCES and table is None:
++        checks = []
++        ok = True
++        for result in results:
++            expected = PUBLISHED_COUNTS[result["policy"]]
++            same = result["lemmas"] == expected
++            ok = ok and same
++            checks.append(
++                "{}={}{}".format(
++                    result["policy"],
++                    result["lemmas"],
++                    "" if same else " (esperado {})".format(expected),
++                )
++            )
++        validation = "VALIDACIÓN de la reconstrucción: {} | {}".format(
++            "VALIDADA" if ok else "FALLA", ", ".join(checks)
++        )
++
++    meta = {
++        "input": os.path.abspath(args.input),
++        "mode": mode,
++        "n": len(uces),
++        "words": words,
++        "tokens": tokens,
++        "bootstrap": args.bootstrap,
++        "seed": args.seed,
++        "validation": validation,
++    }
++
++    print(render(results, meta))
++    print(render_verdict(results))
++
++    if args.json:
++        payload = {
++            "mode": mode,
++            "meta": meta,
++            "results": results,
++            "verdict": (apply_rule(results, TOOL_QUOTA_MAX) or {}).get("policy"),
++            "tool_quota_max": TOOL_QUOTA_MAX,
++            "alceste": {
++                "lemas_uce": ALCESTE_LEMMAS_PER_UCE,
++                "retention": ALCESTE_RETENTION,
++            },
++        }
++        with open(args.json, "w", encoding="utf-8", newline="\n") as fh:
++            json.dump(payload, fh, ensure_ascii=False, indent=2)
++            fh.write("\n")
++
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/reii/gramatica.py b/src/reii/gramatica.py
+index ecb4964..8f4dcaf 100644
+--- a/src/reii/gramatica.py
++++ b/src/reii/gramatica.py
+@@ -19,7 +19,16 @@ from typing import Any, Dict
+ from reii.config import GRAMATICA_PATH
+ 
+ DEFAULT_GRAMATICA: Dict[str, Any] = {
+-    "content_pos": ["NOUN", "VERB", "ADJ", "ADV", "PROPN", "X"],
++    # POS "núcleo" del vocabulario activo. PROPN/X NO se declaran aquí:
++    # los gobierna retention_policy (ver reii/retention_policy.py y
++    # docs/design_v5/RETENTION_POLICY.md).
++    "content_pos": ["NOUN", "VERB", "ADJ", "ADV"],
++    # Política de formas activas: pos_only | pos_plus_propn |
++    # tool_adverb_filtered. Default = pos_only (comportamiento pre-11).
++    "retention_policy": "pos_only",
++    # Override opcional de la lista cerrada de adverbios-herramienta
++    # (vacío = usar TOOL_ADVERB_LEMMAS, que está pre-registrada).
++    "tool_adverb_lemmas": [],
+     "stopwords_extra": [],
+     "expresiones": [],
+     "palabras_activas": {},
+diff --git a/src/reii/main_workflow.py b/src/reii/main_workflow.py
+index d68a535..d38046a 100644
+--- a/src/reii/main_workflow.py
++++ b/src/reii/main_workflow.py
+@@ -80,6 +80,15 @@ from reii.gram.gramatical_analyzer import (
+     train_adverb_classifier,
+ )
+ from reii.gramatica import load_gramatica
++from reii.retention_policy import (
++    TOOL_ADVERB_LEMMAS,
++    TokenTableWriter,
++    normalize_lemmas,
++    policy_content_pos,
++    resolve_retention_policy,
++    token_decision,
++    token_rows,
++)
+ from reii.method_c_policy import (
+     build_method_c_result,
+     corte_optimo_1d as _corte_optimo_1d,
+@@ -1122,10 +1131,25 @@ class Config:
+     dual_write_json: bool = False
+ 
+     # ── Gramática personalizable (capa de personalización léxica) ──────────
+-    # content_pos: POS que se consideran "activas" (entran al vocabulario).
++    # content_pos: POS "núcleo" del vocabulario activo. PROPN/X NO se
++    # declaran aquí: los gobierna retention_policy (más abajo).
+     content_pos: List[str] = field(
+-        default_factory=lambda: ["NOUN", "VERB", "ADJ", "ADV", "PROPN", "X"]
++        default_factory=lambda: ["NOUN", "VERB", "ADJ", "ADV"]
+     )
++    # retention_policy: política de formas activas (fidelidad ALCESTE).
++    #   "pos_only"             POS núcleo y not is_stop (baseline pre-11,
++    #                          10.72 lemas/UCE en este corpus).
++    #   "pos_plus_propn"       núcleo + PROPN/X, sin is_stop (13.16).
++    #   "tool_adverb_filtered" idem, menos adverbios-herramienta (12.24).
++    # None = sin elección programática: manda ia/gramatica.json y, si
++    # tampoco hay valor, "pos_only". A diferencia de content_pos, este
++    # knob NO se pisa en silencio (ver reii.retention_policy).
++    retention_policy: Optional[str] = None
++    # Caché de tokens por UCE ({forma, lemma, pos, is_stop, is_alpha} de
++    # TODOS los tokens), invalidada por corpus_fingerprint. Permite
++    # reevaluar políticas sin volver a correr Stanza (~13 s/UCE).
++    token_table_path: str = os.path.join(REII_DATA_DIR, "token_table.jsonl")
++    use_token_table_cache: bool = True
+     # stopwords_extra: palabras tratadas como suplementarias (además de is_stop).
+     stopwords_extra: List[str] = field(default_factory=list)
+     # expresiones: frases multi-palabra (separadas por espacio) unidas con '_'.
+@@ -2254,7 +2278,18 @@ class SegmentadorALCESTE:
+         # campos de Config con los valores resueltos. Los valores también se
+         # guardan como atributos de instancia para que lematizar_uces los use.
+         gramatica = load_gramatica()
+-        self.config.content_pos = list(gramatica.get("content_pos", config.content_pos))
++        # Precedencia del knob (RETENTION_POLICY.md §2.0):
++        #   Config.retention_policy > ia/gramatica.json > "pos_only"
++        # A diferencia de content_pos (que load_gramatica pisa SIEMPRE),
++        # una elección programática explícita aquí no se pierde.
++        self.retention_policy = resolve_retention_policy(
++            getattr(config, "retention_policy", None),
++            gramatica.get("retention_policy"),
++        )
++        self.config.retention_policy = self.retention_policy
++        self.config.content_pos = policy_content_pos(
++            self.retention_policy, gramatica.get("content_pos", config.content_pos)
++        )
+         self.config.stopwords_extra = list(gramatica.get("stopwords_extra", []))
+         self.config.expresiones = list(gramatica.get("expresiones", []))
+         self.config.palabras_activas = dict(gramatica.get("palabras_activas", {}))
+@@ -2272,6 +2307,14 @@ class SegmentadorALCESTE:
+         self.palabras_suplementarias = set(self.config.palabras_suplementarias)
+         self.palabras_excluir = set(self.config.palabras_excluir)
+         self.sinonimos = dict(self.config.sinonimos)
++        self.tool_adverb_lemmas = normalize_lemmas(
++            gramatica.get("tool_adverb_lemmas") or TOOL_ADVERB_LEMMAS
++        )
++        self.token_table = TokenTableWriter(
++            getattr(config, "token_table_path", None),
++            _corpus_fingerprint(),
++            enabled=bool(getattr(config, "use_token_table_cache", True)),
++        )
+ 
+         self.stemmer = (
+             SnowballStemmer("spanish") if config.stem_backend == "snowball" else None
+@@ -2492,6 +2535,13 @@ class SegmentadorALCESTE:
+         stemmer = self.stemmer
+         for uce in uces:
+             doc = self.nlp(uce.texto)
++            # Tabla completa de tokens (TODOS, también PUNCT): es la caché
++            # que permite reevaluar políticas sin volver a correr Stanza.
++            self.token_table.add(
++                getattr(uce, "id", None),
++                token_rows(doc),
++                words=len(uce.texto.split()),
++            )
+             tokens_raw = [
+                 (i, t.text, t.lemma_.lower(), t.pos_, t.is_stop, t.is_alpha)
+                 for i, t in enumerate(doc)
+@@ -2592,32 +2642,43 @@ class SegmentadorALCESTE:
+                             "pos_idx": i,
+                         }
+                     )
+-                elif (
+-                    is_forced_supp
+-                    or is_extra_stop
+-                    or (
+-                        is_alpha
+-                        and pos
+-                        in {"PRON", "SCONJ", "CCONJ", "DET", "AUX", "ADP", "INTJ"}
+-                    )
+-                ):
+-                    marcadores.append(
+-                        {"forma": text.lower(), "lemma": resolved_lemma, "pos": pos}
+-                    )
+-                elif pos in self.content_pos and is_alpha:
+-                    stem = stemmer.stem(resolved_lemma) if stemmer else resolved_lemma
+-                    lemmas.append(resolved_lemma)
+-                    stems.append(stem)
+-                    pos_tags.append(pos)
+-                    formas_tokens.append(
+-                        {
+-                            "forma": text,
+-                            "lemma": resolved_lemma,
+-                            "stem": stem,
+-                            "pos": pos,
+-                            "pos_idx": i,
+-                        }
++                else:
++                    # Una sola fuente de verdad para la clasificación:
++                    # la política decide is_stop, PROPN/X y la lista de
++                    # adverbios-herramienta (ver retention_policy.py).
++                    _decision = token_decision(
++                        policy=self.retention_policy,
++                        pos=pos,
++                        lemma=resolved_lemma,
++                        is_stop=is_stop,
++                        is_alpha=is_alpha,
++                        content_pos=self.content_pos,
++                        is_forced_supp=is_forced_supp,
++                        is_extra_stop=is_extra_stop,
++                        tool_adverb_lemmas=self.tool_adverb_lemmas,
+                     )
++                    if _decision == "marker":
++                        marcadores.append(
++                            {"forma": text.lower(), "lemma": resolved_lemma, "pos": pos}
++                        )
++                    elif _decision == "active":
++                        stem = (
++                            stemmer.stem(resolved_lemma)
++                            if stemmer
++                            else resolved_lemma
++                        )
++                        lemmas.append(resolved_lemma)
++                        stems.append(stem)
++                        pos_tags.append(pos)
++                        formas_tokens.append(
++                            {
++                                "forma": text,
++                                "lemma": resolved_lemma,
++                                "stem": stem,
++                                "pos": pos,
++                                "pos_idx": i,
++                            }
++                        )
+             if self.config.use_bigrams:
+                 for j in range(len(tokens_raw) - 1):
+                     t1, t2 = tokens_raw[j], tokens_raw[j + 1]
+diff --git a/src/reii/retention_policy.py b/src/reii/retention_policy.py
+new file mode 100644
+index 0000000..0917044
+--- /dev/null
++++ b/src/reii/retention_policy.py
+@@ -0,0 +1,394 @@
++"""Política de formas activas y caché de tokens (fidelidad léxica ALCESTE).
++
++Concentra dos piezas que antes vivían cableadas en ``SegmentadorALCESTE``:
++
++1. ``retention_policy``: knob declarativo que decide **qué tokens son formas
++   activas** y cuáles van a ``marcadores``. Sustituye al par implícito
++   ``content_pos`` + ``is_stop`` de ``lematizar_uces``.
++2. ``TokenTableWriter``: persistencia por UCE de ``{forma, lemma, pos,
++   is_stop, is_alpha}`` de **todos** los tokens, invalidada por
++   ``corpus_fingerprint``. Permite reevaluar políticas sin volver a correr
++   Stanza (~13 s/UCE).
++
++Análisis, regla pre-registrada y veredicto: ``docs/design_v5/RETENTION_POLICY.md``.
++
++Precedencia del knob (documentada para NO repetir el footgun de
++``Config.content_pos``, que ``load_gramatica`` pisa siempre):
++
++    Config.retention_policy (si no es None)  >  ia/gramatica.json  >  "pos_only"
++
++``content_pos`` sigue viniendo de ``load_gramatica`` (JSON > default) y
++describe el **núcleo** categorial; ``PROPN``/``X`` no se declaran allí: los
++gobierna la política.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import unicodedata
++from typing import Any, Dict, Iterable, List, Optional, Set
++
++RETENTION_POLICIES = ("pos_only", "pos_plus_propn", "tool_adverb_filtered")
++DEFAULT_RETENTION_POLICY = "pos_only"
++
++# POS del núcleo activo. PROPN/X se añaden por política, nunca por content_pos.
++BASE_CONTENT_POS = ("NOUN", "VERB", "ADJ", "ADV")
++PROPN_LIKE_POS = ("PROPN", "X")
++
++# Clase cerrada de palabras funcionales: ALCESTE las trata como suplementarias.
++CLOSED_MARKER_POS = frozenset({"PRON", "SCONJ", "CCONJ", "DET", "AUX", "ADP", "INTJ"})
++
++# Lista cerrada de adverbios-herramienta (negación, grado escalar, tiempo y
++# dícticos, foco). Sólo se aplica con retention_policy="tool_adverb_filtered"
++# y sólo a tokens con POS == "ADV". Pre-registrada en RETENTION_POLICY.md §2.1.
++# Se compara plegada (minúsculas, sin tildes): ver ``fold``.
++TOOL_ADVERB_LEMMAS: Set[str] = frozenset(
++    {
++        # negación
++        "no",
++        "ni",
++        "nada",
++        "nadie",
++        "nunca",
++        "jamas",
++        "tampoco",
++        # grado escalar
++        "muy",
++        "mas",
++        "menos",
++        "tan",
++        "tanto",
++        "demasiado",
++        "bastante",
++        "poco",
++        "casi",
++        "apenas",
++        # tiempo y dícticos
++        "ya",
++        "todavia",
++        "aun",
++        "antes",
++        "despues",
++        "ahora",
++        "hoy",
++        "ayer",
++        "manana",
++        "siempre",
++        "luego",
++        "entonces",
++        "mientras",
++        "temprano",
++        "tarde",
++        # foco / adición / comparación
++        "solo",
++        "solamente",
++        "tambien",
++        "incluso",
++        "ademas",
++        "mismo",
++        "igual",
++        "siquiera",
++    }
++)
++
++TOKEN_TABLE_VERSION = 1
++
++
++def fold(value: Any) -> str:
++    """Minúsculas + sin diacríticos (el corpus se normaliza sin tildes)."""
++    if not text_like(value):
++        return ""
++    decomposed = unicodedata.normalize("NFKD", str(value).lower())
++    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
++
++
++def text_like(value: Any) -> bool:
++    """True si ``value`` es una cadena con contenido."""
++    return isinstance(value, str) and bool(value)
++
++
++def normalize_lemmas(values: Iterable[str]) -> frozenset:
++    """Pliega una colección de lemas para comparaciones robustas."""
++    return frozenset(fold(value) for value in values if value)
++
++
++def validate_retention_policy(policy: Any) -> str:
++    """Normaliza y valida una política; lanza ``ValueError`` si no existe."""
++    value = str(policy).strip().lower() if policy is not None else ""
++    if value not in RETENTION_POLICIES:
++        raise ValueError(
++            "retention_policy desconocida: {!r}. Válidas: {}".format(
++                policy, ", ".join(RETENTION_POLICIES)
++            )
++        )
++    return value
++
++
++def resolve_retention_policy(
++    explicit: Optional[str] = None, gramatica: Optional[str] = None
++) -> str:
++    """Resuelve la política efectiva: Config > ia/gramatica.json > default."""
++    for value in (explicit, gramatica):
++        if value is None:
++            continue
++        if isinstance(value, str) and not value.strip():
++            continue
++        return validate_retention_policy(value)
++    return DEFAULT_RETENTION_POLICY
++
++
++def policy_content_pos(policy: str, base: Optional[Iterable[str]] = None) -> List[str]:
++    """POS activos según la política, a partir del núcleo ``base``.
++
++    ``PROPN``/``X`` se ignoran en ``base``: su inclusión la decide la política,
++    no la lista ``content_pos`` (única fuente de verdad, sin el footgun de
++    tener dos sitios que se contradicen).
++    """
++    policy = validate_retention_policy(policy)
++    core = [pos for pos in (base or BASE_CONTENT_POS) if pos not in PROPN_LIKE_POS]
++    if not core:
++        core = list(BASE_CONTENT_POS)
++    if policy == "pos_only":
++        return core
++    return core + list(PROPN_LIKE_POS)
++
++
++def policy_uses_is_stop(policy: str) -> bool:
++    """``is_stop`` es criterio de marcador sólo en la política baseline."""
++    return validate_retention_policy(policy) == "pos_only"
++
++
++def policy_filters_tool_adverbs(policy: str) -> bool:
++    """True si la política excluye la lista cerrada de adverbios-herramienta."""
++    return validate_retention_policy(policy) == "tool_adverb_filtered"
++
++
++def is_tool_adverb(
++    policy: str,
++    pos: str,
++    lemma: str,
++    tool_adverb_lemmas: Optional[Iterable[str]] = None,
++) -> bool:
++    """True si ``(pos, lemma)`` es un adverbio-herramienta de la lista cerrada.
++
++    Requiere ``pos == "ADV"``: el mismo lema con otro POS es contenido legítimo
++    (p.ej. "solo" adjetivo = 'alone', "mucho" cuantificador nominal).
++    """
++    if not policy_filters_tool_adverbs(policy):
++        return False
++    if pos != "ADV":
++        return False
++    lemmas = (
++        tool_adverb_lemmas if tool_adverb_lemmas is not None else TOOL_ADVERB_LEMMAS
++    )
++    return fold(lemma) in lemmas
++
++
++def token_decision(
++    *,
++    policy: str,
++    pos: str,
++    lemma: str,
++    is_stop: bool,
++    is_alpha: bool,
++    content_pos: Optional[Iterable[str]] = None,
++    is_forced_supp: bool = False,
++    is_extra_stop: bool = False,
++    tool_adverb_lemmas: Optional[Iterable[str]] = None,
++) -> str:
++    """Decide ``"active"``, ``"marker"`` o ``"drop"`` para un token.
++
++    Reproduce exactamente la cascada de ``lematizar_uces``: ``palabras_excluir``
++    (drop) y ``palabras_activas`` (POS forzado) se resuelven en el llamador.
++    """
++    policy = validate_retention_policy(policy)
++    if is_forced_supp or is_extra_stop:
++        return "marker"
++
++    uses_stop = policy_uses_is_stop(policy)
++    if is_alpha and ((uses_stop and is_stop) or pos in CLOSED_MARKER_POS):
++        return "marker"
++    if is_alpha and is_tool_adverb(policy, pos, lemma, tool_adverb_lemmas):
++        return "marker"
++
++    active_pos = (
++        set(content_pos) if content_pos is not None else set(policy_content_pos(policy))
++    )
++    if pos in active_pos and is_alpha and (not uses_stop or not is_stop):
++        return "active"
++    return "drop"
++
++
++def token_rows(doc: Iterable[Any]) -> List[Dict[str, Any]]:
++    """Convierte un ``Doc`` (o cualquier iterable de tokens) en filas planas.
++
++    La tabla incluye **todos** los tokens —también PUNCT y los que luego se
++    excluyen—: es la materia prima para reevaluar políticas sin Stanza.
++    """
++    rows: List[Dict[str, Any]] = []
++    for token in doc:
++        rows.append(
++            {
++                "forma": token.text,
++                "lemma": (token.lemma_ or "").lower(),
++                "pos": token.pos_,
++                "is_stop": bool(token.is_stop),
++                "is_alpha": bool(token.is_alpha),
++            }
++        )
++    return rows
++
++
++class TokenTableWriter:
++    """Escribe/actualiza un JSONL con una fila por UCE.
++
++    Formato (LF, UTF-8)::
++
++        {"type": "header", "version": 1, "corpus_fingerprint": "..."}
++        {"type": "uce", "uce_id": "...", "words": 35,
++         "tokens": [{forma, lemma, pos, is_stop, is_alpha}, ...]}
++
++    Si la cabecera no coincide con ``corpus_fingerprint`` el fichero se
++    reescribe (misma semántica de invalidación que ``best_params.json``).
++    ``add`` es idempotente por ``uce_id``.
++
++    Ningún fallo de I/O puede tumbar el pipeline: ante error se desactiva.
++    """
++
++    def __init__(self, path: Optional[str], fingerprint: str, enabled: bool = True):
++        self.path = path
++        self.fingerprint = fingerprint or ""
++        self.enabled = bool(enabled and path)
++        self._fh = None
++        self._done: Set[str] = set()
++        if not self.enabled:
++            return
++        try:
++            self._open()
++        except OSError:
++            self.enabled = False
++            self._fh = None
++
++    def _open(self) -> None:
++        assert self.path is not None  # garantizado por __init__
++        header_ok = False
++        if os.path.exists(self.path):
++            with open(self.path, "r", encoding="utf-8") as fh:
++                first = fh.readline()
++                header = {}
++                try:
++                    header = json.loads(first)
++                except (TypeError, ValueError):
++                    header = {}
++                if isinstance(header, dict):
++                    header_ok = (
++                        header.get("type") == "header"
++                        and header.get("version") == TOKEN_TABLE_VERSION
++                        and header.get("corpus_fingerprint") == self.fingerprint
++                    )
++                if header_ok:
++                    for line in fh:
++                        line = line.strip()
++                        if not line:
++                            continue
++                        try:
++                            record = json.loads(line)
++                        except ValueError:
++                            continue
++                        if isinstance(record, dict) and record.get("type") == "uce":
++                            self._done.add(str(record.get("uce_id")))
++
++        parent = os.path.dirname(os.path.abspath(self.path))
++        if parent:
++            os.makedirs(parent, exist_ok=True)
++        if header_ok:
++            self._fh = open(self.path, "a", encoding="utf-8", newline="\n")
++        else:
++            self._fh = open(self.path, "w", encoding="utf-8", newline="\n")
++            header_record = {
++                "type": "header",
++                "version": TOKEN_TABLE_VERSION,
++                "corpus_fingerprint": self.fingerprint,
++            }
++            self._fh.write(json.dumps(header_record, ensure_ascii=False) + "\n")
++            self._fh.flush()
++
++    def add(
++        self,
++        uce_id: Optional[str],
++        rows: Iterable[Dict[str, Any]],
++        words: Optional[int] = None,
++    ) -> None:
++        if not self.enabled or self._fh is None:
++            return
++        key = str(uce_id) if uce_id is not None else ""
++        if not key or key in self._done:
++            return
++        try:
++            record = {
++                "type": "uce",
++                "uce_id": key,
++                "words": words,
++                "tokens": list(rows),
++            }
++            self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
++            self._fh.flush()
++            self._done.add(key)
++        except (OSError, TypeError, ValueError):
++            self.enabled = False
++
++    def close(self) -> None:
++        if self._fh is not None:
++            try:
++                self._fh.close()
++            finally:
++                self._fh = None
++
++    def __enter__(self) -> "TokenTableWriter":
++        return self
++
++    def __exit__(self, exc_type, exc, tb) -> None:
++        self.close()
++
++
++def read_token_table(
++    path: str, fingerprint: str
++) -> Optional[Dict[str, Dict[str, Any]]]:
++    """Lee la tabla de tokens; ``None`` si falta o la huella no coincide.
++
++    Devuelve ``{uce_id: {"words": int | None, "tokens": [fila, ...]}}``.
++    ``None`` (y no ``{}``) distingue "cache inválida" de "cache vacía".
++    """
++    if not path or not os.path.exists(path):
++        return None
++    table: Dict[str, Dict[str, Any]] = {}
++    with open(path, "r", encoding="utf-8") as fh:
++        first = fh.readline()
++        try:
++            header = json.loads(first)
++        except (TypeError, ValueError):
++            return None
++        if not isinstance(header, dict):
++            return None
++        if (
++            header.get("type") != "header"
++            or header.get("version") != TOKEN_TABLE_VERSION
++            or header.get("corpus_fingerprint") != (fingerprint or "")
++        ):
++            return None
++        for line in fh:
++            line = line.strip()
++            if not line:
++                continue
++            try:
++                record = json.loads(line)
++            except ValueError:
++                continue
++            if not isinstance(record, dict) or record.get("type") != "uce":
++                continue
++            table[str(record.get("uce_id"))] = {
++                "words": record.get("words"),
++                "tokens": list(record.get("tokens") or []),
++            }
++    return table
+diff --git a/tests/test_retention_policy.py b/tests/test_retention_policy.py
+new file mode 100644
+index 0000000..5bc8ab2
+--- /dev/null
++++ b/tests/test_retention_policy.py
+@@ -0,0 +1,207 @@
++"""Tests de la política de retención de formas activas.
++
++NO importa ``reii.main_workflow``: el knob, la decisión por token y la tabla de
++tokens se testean como funciones puras / escritor de fichero.
++"""
++
++from __future__ import annotations
++
++import pytest
++from reii.retention_policy import (
++    DEFAULT_RETENTION_POLICY,
++    RETENTION_POLICIES,
++    TOOL_ADVERB_LEMMAS,
++    TokenTableWriter,
++    policy_content_pos,
++    policy_filters_tool_adverbs,
++    policy_uses_is_stop,
++    read_token_table,
++    resolve_retention_policy,
++    token_decision,
++    token_rows,
++)
++
++
++class _FakeToken:
++    """Misma interfaz que un token de spaCy (sólo lo que usa ``token_rows``)."""
++
++    def __init__(self, text, lemma, pos, is_stop, is_alpha):
++        self.text = text
++        self.lemma_ = lemma
++        self.pos_ = pos
++        self.is_stop = is_stop
++        self.is_alpha = is_alpha
++
++
++def test_knob_maps_to_three_policies():
++    assert set(RETENTION_POLICIES) == {
++        "pos_only",
++        "pos_plus_propn",
++        "tool_adverb_filtered",
++    }
++
++    # pos_only: is_stop manda y PROPN/X no son activos.
++    assert policy_uses_is_stop("pos_only")
++    assert "PROPN" not in policy_content_pos("pos_only")
++    assert not policy_filters_tool_adverbs("pos_only")
++
++    # pos_plus_propn: PROPN/X activos; is_stop deja de ser criterio de marcador.
++    assert not policy_uses_is_stop("pos_plus_propn")
++    assert "PROPN" in policy_content_pos("pos_plus_propn")
++    assert "X" in policy_content_pos("pos_plus_propn")
++    assert not policy_filters_tool_adverbs("pos_plus_propn")
++
++    # tool_adverb_filtered: como la agresiva + lista cerrada de adverbios.
++    assert not policy_uses_is_stop("tool_adverb_filtered")
++    assert "PROPN" in policy_content_pos("tool_adverb_filtered")
++    assert policy_filters_tool_adverbs("tool_adverb_filtered")
++
++
++def test_unknown_policy_raises():
++    with pytest.raises(ValueError):
++        resolve_retention_policy("aggressive")
++    with pytest.raises(ValueError):
++        resolve_retention_policy(None, "no_existe")
++
++
++def test_default_policy_does_not_change_current_result():
++    # Default efectivo = pos_only (baseline pre-11).
++    assert DEFAULT_RETENTION_POLICY == "pos_only"
++    assert resolve_retention_policy(None, None) == "pos_only"
++    assert resolve_retention_policy(None, "pos_only") == "pos_only"
++    # Config manda sobre ia/gramatica.json: no repetimos el footgun de
++    # content_pos (que load_gramatica pisa siempre).
++    assert resolve_retention_policy("pos_plus_propn", "pos_only") == "pos_plus_propn"
++
++    kwargs = dict(pos="ADV", lemma="no", is_stop=True, is_alpha=True)
++    # Baseline: el stopword de contenido cae en marcadores (predicado muerto).
++    assert token_decision(policy="pos_only", **kwargs) == "marker"
++    # Agresiva: se rescata.
++    assert token_decision(policy="pos_plus_propn", **kwargs) == "active"
++    # Conservadora: el adverbio-herramienta sigue en marcadores.
++    assert token_decision(policy="tool_adverb_filtered", **kwargs) == "marker"
++
++    # Un NOUN no-stop es activo en las tres políticas.
++    for policy in RETENTION_POLICIES:
++        assert (
++            token_decision(
++                policy=policy, pos="NOUN", lemma="agua", is_stop=False, is_alpha=True
++            )
++            == "active"
++        )
++
++    # PROPN sólo entra donde la política lo habilita.
++    assert (
++        token_decision(
++            policy="pos_only", pos="PROPN", lemma="lima", is_stop=False, is_alpha=True
++        )
++        == "drop"
++    )
++    assert (
++        token_decision(
++            policy="pos_plus_propn",
++            pos="PROPN",
++            lemma="lima",
++            is_stop=False,
++            is_alpha=True,
++        )
++        == "active"
++    )
++
++    # Clase cerrada y tokens no alfa: marcador / descarte, como antes.
++    assert (
++        token_decision(
++            policy="pos_plus_propn", pos="DET", lemma="el", is_stop=False, is_alpha=True
++        )
++        == "marker"
++    )
++    assert (
++        token_decision(
++            policy="pos_plus_propn",
++            pos="NOUN",
++            lemma="x",
++            is_stop=False,
++            is_alpha=False,
++        )
++        == "drop"
++    )
++
++
++def test_tool_adverb_list_only_applies_to_adverbs():
++    lemma = sorted(TOOL_ADVERB_LEMMAS)[0]
++    assert (
++        token_decision(
++            policy="tool_adverb_filtered",
++            pos="ADV",
++            lemma=lemma,
++            is_stop=False,
++            is_alpha=True,
++        )
++        == "marker"
++    )
++    # El mismo lema con POS adjetivo es contenido legítimo ("solo" = alone).
++    assert (
++        token_decision(
++            policy="tool_adverb_filtered",
++            pos="ADJ",
++            lemma="solo",
++            is_stop=False,
++            is_alpha=True,
++        )
++        == "active"
++    )
++
++
++def test_token_table_is_complete_and_invalidates_by_fingerprint(tmp_path):
++    path = tmp_path / "token_table.jsonl"
++    doc = [
++        _FakeToken("Hola", "hola", "INTJ", True, True),
++        _FakeToken("mundo", "mundo", "NOUN", False, True),
++        _FakeToken(".", ".", "PUNCT", False, False),
++    ]
++
++    rows = token_rows(doc)
++    assert len(rows) == len(doc) == 3
++    assert rows[1] == {
++        "forma": "mundo",
++        "lemma": "mundo",
++        "pos": "NOUN",
++        "is_stop": False,
++        "is_alpha": True,
++    }
++
++    writer = TokenTableWriter(str(path), "fp-v1")
++    writer.add("0_0_1", rows, words=2)
++    writer.add("0_0_1", rows)  # idempotente por uce_id
++    writer.close()
++
++    table = read_token_table(str(path), "fp-v1")
++    assert table is not None
++    assert list(table) == ["0_0_1"]
++    # nº de filas de la tabla == nº de tokens de la UCE.
++    assert len(table["0_0_1"]["tokens"]) == len(doc)
++    assert table["0_0_1"]["words"] == 2
++
++    # Corpus distinto => cache inválida. None distingue "inválida" de "vacía".
++    assert read_token_table(str(path), "fp-v2") is None
++
++    # Reabrir con la huella correcta continúa la tabla sin duplicar filas.
++    writer2 = TokenTableWriter(str(path), "fp-v1")
++    writer2.add("0_0_1", rows)
++    writer2.add("0_0_2", rows[:1], words=1)
++    writer2.close()
++
++    table2 = read_token_table(str(path), "fp-v1")
++    assert table2 is not None
++    assert len(table2) == 2
++    assert len(table2["0_0_1"]["tokens"]) == 3
++
++    # Una huella distinta reescribe la tabla (no mezcla corpus).
++    writer3 = TokenTableWriter(str(path), "fp-v2")
++    writer3.add("9_9_9", rows[:1])
++    writer3.close()
++    stale = read_token_table(str(path), "fp-v1")
++    assert stale is None
++    fresh = read_token_table(str(path), "fp-v2")
++    assert fresh is not None
++    assert list(fresh) == ["9_9_9"]

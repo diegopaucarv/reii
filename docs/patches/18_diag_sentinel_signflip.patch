@@ -1,0 +1,526 @@
+diff --git a/3_diagnose_optuna_db.py b/3_diagnose_optuna_db.py
+--- a/3_diagnose_optuna_db.py
++++ b/3_diagnose_optuna_db.py
+@@ -28,6 +28,7 @@
+ import argparse
+ import glob
+ import json
++import re
+ import sqlite3
+ import sys
+ from collections import Counter, defaultdict
+@@ -40,6 +41,13 @@
+     1: "MINIMIZE",
+     2: "MAXIMIZE",
+ }  # enum de Optuna: MINIMIZE=1, MAXIMIZE=2
++
++# Detector de inversión de signo entre etapas: |ρ| mínimo en AMBAS etapas.
++SIGNFLIP_MIN_ABS_RHO = 0.30
++
++# Sufijos que identifican la etapa en el nombre del estudio. El prefijo anterior
++# (p. ej. `reii_probe_v5`) es la clave de emparejamiento.
++STAGE_MARKERS = (("_stage1_wc_", "stage1"), ("_stage2_select_", "stage2"))
+ 
+ 
+ def find_db(explicit):
+@@ -83,6 +91,78 @@
+     num = sum((x - ma) * (y - mb) for x, y in zip(ra, rb))
+     den = (sum((x - ma) ** 2 for x in ra) * sum((y - mb) ** 2 for y in rb)) ** 0.5
+     return num / den if den else None
++
++
++def param_series(params, valid, pn):
++    """Valores de `pn` en los trials válidos, en el orden de `valid`."""
++    return [float(params[t][pn]) for t in valid if pn in params[t]]
++
++
++def param_objective_rhos(params, num, valid, n_obj, param_names):
++    """{param: [ρ(obj 0), ρ(obj 1), ...]} sobre los trials válidos de un estudio.
++
++    `None` = ρ no calculable (n<4, parámetro constante u objetivo sin varianza).
++    Es la ÚNICA fuente del cálculo: la usan la tabla por estudio y el detector
++    de inversión de signo entre etapas.
++    """
++    return {
++        pn: [
++            spearman(
++                param_series(params, valid, pn),
++                [num[t][i] for t in valid if pn in params[t]],
++            )
++            for i in range(n_obj)
++        ]
++        for pn in param_names
++    }
++
++
++def trial_attrs(con, sid):
++    """{trial_id: {clave: valor}} desde `trial_user_attributes` (value_json→objeto)."""
++    out = defaultdict(dict)
++    for tid, key, vj in con.execute(
++        'SELECT ua.trial_id, ua."key", ua.value_json FROM trial_user_attributes ua '
++        "JOIN trials t ON t.trial_id=ua.trial_id WHERE t.study_id=?",
++        (sid,),
++    ):
++        try:
++            out[tid][key] = json.loads(vj)
++        except (TypeError, ValueError):
++            out[tid][key] = vj
++    return out
++
++
++def k_bounds(reason):
++    """(lo, hi) del rango `[lo, hi]` que aparezca en el motivo, o (None, None)."""
++    m = re.search(r"\[\s*(-?\d+)\s*,\s*(-?\d+)\s*\]", reason)
++    return (int(m.group(1)), int(m.group(2))) if m else (None, None)
++
++
++def sentinel_gate_breakdown(sent, attrs):
++    """Agrupa los centinelas por `gate_reason` y recoge `k_rejected` por motivo.
++
++    Devuelve (Counter(motivo→n), {motivo: [k_rejected...]}, n_sin_atribuir).
++    Los centinelas sin `gate_reason` (BD antigua) se cuentan aparte en vez de
++    perderse: son el 30% del presupuesto que antes no se explicaba.
++    """
++    by_reason = Counter()
++    k_rejected = defaultdict(list)
++    unattributed = 0
++    for t in sent:
++        a = attrs.get(t, {})
++        reason = a.get("gate_reason")
++        if reason is None:
++            unattributed += 1
++            continue
++        reason = str(reason)
++        by_reason[reason] += 1
++        kr = a.get("k_rejected")
++        if kr is not None:
++            try:
++                k_rejected[reason].append(int(kr))
++            except (TypeError, ValueError):
++                pass
++    return by_reason, k_rejected, unattributed
+ 
+ 
+ def dominates(a, b, dirs):
+@@ -145,10 +225,11 @@
+     num = {tid: tuple(v[i] for i in sorted(v)) for tid, v in vals.items()}
+     if not num:
+         print("  (sin valores: ¿estudio vacío o aún corriendo?)")
+-        return
++        return {"sid": sid, "name": name, "n_obj": 0, "rhos": {}}
+     n_obj = len(next(iter(num.values())))
+     sent = [t for t, v in num.items() if tuple(v) == SENTINEL]
+     valid = [t for t in num if t not in sent]
++    attrs = trial_attrs(con, sid)
+     print(
+         f"Centinelas {SENTINEL}: {len(sent)}/{len(num)} ({100 * len(sent) / len(num):.0f}%) "
+         f"— presupuesto desperdiciado en trials inviables"
+@@ -169,9 +250,29 @@
+         f"(se evitan filtrando el espacio, no evaluando)"
+     )
+ 
++    # Atribución fina: el código ya escribe la causa en user attrs.
++    by_reason, k_rejected, unattributed = sentinel_gate_breakdown(sent, attrs)
++    if by_reason:
++        print(f"  por gate_reason: {dict(by_reason)}")
++        for reason, ks in sorted(k_rejected.items()):
++            if not ks:
++                continue
++            lo, hi = k_bounds(reason)
++            detail = ""
++            if lo is not None and min(ks) > hi:
++                detail = f" (por exceso del límite superior {hi})"
++            elif lo is not None and max(ks) < lo:
++                detail = f" (por defecto del límite inferior {lo})"
++            print(f"    {reason}: k_rejected {min(ks)}..{max(ks)}{detail}")
++    if unattributed:
++        print(
++            f"  centinelas sin gate_reason en user attrs: {unattributed} "
++            f"(BD antigua o atribución no escrita)"
++        )
++
+     if not valid:
+         print("  Ningún trial válido.")
+-        return
++        return {"sid": sid, "name": name, "n_obj": n_obj, "rhos": {}}
+     K = Counter(int(-num[t][-1]) for t in valid)
+     print(f"Distribución de K (clases) en trials válidos: {dict(sorted(K.items()))}")
+     for i in range(n_obj):
+@@ -220,40 +321,104 @@
+     print(
+         "Correlación de Spearman parámetro↔objetivo (|ρ|<0.10 en todos = parámetro probablemente INERTE):"
+     )
++    rhos = param_objective_rhos(params, num, valid, n_obj, sorted(dists))
+     for pn in sorted(dists):
+-        xs = [float(params[t][pn]) for t in valid if pn in params[t]]
++        xs = param_series(params, valid, pn)
+         if len(set(xs)) < 2:
+             print(f"   {pn:38s} sin variación")
+             continue
+-        rhos = []
+-        for i in range(n_obj):
+-            ys = [num[t][i] for t in valid if pn in params[t]]
+-            r = spearman(xs, ys)
+-            rhos.append("  n/a " if r is None else f"{r:+.2f}")
+-        inert = all(
+-            r.strip() != "n/a" and abs(float(r)) < 0.10
+-            for r in rhos
+-            if r.strip() != "n/a"
+-        ) and any(r.strip() != "n/a" for r in rhos)
+-        print(f"   {pn:38s} ρ={rhos}{'   ◄ inerte' if inert else ''}")
+-
+-    ua = Counter(
+-        k
+-        for (k,) in con.execute(
+-            "SELECT key FROM trial_user_attributes ua JOIN trials t ON t.trial_id=ua.trial_id WHERE t.study_id=?",
+-            (sid,),
++        raw = rhos[pn]
++        cells = ["  n/a " if r is None else f"{r:+.2f}" for r in raw]
++        inert = all(r is not None and abs(r) < 0.10 for r in raw) and any(
++            r is not None for r in raw
+         )
+-    )
++        print(f"   {pn:38s} ρ={cells}{'   ◄ inerte' if inert else ''}")
++
++    ua = Counter(k for a in attrs.values() for k in a)
+     print(f"\nUser attrs presentes: {dict(ua) or 'ninguno (normal en etapa 1)'}")
+-
+-
+-def main():
++    return {"sid": sid, "name": name, "n_obj": n_obj, "rhos": rhos}
++
++
++def split_stage(name):
++    """(prefijo, etapa) del nombre de estudio, o None si no casa con el patrón."""
++    for marker, stage in STAGE_MARKERS:
++        if marker in name:
++            return name.split(marker, 1)[0], stage
++    return None
++
++
++def pair_stage_records(records):
++    """{prefijo: {'stage1': rec, 'stage2': rec}} solo con ambas etapas presentes."""
++    pairs = {}
++    for rec in records:
++        split = split_stage(rec["name"])
++        if not split:
++            continue
++        prefix, stage = split
++        pairs.setdefault(prefix, {}).setdefault(stage, rec)
++    return {p: d for p, d in pairs.items() if {"stage1", "stage2"} <= set(d)}
++
++
++def is_sign_flip(r1, r2):
++    """Signos opuestos y |ρ| ≥ umbral en AMBAS etapas."""
++    return (
++        r1 is not None
++        and r2 is not None
++        and r1 * r2 < 0
++        and abs(r1) >= SIGNFLIP_MIN_ABS_RHO
++        and abs(r2) >= SIGNFLIP_MIN_ABS_RHO
++    )
++
++
++def print_sign_flip_section(records):
++    """Diagnóstico (NO gate): ρ del mismo parámetro con signo opuesto entre etapas.
++
++    Un parámetro no puede mejorar y dañar la misma estructura subyacente. Si el
++    signo se invierte con magnitud suficiente, lo que cambió es lo que MIDE el
++    objetivo de la etapa 2, no la señal. Solo informa: no filtra ni cambia el rc.
++    """
++    pairs = pair_stage_records(records)
++    if not pairs:
++        return
++    print("\n" + "=" * 72)
++    print("SIGN FLIP ENTRE ETAPAS (posible artefacto de objetivo)")
++    print("=" * 72)
++    for prefix in sorted(pairs):
++        s1, s2 = pairs[prefix]["stage1"], pairs[prefix]["stage2"]
++        print(f"\n  pareja {prefix}: {s1['name']}  vs  {s2['name']}")
++        rows = 0
++        flipped = 0
++        for pn in sorted(set(s1["rhos"]) & set(s2["rhos"])):
++            for i in range(min(len(s1["rhos"][pn]), len(s2["rhos"][pn]))):
++                r1, r2 = s1["rhos"][pn][i], s2["rhos"][pn][i]
++                if r1 is None or r2 is None:
++                    continue
++                flip = is_sign_flip(r1, r2)
++                rows += 1
++                flipped += int(flip)
++                print(
++                    f"   {pn:38s} obj[{i}]  ρ_etapa1={r1:+.2f}  ρ_etapa2={r2:+.2f}"
++                    f"{'   <<< INVIERTE' if flip else ''}"
++                )
++        if not rows:
++            print("   (sin parámetros/objetivos comparables entre ambas etapas)")
++        elif not flipped:
++            print(f"   ningún ρ invierte con |ρ| ≥ {SIGNFLIP_MIN_ABS_RHO:.2f}")
++    print(
++        "\n  Lectura: es un DIAGNÓSTICO, no un gate: no filtra trials ni cambia el exit code.\n"
++        "  Un parámetro no puede mejorar y dañar la misma estructura subyacente: si el signo\n"
++        "  del ρ se invierte con magnitud suficiente, lo que cambió es lo que MIDE el objetivo\n"
++        "  de la etapa 2 (no la señal). Revisa ese objetivo antes de fiarte del ganador."
++    )
++
++
++def main(argv=None):
+     ap = argparse.ArgumentParser(
+         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+     )
+     ap.add_argument("--db", default=None)
+     ap.add_argument("--study", default=None, help="subcadena del nombre del estudio")
+-    a = ap.parse_args()
++    a = ap.parse_args(argv)
+     db = find_db(a.db)
+     if not db or not db.exists():
+         print("✗ No encuentro una BD de Optuna. Pasa --db data/<archivo>.db")
+@@ -264,10 +429,14 @@
+         "SELECT study_id, study_name FROM studies ORDER BY study_id"
+     ).fetchall()
+     print(f"Estudios: {[s[1] for s in studies]}")
++    diagnosed = []
+     for sid, name in studies:
+         if a.study and a.study not in name:
+             continue
+-        diagnose_study(con, sid, name)
++        rec = diagnose_study(con, sid, name)
++        if rec:
++            diagnosed.append(rec)
++    print_sign_flip_section(diagnosed)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/test_diag_signflip.py b/tests/test_diag_signflip.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_diag_signflip.py
+@@ -0,0 +1,229 @@
++"""Tests de la atribución de centinelas y del detector de sign flip entre etapas.
++
++No tocan la BD real: construyen una BD SQLite temporal con el esquema de Optuna
++(el mismo de ``data/reii_optuna.db``) y ejercitan ``3_diagnose_optuna_db.py``
++por su ``main(argv)``.
++
++El script empieza por un dígito y vive en la raíz, así que se carga con
++``importlib`` (igual que otros tests de scripts de ``scripts/``) y se inserta la
++raíz en ``sys.path`` para que ``diag_common`` resuelva.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import json
++import sqlite3
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++if str(ROOT) not in sys.path:
++    sys.path.insert(0, str(ROOT))
++
++_SPEC = importlib.util.spec_from_file_location(
++    "diag_optuna_db_under_test", ROOT / "3_diagnose_optuna_db.py"
++)
++D = importlib.util.module_from_spec(_SPEC)
++_SPEC.loader.exec_module(D)
++
++# Esquema exacto de data/reii_optuna.db (solo las tablas que lee el script).
++DDL = """
++CREATE TABLE studies (
++    study_id INTEGER NOT NULL,
++    study_name VARCHAR(512) NOT NULL,
++    PRIMARY KEY (study_id)
++);
++CREATE TABLE study_directions (
++    study_direction_id INTEGER NOT NULL,
++    direction VARCHAR(8) NOT NULL,
++    study_id INTEGER NOT NULL,
++    objective INTEGER NOT NULL,
++    PRIMARY KEY (study_direction_id),
++    UNIQUE (study_id, objective),
++    FOREIGN KEY(study_id) REFERENCES studies (study_id)
++);
++CREATE TABLE trials (
++    trial_id INTEGER NOT NULL,
++    number INTEGER,
++    study_id INTEGER,
++    state VARCHAR(8) NOT NULL,
++    datetime_start DATETIME,
++    datetime_complete DATETIME,
++    PRIMARY KEY (trial_id),
++    FOREIGN KEY(study_id) REFERENCES studies (study_id)
++);
++CREATE TABLE trial_user_attributes (
++    trial_user_attribute_id INTEGER NOT NULL,
++    trial_id INTEGER,
++    "key" VARCHAR(512),
++    value_json TEXT,
++    PRIMARY KEY (trial_user_attribute_id),
++    UNIQUE (trial_id, "key"),
++    FOREIGN KEY(trial_id) REFERENCES trials (trial_id)
++);
++CREATE TABLE trial_params (
++    param_id INTEGER NOT NULL,
++    trial_id INTEGER,
++    param_name VARCHAR(512),
++    param_value FLOAT,
++    distribution_json TEXT,
++    PRIMARY KEY (param_id),
++    UNIQUE (trial_id, param_name),
++    FOREIGN KEY(trial_id) REFERENCES trials (trial_id)
++);
++CREATE TABLE trial_values (
++    trial_value_id INTEGER NOT NULL,
++    trial_id INTEGER NOT NULL,
++    objective INTEGER NOT NULL,
++    value FLOAT,
++    value_type VARCHAR(7) NOT NULL,
++    PRIMARY KEY (trial_value_id),
++    UNIQUE (trial_id, objective),
++    FOREIGN KEY(trial_id) REFERENCES trials (trial_id)
++);
++"""
++
++DIST_JSON = {
++    pn: '{"name": "IntDistribution", "attributes": {"log": false, "step": 1, "low": 1, "high": 6}}'
++    for pn in ("signflip", "stable")
++}
++
++STAGE1 = "synth_stage1_wc_feedface"
++STAGE2 = "synth_stage2_select_feedface"
++
++# Rango elegido para que ρ(stable, objetivo monótono) = 0 en ambas etapas.
++STABLE = (2, 4, 1, 3)
++
++
++def _insert_trial(con, tid, sid, values, params, attrs=None):
++    con.execute(
++        "INSERT INTO trials (trial_id, number, study_id, state) VALUES (?,?,?,?)",
++        (tid, tid, sid, "COMPLETE"),
++    )
++    for obj, v in enumerate(values):
++        con.execute(
++            "INSERT INTO trial_values (trial_id, objective, value, value_type) "
++            "VALUES (?,?,?,?)",
++            (tid, obj, float(v), "FINITE"),
++        )
++    for pn, pv in params.items():
++        con.execute(
++            "INSERT INTO trial_params (trial_id, param_name, param_value, distribution_json) "
++            "VALUES (?,?,?,?)",
++            (tid, pn, float(pv), DIST_JSON[pn]),
++        )
++    for key, val in (attrs or {}).items():
++        con.execute(
++            'INSERT INTO trial_user_attributes (trial_id, "key", value_json) VALUES (?,?,?)',
++            (tid, key, json.dumps(val)),
++        )
++
++
++def make_db(path, only_stage1=False):
++    """Dos estudios sintéticos: ``signflip`` invierte ρ en obj0, ``stable`` no.
++
++    Cada estudio lleva un centinela (-2, -1, 0): en etapa 1 con `gate_reason` y
++    `k_rejected` (como escribe el código real) y en etapa 2 SIN user attrs
++    (BD antigua / atribución no escrita).
++    """
++    con = sqlite3.connect(path)
++    try:
++        con.executescript(DDL)
++        con.execute(
++            "INSERT INTO studies (study_id, study_name) VALUES (1, ?)", (STAGE1,)
++        )
++        if not only_stage1:
++            con.execute(
++                "INSERT INTO studies (study_id, study_name) VALUES (2, ?)", (STAGE2,)
++            )
++        for sid in (1, 2):
++            for obj, direction in enumerate(("MAXIMIZE", "MAXIMIZE", "MINIMIZE")):
++                con.execute(
++                    "INSERT INTO study_directions (study_id, objective, direction) "
++                    "VALUES (?,?,?)",
++                    (sid, obj, direction),
++                )
++        # Etapa 1: `signflip` correlaciona POSITIVO con el objetivo 0; `stable`
++        # está descorrelacionado (ρ=0) con los tres objetivos.
++        for j in range(4):
++            _insert_trial(
++                con,
++                10 + j,
++                1,
++                (j + 1, j + 1, -(4 - j)),
++                {"signflip": j + 1, "stable": STABLE[j]},
++            )
++        _insert_trial(
++            con,
++            15,
++            1,
++            D.SENTINEL,
++            {"signflip": 0, "stable": 0},
++            {"gate_reason": "K fuera de [2, 20]", "k_rejected": 25, "outcome": "gate"},
++        )
++        if not only_stage1:
++            # Etapa 2: `signflip` invierte el signo en obj0; `stable` sigue a ρ=0.
++            for j in range(4):
++                _insert_trial(
++                    con,
++                    20 + j,
++                    2,
++                    (4 - j, j + 1, -(4 - j)),
++                    {"signflip": j + 1, "stable": STABLE[j]},
++                )
++            _insert_trial(  # sin user attrs a propósito
++                con, 25, 2, D.SENTINEL, {"signflip": 0, "stable": 0}
++            )
++        con.commit()
++    finally:
++        con.close()
++    return path
++
++
++def _run(tmp_path):
++    db = make_db(tmp_path / "diag.db")
++    assert D.main(["--db", str(db)]) in (None, 0)
++    return db
++
++
++def test_sign_flip_marks_only_the_inverting_param(tmp_path, capsys):
++    _run(tmp_path)
++    out = capsys.readouterr().out
++
++    assert "SIGN FLIP ENTRE ETAPAS (posible artefacto de objetivo)" in out
++    marked = [ln for ln in out.splitlines() if "<<< INVIERTE" in ln]
++    assert len(marked) == 1, marked
++    assert "signflip" in marked[0] and "obj[0]" in marked[0]
++    assert "stable" not in marked[0]
++    # `stable` sí se tabula, pero sin marca.
++    assert any("stable" in ln and "obj[0]" in ln for ln in out.splitlines())
++
++
++def test_gate_reason_breakdown_counts_sentinels(tmp_path, capsys):
++    _run(tmp_path)
++    out = capsys.readouterr().out
++
++    assert "Centinelas (-2.0, -1.0, 0.0): 1/5 (20%)" in out
++    assert "por gate_reason: {'K fuera de [2, 20]': 1}" in out
++    assert "k_rejected 25..25 (por exceso del límite superior 20)" in out
++
++
++def test_sentinel_without_user_attrs_does_not_break(tmp_path, capsys):
++    _run(tmp_path)
++    out = capsys.readouterr().out
++
++    assert "centinelas sin gate_reason en user attrs: 1" in out
++
++
++def test_no_pair_means_no_sign_flip_section(tmp_path, capsys):
++    db = make_db(tmp_path / "solo_etapa1.db", only_stage1=True)
++    assert D.main(["--db", str(db)]) in (None, 0)
++    assert "SIGN FLIP ENTRE ETAPAS" not in capsys.readouterr().out
++
++
++def test_is_sign_flip_threshold():
++    assert D.is_sign_flip(0.30, -0.30)
++    assert not D.is_sign_flip(0.29, -0.30)
++    assert not D.is_sign_flip(0.50, 0.50)
++    assert not D.is_sign_flip(None, -0.50)

@@ -130,6 +130,15 @@ class TestEvaluateTrialARI:
         class FakeTrial:
             number = 0
 
+            def __init__(self):
+                # `_evaluate_trial` registra attrs de diagnostico en la rama
+                # wc_only (k_ach, k_stable, k_rejected); sin este metodo el
+                # doble de test revienta con AttributeError.
+                self.user_attrs = {}
+
+            def set_user_attr(self, key, value):
+                self.user_attrs[key] = value
+
             def suggest_int(self, name, lo, hi):
                 return {"min_forms_uc_1": 12, "forms_gap": 4, "tsj": 3}[name]
 
@@ -171,6 +180,15 @@ class TestEvaluateTrialARI:
 
         class FakeTrial:
             number = 1
+
+            def __init__(self):
+                # `_evaluate_trial` registra attrs de diagnostico en la rama
+                # wc_only (k_ach, k_stable, k_rejected); sin este metodo el
+                # doble de test revienta con AttributeError.
+                self.user_attrs = {}
+
+            def set_user_attr(self, key, value):
+                self.user_attrs[key] = value
 
             def suggest_int(self, name, lo, hi):
                 return {"min_forms_uc_1": 12, "forms_gap": 4, "tsj": 3}[name]

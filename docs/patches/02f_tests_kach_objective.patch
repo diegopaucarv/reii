@@ -1,0 +1,61 @@
+--- a/tests/test_optimizer_gate.py
++++ b/tests/test_optimizer_gate.py
+@@ -130,6 +130,15 @@
+         class FakeTrial:
+             number = 0
+ 
++            def __init__(self):
++                # `_evaluate_trial` registra attrs de diagnostico en la rama
++                # wc_only (k_ach, k_stable, k_rejected); sin este metodo el
++                # doble de test revienta con AttributeError.
++                self.user_attrs = {}
++
++            def set_user_attr(self, key, value):
++                self.user_attrs[key] = value
++
+             def suggest_int(self, name, lo, hi):
+                 return {"min_forms_uc_1": 12, "forms_gap": 4, "tsj": 3}[name]
+ 
+@@ -172,6 +181,15 @@
+         class FakeTrial:
+             number = 1
+ 
++            def __init__(self):
++                # `_evaluate_trial` registra attrs de diagnostico en la rama
++                # wc_only (k_ach, k_stable, k_rejected); sin este metodo el
++                # doble de test revienta con AttributeError.
++                self.user_attrs = {}
++
++            def set_user_attr(self, key, value):
++                self.user_attrs[key] = value
++
+             def suggest_int(self, name, lo, hi):
+                 return {"min_forms_uc_1": 12, "forms_gap": 4, "tsj": 3}[name]
+ 
+--- a/tests/test_select_mode_objective.py
++++ b/tests/test_select_mode_objective.py
+@@ -85,10 +85,10 @@
+         "coref_weight": [0.0, 0.1, 0.2, 0.3, 0.4],
+         "uc_window_size": [1, 2, 3, 4, 5],
+     }
+-    primary = [
+-        _FakeUCE(f"u{i}", 0 if i < coverage_uces // 2 else 1)
+-        for i in range(coverage_uces)
+-    ]
++    # 7 clusters: el K que A reporta en la seleccion (`winner_k`). La
++    # fixture tiene que ser coherente con el objetivo -K, que es el K REAL
++    # del ganador y no el recuento de etiquetas de este doble.
++    primary = [_FakeUCE(f"u{i}", i % 7) for i in range(coverage_uces)]
+     result = (primary, None, ["a", "b"], [], [], None, None, None, None, {})
+     opt._evaluacion_rapida = lambda cfg, uc_cfg=None: result
+     return opt
+@@ -106,7 +106,8 @@
+         coverage, ari_winner, neg_k = values
+         assert coverage == pytest.approx(0.40)
+         assert ari_winner == pytest.approx(0.350), "ARI del ganador, no agreement_sym"
+-        assert neg_k == -2.0
++        assert neg_k == -7.0  # K real del ganador (A), no n_clusters
++        assert trial.attrs["k_ach"] == 7
+         assert trial.attrs["selected_method"] == "A"
+         assert trial.attrs["ari_winner"] == pytest.approx(0.350)
+ 

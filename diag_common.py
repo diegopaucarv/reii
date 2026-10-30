@@ -8,7 +8,8 @@ Hechos del repo en los que se apoyan (verificados contra src/reii/main_workflow.
   * main_workflow.py carga `uwu` al importarse y SALTA los documentos ya presentes
     en PostgreSQL salvo que se pase --force. Todo script debe pasar --force.
   * Flags CLI (añadidos por este parche): --trials, --seed, --study-name,
-    --optimize-only, --bench, --bench-coref. Ya existían: --mode, --uce-target-size, --force.
+    --optimize-only, --stage1-fraction, --no-optuna-warm-start. Ya existían:
+    --mode, --uce-target-size, --force.
 """
 
 from __future__ import annotations
@@ -31,7 +32,10 @@ DEFAULT_SPACE = {
     "min_forms_uc_1": (6, 14),
     "forms_gap": (2, 7),
     "tsj": (2, 5),
-    "min_cluster_size_cdh": (0.05, 0.20),
+    # Espacio actual: K objetivo -> frac = 1/(2K). Se mantiene la clave legacy
+    # (min_cluster_size_cdh) para re-analizar best_params.json antiguos.
+    "cdh_target_k": (3, 20),
+    "min_cluster_size_cdh": (0.025, 0.1667),
     "swap_iterations": (1, 5),
     "min_r2_threshold": (0.03, 0.10),
     "similarity_threshold": (0.25, 0.65),

@@ -1,0 +1,133 @@
+{
+  "name": "02_c_dense_dominance_0837",
+  "note": "Caso del probe v4: particion densa {442,45,30,11} sobre 528 UCEs sin ruido => a=0.837121, nu=0 => c=0.837121. Con select-v4 (c > 0.70) C DEBE descartarse por dominancia; con select-v3 (a > 0.90) C gana. El fixture declara rule_version=select-v4 con winner=C, un payload imposible bajo v4: la auditoria debe detectar que el ganador no reproduce. Ver AUDIT_V4.md seccion 5.1.",
+  "rule": "select-v4",
+  "expect": {
+    "verdict": "violation",
+    "exit_strict": 1,
+    "invariants": {
+      "reproducibility": "fail",
+      "discard_reason": "warn",
+      "denominator": "ok",
+      "backend_coherente": "ok"
+    },
+    "must_contain": ["dominante"]
+  },
+  "expect_stale_rule": {
+    "verdict": "select",
+    "exit_strict": 0,
+    "invariants": {
+      "reproducibility": "warn",
+      "discard_reason": "ok",
+      "denominator": "ok",
+      "backend_coherente": "ok"
+    }
+  },
+  "best_params": {
+    "path": "data/best_params.json",
+    "exists": true,
+    "mtime": "2026-10-26T09:00:00+00:00",
+    "size": 4096
+  },
+  "history": [
+    {
+      "rule_version": "select-v4",
+      "context": {
+        "corpus_fingerprint": "fp-smoke-0002",
+        "uce_target_size": 30,
+        "mode": "select",
+        "n_uces": 528,
+        "seed": 42,
+        "written_at": "2026-10-27T10:05:00+00:00",
+        "method_c_backend": "dense_cdh",
+        "spec_hash": "sha256:0000aaaa1111cccc"
+      },
+      "selection": {
+        "winner": "C",
+        "winner_ari": 0.79,
+        "winner_coverage": 0.92,
+        "winner_k": 4,
+        "winner_usable_coverage": 0.92,
+        "runner_up": "A",
+        "runner_up_ari": 0.41,
+        "runner_up_coverage": 0.55,
+        "runner_up_k": 8,
+        "runner_up_usable_coverage": 0.55,
+        "delta_ari": 0.38,
+        "delta_coverage": 0.37,
+        "ambiguous": false,
+        "criteria_conflict": false,
+        "abstained": false,
+        "reason": "max ARI intra-metodo",
+        "discarded": [],
+        "rule_version": "select-v4",
+        "margin": 0.02,
+        "coverage_floor": 0.15,
+        "min_class_share": 0.01,
+        "noise_max": 0.5,
+        "k_bounds": [3, 20],
+        "all_metrics": [
+          {
+            "method": "A",
+            "k": 8,
+            "ari": 0.41,
+            "coverage": 0.55,
+            "tiny_frac": 0.0,
+            "noise_frac": 0.0,
+            "perturbation": "A1<->A2",
+            "available": true,
+            "assigned_frac": 1.0,
+            "min_class_size": 20,
+            "median_class_size": 66.0,
+            "max_class_share": 0.1799,
+            "usable": 0.55,
+            "n_total": 528,
+            "n_assigned": 528,
+            "n_noise": 0,
+            "max_class_size": 95
+          },
+          {
+            "method": "B",
+            "k": 7,
+            "ari": 0.33,
+            "coverage": 0.49,
+            "tiny_frac": 0.0,
+            "noise_frac": 0.0,
+            "perturbation": "B1<->B2",
+            "available": true,
+            "assigned_frac": 1.0,
+            "min_class_size": 22,
+            "median_class_size": 75.0,
+            "max_class_share": 0.1496,
+            "usable": 0.49,
+            "n_total": 528,
+            "n_assigned": 528,
+            "n_noise": 0,
+            "max_class_size": 79
+          },
+          {
+            "method": "C",
+            "k": 4,
+            "ari": 0.79,
+            "coverage": 0.92,
+            "tiny_frac": 0.0,
+            "noise_frac": 0.0,
+            "perturbation": "C1<->C2",
+            "available": true,
+            "assigned_frac": 1.0,
+            "min_class_size": 11,
+            "median_class_size": 37.0,
+            "max_class_share": 0.8371,
+            "usable": 0.92,
+            "backend": "dense_cdh",
+            "diagnostic_only": false,
+            "n_total": 528,
+            "n_assigned": 528,
+            "n_noise": 0,
+            "max_class_size": 442
+          }
+        ]
+      }
+    }
+  ]
+}

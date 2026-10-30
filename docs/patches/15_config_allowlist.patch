@@ -1,0 +1,154 @@
+diff --git a/src/reii/backend/config_store.py b/src/reii/backend/config_store.py
+--- a/src/reii/backend/config_store.py
++++ b/src/reii/backend/config_store.py
+@@ -64,6 +64,21 @@
+         "hdbscan_uce_epsilon",
+         "hdbscan_uce_min_samples",
+         "hdbscan_uce_metric",
++        # ── v5: knobs que el optimizador mueve y best_params.json persiste.
++        # Faltaban aqui aunque el camino de aplicacion los honra (filtra por
++        # __dataclass_fields__): la asimetria era solo de ESCRITURA, asi que
++        # el dashboard no podia fijarlos (#24-#27).
++        "hdbscan_uce_min_cluster_frac",
++        "hdbscan_uce_min_cluster_frac_loose",
++        "hdbscan_uce_min_cluster_floor",
++        "hdbscan_uce_min_samples_ratio",
++        "cdh_enforce_min_leaf",
++        "method_c_backend",
++        "method_c_hdbscan_selectable",
++        "method_c_target_k",
++        "dense_cdh_min_r2_1d",
++        "dense_cdh_min_r2_dense",
++        "dense_cdh_loose_factor",
+     ],
+     "afc_y_proyeccion": [
+         "use_projection",
+@@ -109,6 +124,36 @@
+         "embedding_model_name",
+     ],
+     "estabilidad": ["use_term_stability", "term_stability_n_iter"],
++    "seleccion_de_metodo": [
++        # Politica select-v4: sin esto, el gate de dominancia y el modo del
++        # nulo solo se pueden fijar por codigo o por CLI.
++        "method_selection_margin",
++        "method_selection_coverage_floor",
++        "method_selection_null_mode",
++        "method_selection_stability_boot",
++        "method_selection_stability_perm",
++        "method_selection_stability_min_n",
++        "method_selection_k_bounds",
++        "method_selection_min_class_share",
++        "method_selection_noise_max",
++        "method_selection_max_class_share",
++    ],
++    "lexico_y_gramatica": [
++        # Vocabulario de formas activas y su cache. `retention_policy` tiene
++        # precedencia Config > ia/gramatica.json > default, asi que una fila
++        # de la BD SI surte efecto.
++        "retention_policy",
++        "token_table_path",
++        "use_token_table_cache",
++        # NO se exponen aqui (a proposito):
++        #   content_pos   -> load_gramatica() lo pisa siempre con
++        #                    ia/gramatica.json: una fila de la BD seria muerta.
++        #   run_mode      -> lo manda `--mode`; una fila cambiaria el escenario
++        #                    (classic vs modern) sin pasar por el CLI.
++        #   corpus_name / n_entrevistas / fecha_analisis -> procedencia.
++        #   palabras_excluir / sinonimos / stopwords_extra / expresiones
++        #                 -> overrides de corpus, viven en ia/*.json.
++    ],
+     "optimizacion": [
+         "optimize",
+         "optimize_trials",
+@@ -122,6 +167,13 @@
+         "optimize_directions",
+         "optimize_preference",
+         "optimize_coverage_gate",
++        "optimize_coverage_gate_all",
++        "optimize_coverage_gate_select",
++        "optimize_stage1_fraction",
++        "optimize_two_stage",
++        "optimize_n_ei_candidates",
++        "optimize_warm_start_max",
++        "optimize_freeze_inert",
+     ],
+     "general": [
+         "db_local_path",
+diff --git a/tests/test_config_allowlist.py b/tests/test_config_allowlist.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_config_allowlist.py
+@@ -0,0 +1,73 @@
++"""Invariantes del allowlist de configuracion (dashboard <-> pipeline).
++
++``ConfigStore.set_config_many`` filtra por ``ALL_CONFIG_KEYS``, mientras el
++camino de aplicacion (``main_workflow``) filtra por ``__dataclass_fields__``.
++Si una clave esta en el segundo y no en el primero, la fila de la BD se
++aplicaria pero nadie podria escribirla: el knob queda invisible en el
++dashboard aunque el optimizador lo mueva (#24-#27, #73).
++
++Estos tests fijan las dos direcciones y las exclusiones deliberadas.
++"""
++
++from __future__ import annotations
++
++import ast
++from pathlib import Path
++
++from reii.backend.config_store import ALL_CONFIG_KEYS, CONFIG_CATEGORIES
++
++ROOT = Path(__file__).resolve().parents[1]
++PIPELINE = ROOT / "src" / "reii" / "main_workflow.py"
++
++# Knobs que el optimizador mueve o que best_params.json persiste.
++REQUIRED = {
++    "hdbscan_uce_min_cluster_frac",
++    "hdbscan_uce_min_cluster_frac_loose",
++    "hdbscan_uce_min_cluster_floor",
++    "hdbscan_uce_min_samples_ratio",
++    "cdh_enforce_min_leaf",
++    "method_c_backend",
++    "method_c_hdbscan_selectable",
++    "method_c_target_k",
++    "dense_cdh_min_r2_1d",
++    "dense_cdh_min_r2_dense",
++    "dense_cdh_loose_factor",
++    "retention_policy",
++    "method_selection_max_class_share",
++    "method_selection_null_mode",
++    "optimize_coverage_gate_select",
++}
++
++# Excluidas a proposito; ver el comentario de ``lexico_y_gramatica``.
++EXCLUDED = {"content_pos", "run_mode", "corpus_name"}
++
++
++def _config_fields() -> set:
++    """Campos de ``Config`` leidos con ``ast`` (importarlo cuesta ~60 s)."""
++    tree = ast.parse(PIPELINE.read_text(encoding="utf-8"))
++    for node in tree.body:
++        if isinstance(node, ast.ClassDef) and node.name == "Config":
++            return {
++                s.target.id
++                for s in node.body
++                if isinstance(s, ast.AnnAssign) and isinstance(s.target, ast.Name)
++            }
++    raise AssertionError("no existe Config en main_workflow.py")
++
++
++def test_required_knobs_are_writable() -> None:
++    missing = sorted(REQUIRED - set(ALL_CONFIG_KEYS))
++    assert not missing, "knobs aplicables pero no escribibles: %s" % missing
++
++
++def test_excluded_knobs_stay_out() -> None:
++    present = sorted(EXCLUDED & set(ALL_CONFIG_KEYS))
++    assert not present, "claves excluidas por diseno: %s" % present
++
++
++def test_allowlist_is_subset_of_config_without_duplicates() -> None:
++    unknown = sorted(set(ALL_CONFIG_KEYS) - _config_fields())
++    assert not unknown, "claves del allowlist sin campo en Config: %s" % unknown
++    flat = [key for keys in CONFIG_CATEGORIES.values() for key in keys]
++    dups = sorted({key for key in flat if flat.count(key) > 1})
++    assert not dups, "claves en dos categorias: %s" % dups

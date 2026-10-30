@@ -1,0 +1,410 @@
+--- a/src/reii/main_workflow.py
++++ b/src/reii/main_workflow.py
+@@ -8436,9 +8436,202 @@
+         return [lo, hi]
+     if isinstance(spec, list):
+         return list(spec)
+     return [spec]
+ 
+ 
++# ── Auditor de bordes del espacio (v6, WARN-only) ──────────────────────
++#: Parametros AMPLIABLES: si el ganador cae en un extremo, el rango puede
++#: estar recortando el optimo. La recomendacion es ensanchar UN paso la
++#: proxima campana con un study NUEVO (Optuna no debe mezclar trials
++#: muestreados de espacios distintos).
++_BOUNDARY_EXPANDABLE = (
++    "min_forms_uc_1",
++    "forms_gap",
++    "tsj",
++    "similarity_threshold",
++    "min_r2_threshold",
++    "coref_weight",
++)
++
++#: Parametros ESTRUCTURALES: su extremo describe un limite del metodo (o el
++#: rango lo fija otro parametro). Ampliarlo no compra busqueda: cambia el
++#: metodo o produce trials infactibles. El auditor NO los recomienda ampliar.
++_BOUNDARY_STRUCTURAL = (
++    "swap_iterations",
++    "cdh_target_k",
++    "coref_context_units_tight",
++    "hdbscan_uce_min_cluster_frac",
++    "hdbscan_uce_min_cluster_frac_loose",
++)
++
++#: Motivo (una frase) de por que cada estructural NO se amplia.
++_BOUNDARY_STRUCTURAL_WHY = {
++    "swap_iterations": (
++        "0 apaga _intercambio (ablacion del refinamiento, no un "
++        "hiperparametro) y por encima de 5 el swap ya satura"
++    ),
++    "cdh_target_k": (
++        "no es un objetivo: fija min_cluster_size_cdh=1/(2K); pasado "
++        "_CDH_TARGET_K_HI el CDH sale del gate k_bounds y el trial es "
++        "centinela por construccion"
++    ),
++    "coref_context_units_tight": (
++        "es el dependiente de coref_context_units_loose (tight < loose); "
++        "el borde lo fija el driver, no el presupuesto"
++    ),
++    "hdbscan_uce_min_cluster_frac": (
++        "es el dependiente de frac_loose (frac > frac_loose); su techo "
++        "0.04 codifica el regimen mcs~5-20 medido"
++    ),
++    "hdbscan_uce_min_cluster_frac_loose": (
++        "el driver fija la escala de Method C (mcs), no un rango explorable"
++    ),
++}
++
++
++def _edge_equal(a: Any, b: Any) -> bool:
++    """Igualdad tolerante a floats y a tipos raros (nunca lanza)."""
++    try:
++        if isinstance(a, bool) or isinstance(b, bool):
++            return bool(a == b)
++        if isinstance(a, float) or isinstance(b, float):
++            return math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-12)
++        return bool(a == b)
++    except (TypeError, ValueError):
++        return False
++
++
++def _edge_bounds(spec: Any, chosen: Dict[str, Any]):
++    """(lo, hi) del spec, o None si es de una sola opcion / no clasificable."""
++    if isinstance(spec, tuple) and len(spec) == 2:
++        lo, hi = spec
++        if isinstance(lo, bool) or isinstance(hi, bool):
++            return None
++        if isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
++            return None if lo == hi else (lo, hi)
++        return None
++    if isinstance(spec, list):
++        if len(spec) < 2:
++            return None
++        return spec[0], spec[-1]
++    if isinstance(spec, dict):
++        kind = spec.get("kind")
++        base = chosen.get(spec.get("other"))
++        if base is None:
++            return None
++        try:
++            if kind == "lt":
++                lo, hi = int(spec.get("lo", 1)), int(base) - 1
++            elif kind == "gt":
++                lo = float(base) + float(spec.get("eps", 0.002))
++                hi = float(spec.get("hi", 0.06))
++            else:
++                return None
++        except (TypeError, ValueError):
++            return None
++        return (lo, hi) if hi >= lo else None
++    return None
++
++
++def _edge_num(x: Any) -> str:
++    """Numero compacto: 0.012000000000000002 -> 0.012."""
++    return f"{x:g}" if isinstance(x, float) else str(x)
++
++
++def _edge_label(spec: Any, lo: Any = None, hi: Any = None) -> str:
++    """Rango legible del spec para la linea del auditor."""
++    if isinstance(spec, list):
++        return "[" + ", ".join(_edge_num(x) for x in spec) + "]"
++    if isinstance(spec, tuple) and len(spec) == 2:
++        return f"({_edge_num(spec[0])}, {_edge_num(spec[1])})"
++    if isinstance(spec, dict):
++        other = spec.get("other")
++        return f"(dependiente de {other}: [{_edge_num(lo)}, {_edge_num(hi)}])"
++    return str(spec)
++
++
++def _edge_recommendation(
++    name: str, spec: Any, lo: Any, hi: Any, at_lo: bool, at_hi: bool
++) -> str:
++    """Recomendacion; empieza por ampliable/estructural/sin-clasificar."""
++    if name in _BOUNDARY_STRUCTURAL:
++        why = _BOUNDARY_STRUCTURAL_WHY.get(name, "el borde es un limite del metodo")
++        return f"estructural: rango {_edge_label(spec, lo, hi)}; NO se amplia ({why})"
++    if name not in _BOUNDARY_EXPANDABLE:
++        return (
++            f"sin-clasificar: rango {_edge_label(spec, lo, hi)}; revisar a mano antes "
++            "de ampliar (no hay politica pre-registrada)"
++        )
++
++    tail = "la proxima pasada con un study nuevo"
++    if isinstance(spec, list):
++        if at_hi:
++            step = spec[-1] - spec[-2]
++            what = f"anadir el nivel {round(spec[-1] + step, 10)} por arriba"
++        else:
++            step = spec[1] - spec[0]
++            what = f"anadir un nivel por debajo del minimo (paso {round(step, 10)})"
++        return f"ampliable: lista {_edge_label(spec, lo, hi)} -> {what}; {tail}"
++
++    if isinstance(lo, int) and isinstance(hi, int):
++        step = 1
++    else:
++        step = float(hi) - float(lo)
++        step = step if step > 0 else 1.0
++    new_lo, new_hi = (lo, hi + step) if at_hi else (lo - step, hi)
++    widened = f"({_edge_num(new_lo)}, {_edge_num(new_hi)})"
++    return f"ampliable: rango {_edge_label(spec, lo, hi)} -> {widened}; {tail}"
++
++
++def _boundary_audit(space: Any, chosen_params: Any) -> List[Tuple[str, str, str]]:
++    """Bordes del espacio que toca el trial ganador: solo diagnostico.
++
++    Devuelve ``(param, valor, recomendacion)`` por cada parametro cuyo valor
++    cae en un extremo. ``recomendacion`` empieza por ``ampliable:``,
++    ``estructural:`` o ``sin-clasificar:`` para que el llamador (y los
++    tests) distingan la politica sin parsear texto libre.
++
++    Reglas: tupla ``(lo, hi)`` -> extremo si el valor es ``lo`` o ``hi``;
++    lista categorica -> primer/ultimo nivel; spec condicional -> el extremo
++    se resuelve con el driver; escalar -> una sola opcion, se ignora.
++
++    NUNCA lanza y NUNCA altera la optimizacion: un ``space``/``chosen``
++    inesperado devuelve una lista (posiblemente vacia).
++    """
++    hits: List[Tuple[str, str, str]] = []
++    try:
++        if not isinstance(space, dict) or not isinstance(chosen_params, dict):
++            return hits
++        for name in sorted(space):
++            try:
++                spec = space[name]
++                if name not in chosen_params:
++                    continue
++                value = chosen_params[name]
++                if value is None or isinstance(value, bool):
++                    continue
++                bounds = _edge_bounds(spec, chosen_params)
++                if bounds is None:
++                    continue
++                lo, hi = bounds
++                at_lo = _edge_equal(value, lo)
++                at_hi = _edge_equal(value, hi)
++                if not (at_lo or at_hi):
++                    continue
++                hits.append(
++                    (
++                        name,
++                        str(value),
++                        _edge_recommendation(name, spec, lo, hi, at_lo, at_hi),
++                    )
++                )
++            except Exception:  # un spec raro no tumba el auditor
++                continue
++    except Exception:  # ni un `space`/`chosen` raro
++        return hits
++    return hits
++
++
+ class Optimizador:
+     """
+     Optimizador de hiperparámetros REII basado en Optuna.
+@@ -8988,11 +9181,22 @@
+         space: Dict[str, Any] = {
+             "min_forms_uc_1": (max(2, f1 - 4), f1 + 4),
+             "forms_gap": (2, 7),
+-            "tsj": (max(2, tsj - 2), tsj + 2),
++            # v6 (PRE-REGISTRADO antes del run v6): en v5 el optimo de `tsj`
++            # quedo CENSURADO al techo en AMBAS etapas (tsj=5, rango [2, 5]).
++            # Se amplia UN paso por arriba. `tsj` solo se usa como umbral de
++            # frecuencia documental (`MatrizBuilder.construir_vocabulario` y
++            # `TermStabilityAnalyzer.bootstrap_terms`): no hay invariante que
++            # lo ate a `min_forms_uc` (con f1=13, tsj<=6 < 13), asi que 6 no
++            # rompe el filtrado de formas.
++            "tsj": (max(2, tsj - 2), tsj + 3),
+             # pseudocount eliminado (BLOQUE 1: siempre 0.0)
+             "cdh_target_k": (3, k_hi),
+-            # v5 (§3.4): el ganador del probe v4 esta en el minimo (1);
+-            # 0 es la ablacion sin refinamiento (_partition: `if > 0`).
+-            "swap_iterations": [0, 1, 2, 3, 5],
++            # v6 (PRE-REGISTRADO antes del run v6): 0 fuera del espacio.
++            # Con 0, `_partition` no llama a `_intercambio` (`if > 0`): la
++            # particion es el corte k-means crudo. Eso quita varianza entre
++            # pases y SUBE el ARI de estabilidad por construccion, no por
++            # mejor estructura: es una ablacion del refinamiento, no un
++            # hiperparametro (los ganadores de v5, trials 18/19, caian ahi).
++            "swap_iterations": [1, 2, 3, 5],
+             # v5 (§3.3): el ganador esta en el maximo (0.10).
+             "min_r2_threshold": [0.03, 0.05, 0.08, 0.10, 0.15, 0.20],
+@@ -9702,10 +9906,27 @@
+         # Persistir frente completo
+         self.save_pareto_front(study)
+ 
+         # Selección según preferencia
+         best_idx = self._select_preference(best_trials)
+         best_trial = best_trials[best_idx]
+ 
++        # ── Auditor de bordes (v6, WARN-only): diagnostico, no decision ──
++        # Corre DESPUES de elegir el ganador y no toca ni `best_trial` ni el
++        # study: si un parametro quedo censurado, se reporta aqui para
++        # planificar la proxima campana sin reescribir esta corrida.
++        try:
++            _audit = _boundary_audit(
++                getattr(self, "_search_space_cached", {}) or {},
++                dict(getattr(best_trial, "params", {}) or {}),
++            )
++            print("   ── BOUNDARY AUDIT (WARN-only; no altera el resultado) ──")
++            if not _audit:
++                print("   [OK] ningun parametro elegido esta en un borde.")
++            for _name, _val, _rec in _audit:
++                print(f"   [BORDE] {_name} = {_val} | {_rec}")
++        except Exception as _exc:  # un diagnostico nunca tumba la corrida
++            logger.debug("BOUNDARY AUDIT omitido: %s", _exc)
++
+         print(
+             f"\n   >>> Pareto front: {len(study.best_trials)} soluciones no-dominadas"
+         )
+--- a/tests/test_v5_space.py
++++ b/tests/test_v5_space.py
+@@ -291,3 +291,147 @@
+     n_gate, n_exc, detail = breakdown([t_gate, t_exc])
+     assert (n_gate, n_exc) == (1, 1)
+     assert len(detail) == 1 and "ValueError" in detail[0]
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# 3. Pre-registro v6 (patch 19): espacio y auditor de bordes
++# ─────────────────────────────────────────────────────────────────────────────
++def test_swap_iterations_excludes_the_no_refinement_ablation(opt):
++    """0 apaga `_intercambio` en `_partition`: es ablacion, no hiperparametro."""
++    levels = list(opt._search_space_cached["swap_iterations"])
++    assert levels == [1, 2, 3, 5]
++    assert 0 not in levels
++    assert 1 in levels
++
++
++def test_tsj_ceiling_is_widened_one_step(opt):
++    """v5 dejo el optimo de tsj censurado al techo en AMBAS etapas."""
++    cfg = mw.Config()
++    assert opt._search_space_cached["tsj"] == (max(2, cfg.tsj - 2), cfg.tsj + 3)
++
++
++def test_boundary_audit_flags_expandable_and_structural_edges():
++    audit = _need("_boundary_audit")
++    space = {
++        "tsj": (2, 6),
++        "coref_weight": [0.0, 0.1, 0.2],
++        "swap_iterations": [1, 2, 3, 5],
++        "cdh_target_k": (3, 12),
++        "min_forms_uc_1": (9, 17),
++        "forms_gap": (2, 7),
++        "similarity_threshold": [0.25, 0.35, 0.45, 0.55, 0.65],
++        "min_r2_threshold": [0.03, 0.05, 0.08],
++        "coref_context_units_loose": [3, 4, 5, 6, 8],
++        "coref_context_units_tight": {
++            "kind": "lt",
++            "other": "coref_context_units_loose",
++            "lo": 1,
++        },
++        "hdbscan_uce_min_cluster_frac_loose": [0.005, 0.01, 0.02],
++        "hdbscan_uce_min_cluster_frac": {
++            "kind": "gt",
++            "other": "hdbscan_uce_min_cluster_frac_loose",
++            "hi": 0.04,
++            "eps": 0.002,
++        },
++    }
++    chosen = {
++        "tsj": 6,                                    # techo: ampliable
++        "coref_weight": 0.0,                         # piso: ampliable
++        "swap_iterations": 5,                        # techo: estructural
++        "cdh_target_k": 3,                           # piso: estructural
++        "min_forms_uc_1": 12,                        # interior
++        "forms_gap": 7,                              # techo: ampliable
++        "similarity_threshold": 0.45,                # interior
++        "min_r2_threshold": 0.03,                    # piso: ampliable
++        "coref_context_units_loose": 5,              # interior (driver)
++        "coref_context_units_tight": 4,              # hi=loose-1: estructural
++        "hdbscan_uce_min_cluster_frac_loose": 0.01,  # interior (driver)
++        "hdbscan_uce_min_cluster_frac": 0.04,        # techo: estructural
++    }
++
++    hits = audit(space, chosen)
++    assert [h[0] for h in hits] == [
++        "cdh_target_k",
++        "coref_context_units_tight",
++        "coref_weight",
++        "forms_gap",
++        "hdbscan_uce_min_cluster_frac",
++        "min_r2_threshold",
++        "swap_iterations",
++        "tsj",
++    ]
++
++    by_name = {name: (value, rec) for name, value, rec in hits}
++    # Ampliables: la recomendacion propone ensanchar el rango.
++    for name, expected in (
++        ("tsj", "(2, 7)"),
++        ("forms_gap", "(2, 8)"),
++        ("coref_weight", "por debajo del minimo"),
++        ("min_r2_threshold", "por debajo del minimo"),
++    ):
++        rec = by_name[name][1]
++        assert rec.startswith("ampliable:"), (name, rec)
++        assert expected in rec, (name, rec)
++    assert by_name["tsj"][0] == "6"
++    assert by_name["coref_weight"][0] == "0.0"
++
++    # Estructurales: el auditor dice explicitamente que NO se amplia.
++    for name in (
++        "swap_iterations",
++        "cdh_target_k",
++        "coref_context_units_tight",
++        "hdbscan_uce_min_cluster_frac",
++    ):
++        rec = by_name[name][1]
++        assert rec.startswith("estructural:"), (name, rec)
++        assert "NO se amplia" in rec, (name, rec)
++
++    # Todos interiores -> sin bordes.
++    interior = dict(chosen)
++    interior.update(
++        {
++            "tsj": 4,
++            "coref_weight": 0.1,
++            "swap_iterations": 2,
++            "cdh_target_k": 8,
++            "forms_gap": 4,
++            "min_r2_threshold": 0.05,
++            "coref_context_units_tight": 3,
++            "hdbscan_uce_min_cluster_frac": 0.03,
++        }
++    )
++    assert audit(space, interior) == []
++
++
++def test_boundary_audit_never_raises_on_missing_or_weird_input():
++    audit = _need("_boundary_audit")
++    space = {
++        "tsj": (2, 6),
++        "coref_weight": [0.0, 0.1],
++        "coref_context_units_tight": {
++            "kind": "lt",
++            "other": "coref_context_units_loose",
++            "lo": 5,
++        },
++        "hdbscan_uce_min_cluster_frac": {
++            "kind": "gt",
++            "other": "hdbscan_uce_min_cluster_frac_loose",
++            "hi": 0.04,
++        },
++        "frozen_scalar": 13,
++        "degenerate_range": (3, 3),
++        "one_level_list": [7],
++    }
++
++    # (a) claves ausentes: se omiten, el resto sigue funcionando
++    assert [h[0] for h in audit(space, {"tsj": 6})] == ["tsj"]
++    # (b) valores con tipo inesperado: no lanza y no inventa bordes
++    assert audit(space, {"tsj": "seis", "coref_weight": None}) == []
++    assert audit(space, {"tsj": [1, 2], "coref_weight": {"a": 1}}) == []
++    # (c) spec condicional sin driver: se ignora
++    assert audit(space, {"coref_context_units_tight": 4}) == []
++    # (d) contenedores que no son dict: lista vacia, sin excepcion
++    assert audit(None, {"tsj": 6}) == []
++    assert audit(space, None) == []
++    assert audit([("tsj", (2, 6))], {"tsj": 6}) == []

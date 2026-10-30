@@ -117,7 +117,9 @@ _METRIC_FIELDS = tuple(f.name for f in dataclasses.fields(MethodMetrics))
 #: copia de la formula: con select-v4 (GATE_NOISE.md) existe
 #: MethodMetrics.dominance_corpus y el umbral aplica sobre c (fraccion del
 #: corpus); con select-v3 el umbral persistido aplica sobre a (asignadas).
-_THRESHOLD_SCALE = "corpus" if hasattr(MethodMetrics, "dominance_corpus") else "assigned"
+_THRESHOLD_SCALE = (
+    "corpus" if hasattr(MethodMetrics, "dominance_corpus") else "assigned"
+)
 
 
 def _utf8_stdout() -> None:
@@ -188,8 +190,18 @@ def _metric_from_row(row: Any) -> Optional[MethodMetrics]:
     data["k"] = _as_int(data.get("k")) or 0
     data["ari"] = _as_float(data.get("ari"))
     data["coverage"] = _as_float(data.get("coverage"), 0.0)
-    for key in ("noise_frac", "tiny_frac", "max_class_share", "median_class_size"):
-        data[key] = _as_float(data.get(key), 0.0)
+    # Campos que el productor deja en NaN y el JSON guarda como null: deben
+    # volver a NaN (no a 0.0), o el replay cambia de criterio.
+    for key in (
+        "bootstrap_ari",
+        "bootstrap_ci_lo",
+        "bootstrap_ci_hi",
+        "coverage_stable",
+        "dominance_corpus",
+        "null_p",
+        "null_z",
+    ):
+        data[key] = _as_float(data.get(key))
     if data.get("assigned_frac") is not None:
         data["assigned_frac"] = _as_float(data.get("assigned_frac"))
     if "min_class_size" in data:
@@ -338,7 +350,11 @@ def _check_record(
     same_rule = bool(stored_rule) and stored_rule == RULE_VERSION
     thresholds = _thresholds(sel)
     persisted_gate = thresholds["max_class_share_max"]
-    gate = persisted_gate if (same_rule and _finite(persisted_gate)) else float(gate_default)
+    gate = (
+        persisted_gate
+        if (same_rule and _finite(persisted_gate))
+        else float(gate_default)
+    )
 
     winner_raw = sel.get("winner")
     winner = None if winner_raw in (None, "", "null") else str(winner_raw)
@@ -354,8 +370,10 @@ def _check_record(
         diagnostic = str(diag_raw).strip().lower() in ("1", "true", "yes", "si")
     else:
         diagnostic = None
-    effective_diag = diagnostic if diagnostic is not None else (
-        backend == "hdbscan" if backend else None
+    effective_diag = (
+        diagnostic
+        if diagnostic is not None
+        else (backend == "hdbscan" if backend else None)
     )
     if backend is None:
         add(
@@ -379,8 +397,7 @@ def _check_record(
             add(
                 "backend_coherente",
                 "fail",
-                detail
-                + ": ganador C con backend de diagnostico"
+                detail + ": ganador C con backend de diagnostico"
                 " (hdbscan no puede ganar; ver BACKEND_C.md)",
             )
         elif winner == "C" and backend in DENSE_BACKENDS:
@@ -389,8 +406,7 @@ def _check_record(
             add(
                 "backend_coherente",
                 "warn",
-                detail
-                + f": backend denso con noise_frac={dense_noise:.3f}"
+                detail + f": backend denso con noise_frac={dense_noise:.3f}"
                 " (contrato: n_noise=0)",
             )
         else:
@@ -493,7 +509,10 @@ def _check_record(
             label = "c" if scale == "corpus" else "a"
             if not _finite(value):
                 issues.append(
-                    ("warn", f"{method}: descarte por dominancia sin {label} calculable")
+                    (
+                        "warn",
+                        f"{method}: descarte por dominancia sin {label} calculable",
+                    )
                 )
             elif _finite(gate) and value <= gate:
                 issues.append(
@@ -659,16 +678,12 @@ def _check_record(
     # ── 7. trazabilidad ──────────────────────────────────────────────────
     fingerprint = ctx.get("corpus_fingerprint") or ctx.get("spec") or record.get("spec")
     spec_hash = (
-        ctx.get("spec_hash")
-        or ctx.get("params_hash")
-        or ctx.get("best_params_sha256")
+        ctx.get("spec_hash") or ctx.get("params_hash") or ctx.get("best_params_sha256")
     )
     written_at = ctx.get("written_at")
     trace: List[Tuple[str, str]] = []
     if not fingerprint:
-        trace.append(
-            ("fail", "sin corpus_fingerprint ni spec: corrida no atribuible")
-        )
+        trace.append(("fail", "sin corpus_fingerprint ni spec: corrida no atribuible"))
     if not n_total:
         trace.append(("warn", "sin n_uces en el context"))
     if not written_at:
@@ -690,7 +705,11 @@ def _check_record(
                 )
             )
     if trace:
-        add("traceability", _worst([s for s, _ in trace]), "; ".join(m for _, m in trace))
+        add(
+            "traceability",
+            _worst([s for s, _ in trace]),
+            "; ".join(m for _, m in trace),
+        )
     else:
         add(
             "traceability",
@@ -717,7 +736,9 @@ def _check_record(
         "backend": backend,
         "diagnostic_only": effective_diag,
         "threshold": {"value": gate, "scale": _threshold_scale()},
-        "dominance_corpus": _dominance_value(by_method["C"]) if "C" in by_method else None,
+        "dominance_corpus": _dominance_value(by_method["C"])
+        if "C" in by_method
+        else None,
         "checks": checks,
         "verdict": verdict,
     }
@@ -777,12 +798,8 @@ def _build_report(
     report = audit_history(records)
     checked = [_check_record(rec, best_params, gate_default) for rec in records]
     snap = _snapshot_report(snapshot_path, best_params, gate_default)
-    n_fail = sum(
-        1 for r in checked if any(c["status"] == "fail" for c in r["checks"])
-    )
-    n_warn = sum(
-        1 for r in checked if any(c["status"] == "warn" for c in r["checks"])
-    )
+    n_fail = sum(1 for r in checked if any(c["status"] == "fail" for c in r["checks"]))
+    n_warn = sum(1 for r in checked if any(c["status"] == "warn" for c in r["checks"]))
     snap_fail = sum(1 for c in snap["checks"] if c.get("status") == "fail")
     if n_fail or snap_fail:
         verdict = "violation"
@@ -931,9 +948,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=None,
         help="sin valor (o '-') -> JSON a stdout; con ruta -> escribe el informe",
     )
-    ap.add_argument(
-        "--limit", type=int, default=20, help="maximo de corridas impresas"
-    )
+    ap.add_argument("--limit", type=int, default=20, help="maximo de corridas impresas")
     ap.add_argument(
         "--strict",
         action="store_true",
@@ -981,7 +996,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not machine:
         print("")
         if unstable:
-            print("VEREDICTO: la eleccion NO es estable -> no se persiste como decision.")
+            print(
+                "VEREDICTO: la eleccion NO es estable -> no se persiste como decision."
+            )
         else:
             print("VEREDICTO: eleccion estable en todos los targets medidos.")
         if broken:

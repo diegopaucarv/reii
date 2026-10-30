@@ -1,0 +1,121 @@
+{
+  "name": "03_c_hdbscan_winner",
+  "note": "Ganador C con method_c_backend=hdbscan y diagnostic_only=true. El backend de diagnostico no puede ganar (BACKEND_C.md): la invariante 4 debe ser [X] y --strict debe salir 1, con independencia de la generacion de regla.",
+  "rule": "current",
+  "expect": {
+    "verdict": "violation",
+    "exit_strict": 1,
+    "invariants": {
+      "backend_coherente": "fail",
+      "abstention": "ok",
+      "denominator": "ok"
+    }
+  },
+  "best_params": {
+    "path": "data/best_params.json",
+    "exists": true,
+    "mtime": "2026-10-26T09:00:00+00:00",
+    "size": 4096
+  },
+  "history": [
+    {
+      "rule_version": "select-v3",
+      "context": {
+        "corpus_fingerprint": "fp-smoke-0003",
+        "uce_target_size": 26,
+        "mode": "select",
+        "n_uces": 528,
+        "seed": 42,
+        "written_at": "2026-10-27T10:10:00+00:00",
+        "method_c_backend": "hdbscan",
+        "spec_hash": "sha256:0000aaaa1111dddd"
+      },
+      "selection": {
+        "winner": "C",
+        "winner_ari": 0.55,
+        "winner_coverage": 0.6,
+        "winner_k": 5,
+        "winner_usable_coverage": 0.6,
+        "runner_up": "A",
+        "runner_up_ari": 0.3,
+        "runner_up_coverage": 0.5,
+        "runner_up_k": 7,
+        "runner_up_usable_coverage": 0.5,
+        "delta_ari": 0.25,
+        "delta_coverage": 0.1,
+        "ambiguous": false,
+        "criteria_conflict": false,
+        "abstained": false,
+        "reason": "max ARI intra-metodo",
+        "discarded": [],
+        "rule_version": "select-v3",
+        "margin": 0.02,
+        "coverage_floor": 0.15,
+        "min_class_share": 0.01,
+        "noise_max": 0.5,
+        "k_bounds": [3, 20],
+        "all_metrics": [
+          {
+            "method": "A",
+            "k": 7,
+            "ari": 0.3,
+            "coverage": 0.5,
+            "tiny_frac": 0.0,
+            "noise_frac": 0.0,
+            "perturbation": "A1<->A2",
+            "available": true,
+            "assigned_frac": 1.0,
+            "min_class_size": 24,
+            "median_class_size": 75.0,
+            "max_class_share": 0.1799,
+            "usable": 0.5,
+            "n_total": 528,
+            "n_assigned": 528,
+            "n_noise": 0,
+            "max_class_size": 95
+          },
+          {
+            "method": "B",
+            "k": 9,
+            "ari": 0.25,
+            "coverage": 0.45,
+            "tiny_frac": 0.0,
+            "noise_frac": 0.0,
+            "perturbation": "B1<->B2",
+            "available": true,
+            "assigned_frac": 1.0,
+            "min_class_size": 21,
+            "median_class_size": 58.0,
+            "max_class_share": 0.1591,
+            "usable": 0.45,
+            "n_total": 528,
+            "n_assigned": 528,
+            "n_noise": 0,
+            "max_class_size": 84
+          },
+          {
+            "method": "C",
+            "k": 5,
+            "ari": 0.55,
+            "coverage": 0.6,
+            "tiny_frac": 0.0,
+            "noise_frac": 0.0492,
+            "perturbation": "C1<->C2",
+            "available": true,
+            "assigned_frac": 0.9508,
+            "min_class_size": 38,
+            "median_class_size": 74.0,
+            "max_class_share": 0.5996,
+            "usable": 0.6,
+            "backend": "hdbscan",
+            "diagnostic_only": true,
+            "n_total": 528,
+            "n_assigned": 502,
+            "n_noise": 26,
+            "max_class_size": 301
+          }
+        ]
+      }
+    }
+  ]
+}

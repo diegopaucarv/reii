@@ -52,6 +52,7 @@ from reii.config import (
     LLM_MODEL,
     OUTPUT_DASHBOARD,
     OUTPUT_NETWORK_GEXF,
+    RF_N_JOBS,
     SPACY_MODEL,
     STANZA_SERVER_URL,
     TOGETHER_API_KEY,
@@ -1132,6 +1133,9 @@ class Config:
     rf_impute_strategy: str = "median"  # 'median', 'mean', 'constant'
     rf_cat_encoding: str = "frequency"  # 'onehot', 'frequency', 'target'
     rf_min_samples_for_tuning: int = 30
+    # Workers de sklearn (-1 = todos los núcleos). Ver RF_N_JOBS en config.py:
+    # con -1 en el contenedor puede agotar la RAM y matar la daemon de Docker.
+    rf_n_jobs: int = RF_N_JOBS
 
     # ── Optimizer (Optuna) ──────────────────────────────────────────────
     optimize: bool = True
@@ -6098,6 +6102,7 @@ class DoubleClassifier:
                     A, y, n_perm=int(n_perm), seed=int(seed), min_n=int(min_n)
                 )
                 block = dict(boot)
+                block["ids"] = list(uce_ids)
                 block.update(
                     null_p=nul.get("null_p", float("nan")),
                     null_stat=nul.get("null_stat", float("nan")),
@@ -6330,6 +6335,26 @@ class DoubleClassifier:
             else:
                 primary_cluster = _stable_by_method[selection.winner]
                 primary_ids = set(primary_cluster)
+                if abs(float(_ari[selection.winner]) - 1.0) <= 1e-9:
+                    _blk = _stab.get(selection.winner) or {}
+                    _ids = list(_blk.get("ids") or [])
+                    _mask = _blk.get("stable_mask")
+                    if _ids and _mask is not None and len(_ids) == len(_mask):
+                        _m_ref = _stable_by_method[selection.winner]
+                        _boot_ok = {
+                            uid: _m_ref[uid]
+                            for uid, ok in zip(_ids, _mask)
+                            if ok and uid in _m_ref
+                        }
+                        if _boot_ok:
+                            primary_cluster = _boot_ok
+                            primary_ids = set(primary_cluster)
+                            print(
+                                f"   [select] {selection.winner}: pase tight/loose "
+                                f"tautologico (ARI=1.0); is_stable por bootstrap "
+                                f"({len(primary_ids)}/{n_total})"
+                            )
+
             # La persistencia NO se hace aqui: este metodo corre una vez por
             # trial del optimizador (1050+ veces). La corrida principal la
             # escribe via WorkflowOrchestrator -> persist_method_selection().
@@ -6410,8 +6435,15 @@ class DoubleClassifier:
                         + ("_sim" if in_sim else "")
                         + ("_emb" if in_emb else "")
                     ).strip("_") or "unstable"
-                    # Assign best available cluster_id for downstream reference
-                    if in_wc:
+                    # Assign best available cluster_id for downstream reference.
+                    # En 'select' NO se mezclan espacios de etiquetas: el ganador
+                    # tiene su propio K y las etiquetas de stable_wc/stable_sim
+                    # pertenecen a OTRO metodo (K distinto). Una UCE inestable
+                    # queda sin clase, como en ALCESTE ("no clasificada"), y no
+                    # infla member_count de la tabla clusters.
+                    if _mode == "select":
+                        uce.cluster_id = None
+                    elif in_wc:
                         uce.cluster_id = stable_wc[uid]
                     elif in_sim:
                         uce.cluster_id = stable_sim[uid]
@@ -6420,7 +6452,9 @@ class DoubleClassifier:
                     else:
                         uce.cluster_id = None
                     uce.is_stable = False
-                    uce.stability_method = methods
+                    uce.stability_method = (
+                        f"{_stability_tag}|{methods}" if _mode == "select" else methods
+                    )
 
         # ── Build summary report ──────────────────────────────────────────
         n_primary = len(primary_stable_uces)
@@ -7571,6 +7605,7 @@ class RobustRFShapAnalyzer:
         self.impute_strategy = config.rf_impute_strategy
         self.cat_encoding = config.rf_cat_encoding
         self.min_samples_for_tuning = config.rf_min_samples_for_tuning
+        self.n_jobs = config.rf_n_jobs
 
     def _preprocess(
         self, X_raw: pd.DataFrame, y: np.ndarray
@@ -7673,7 +7708,7 @@ class RobustRFShapAnalyzer:
             n_iter=self.n_iter_tune,
             cv=cv,
             scoring="balanced_accuracy",
-            n_jobs=-1,
+            n_jobs=self.n_jobs,
             random_state=self.random_state,
         )
         search.fit(X, y)
@@ -7721,8 +7756,23 @@ class RobustRFShapAnalyzer:
         if len(X) < 10 or len(np.unique(y)) < 2:
             return {"error": "Después de preprocesamiento, datos insuficientes"}
 
-        # Tune hyperparameters
-        best_params = self._tune_hyperparams(X, y)
+        # Tune hyperparameters. Si el tuning falla (p. ej. joblib no puede
+        # crear workers por falta de memoria), seguimos con los valores por
+        # defecto: perder el tuning es preferible a abortar aquí la corrida
+        # completa, con todo el pipeline ya calculado.
+        try:
+            best_params = self._tune_hyperparams(X, y)
+        except Exception as exc:  # noqa: BLE001 - degradar, no abortar
+            print(
+                f"[RF] WARNING: tuning falló ({type(exc).__name__}: {exc}); "
+                "usando hiperparámetros por defecto."
+            )
+            best_params = {
+                "n_estimators": self.n_estimators,
+                "max_depth": self.max_depth,
+                "min_samples_split": 2,
+                "min_samples_leaf": 1,
+            }
         clf = RandomForestClassifier(
             **best_params, random_state=self.random_state, class_weight="balanced"
         )
@@ -7768,7 +7818,7 @@ class RobustRFShapAnalyzer:
 
         # Permutation importance
         perm_imp = permutation_importance(
-            clf, X, y, n_repeats=10, random_state=self.random_state, n_jobs=-1
+            clf, X, y, n_repeats=10, random_state=self.random_state, n_jobs=self.n_jobs
         )
         perm_imp_df = pd.DataFrame(
             {
@@ -8844,7 +8894,6 @@ def _expand_levels(spec: Any) -> List[Any]:
 #: muestreados de espacios distintos).
 _BOUNDARY_EXPANDABLE = (
     "min_forms_uc_1",
-    "forms_gap",
     "similarity_threshold",
     "min_r2_threshold",
     "coref_weight",
@@ -8895,6 +8944,17 @@ _BOUNDARY_DECLINED = {
         "endpoint registrado (0.451 frente a 0.537 de ALCESTE). Ganar "
         "estabilidad podando retencion es el intercambio que este auditor "
         "existe para hacer visible, no para firmar"
+    ),
+    "forms_gap": (
+        "el piso se mantiene: `gap` separa los pisos de la pasada 1 y la "
+        "pasada 2 (mf2 = mf1 + gap). Con gap<2 las dos pasadas producen casi "
+        "la misma particion y el ARI de 2 pasadas sube por construccion: es "
+        "la misma familia de artefacto que swap_iterations=0 (patch 19), no "
+        "un hiperparametro. gap=2 es el minimo que las mantiene distintas. "
+        "Desviacion declarada: ALCESTE usa 10/14 (gap=4) y el default del "
+        "codigo [13, 17] (gap=4); el optimo de v6 corre con (10, 12). La "
+        "sensibilidad gap=2 vs gap=4 se mide en "
+        "docs/design_v5/EXPERIMENTO_SENSIBILIDAD_FORMS_GAP.md"
     ),
 }
 
@@ -9599,6 +9659,11 @@ class Optimizador:
 
         space: Dict[str, Any] = {
             "min_forms_uc_1": (max(2, f1 - 4), f1 + 4),
+            # v6b (patch 19c): el piso NO se baja a 1. `mf2 = mf1 + gap`;
+            # con gap<2 las dos pasadas son casi la misma particion y el ARI
+            # de 2 pasadas sube por construccion (misma familia que
+            # swap_iterations=0). El optimo de v6 cayo en 2 (=piso): se
+            # declara en _BOUNDARY_DECLINED, no se amplia.
             "forms_gap": (2, 7),
             # v6 (PRE-REGISTRADO antes del run v6): en v5 el optimo de `tsj`
             # quedo CENSURADO al techo en AMBAS etapas (tsj=5, rango [2, 5]).
@@ -9619,7 +9684,7 @@ class Optimizador:
             "swap_iterations": [1, 2, 3, 5],
             # v5 (§3.3): el ganador esta en el maximo (0.10).
             "min_r2_threshold": [0.03, 0.05, 0.08, 0.10, 0.15, 0.20],
-            "similarity_threshold": [0.25, 0.35, 0.45, 0.55, 0.65],
+            "similarity_threshold": [0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85],
             # v5 (§3.1): combinacion convexa con similarity_weight=1-w; no
             # hay cota estructural en 0.4.
             "coref_weight": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
@@ -11315,7 +11380,9 @@ class WorkflowOrchestrator:
                 self.db.data["method_selection"] = _sel.to_dict()
                 # Decision persistida (snapshot + historial append-only).
                 # La tabla ya se imprimio en DoubleClassifier.run().
-                self.double_clf.persist_method_selection(_sel, len(uces_est_list))
+                self.double_clf.persist_method_selection(
+                    _sel, len({uce.id for doc in uces_por_doc for uce in doc})
+                )
 
             # ── Estabilidad ALCESTE clásica (CR + ARI 10↔14) — §5 ────────
             if str(getattr(self.config, "run_mode", "modern")) == "classic":

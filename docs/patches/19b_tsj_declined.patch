@@ -1,0 +1,128 @@
+--- a/src/reii/main_workflow.py
++++ b/src/reii/main_workflow.py
+@@ -8683,7 +8683,6 @@
+ _BOUNDARY_EXPANDABLE = (
+     "min_forms_uc_1",
+     "forms_gap",
+-    "tsj",
+     "similarity_threshold",
+     "min_r2_threshold",
+     "coref_weight",
+@@ -8721,6 +8720,19 @@
+     ),
+     "hdbscan_uce_min_cluster_frac_loose": (
+         "el driver fija la escala de Method C (mcs), no un rango explorable"
++    ),
++}
++
++#: Censura DECLARADA: el optimo queda en el borde y el rango se deja como esta.
++#: No es un descuido: es una decision tomada antes del run v6, y el auditor la
++#: imprime para que quede en el log, no para que se "arregle" despues.
++_BOUNDARY_DECLINED = {
++    "tsj": (
++        "el techo se mantiene: `tsj` es umbral de frecuencia documental, "
++        "subirlo poda vocabulario y baja lemas/UCE (retencion), que es "
++        "endpoint registrado (0.451 frente a 0.537 de ALCESTE). Ganar "
++        "estabilidad podando retencion es el intercambio que este auditor "
++        "existe para hacer visible, no para firmar"
+     ),
+ }
+ 
+@@ -8789,10 +8801,15 @@
+ def _edge_recommendation(
+     name: str, spec: Any, lo: Any, hi: Any, at_lo: bool, at_hi: bool
+ ) -> str:
+-    """Recomendacion; empieza por ampliable/estructural/sin-clasificar."""
++    """Recomendacion; el prefijo declara la politica (4 categorias)."""
+     if name in _BOUNDARY_STRUCTURAL:
+         why = _BOUNDARY_STRUCTURAL_WHY.get(name, "el borde es un limite del metodo")
+         return f"estructural: rango {_edge_label(spec, lo, hi)}; NO se amplia ({why})"
++    if name in _BOUNDARY_DECLINED:
++        return (
++            f"censurado-declarado: rango {_edge_label(spec, lo, hi)}; NO se "
++            f"amplia ({_BOUNDARY_DECLINED[name]})"
++        )
+     if name not in _BOUNDARY_EXPANDABLE:
+         return (
+             f"sin-clasificar: rango {_edge_label(spec, lo, hi)}; revisar a mano antes "
+@@ -8824,8 +8841,9 @@
+ 
+     Devuelve ``(param, valor, recomendacion)`` por cada parametro cuyo valor
+     cae en un extremo. ``recomendacion`` empieza por ``ampliable:``,
+-    ``estructural:`` o ``sin-clasificar:`` para que el llamador (y los
+-    tests) distingan la politica sin parsear texto libre.
++    ``estructural:``, ``censurado-declarado:`` o ``sin-clasificar:`` para
++    que el llamador (y los tests) distingan la politica sin parsear texto
++    libre.
+ 
+     Reglas: tupla ``(lo, hi)`` -> extremo si el valor es ``lo`` o ``hi``;
+     lista categorica -> primer/ultimo nivel; spec condicional -> el extremo
+@@ -9424,12 +9442,12 @@
+             "forms_gap": (2, 7),
+             # v6 (PRE-REGISTRADO antes del run v6): en v5 el optimo de `tsj`
+             # quedo CENSURADO al techo en AMBAS etapas (tsj=5, rango [2, 5]).
+-            # Se amplia UN paso por arriba. `tsj` solo se usa como umbral de
+-            # frecuencia documental (`MatrizBuilder.construir_vocabulario` y
+-            # `TermStabilityAnalyzer.bootstrap_terms`): no hay invariante que
+-            # lo ate a `min_forms_uc` (con f1=13, tsj<=6 < 13), asi que 6 no
+-            # rompe el filtrado de formas.
+-            "tsj": (max(2, tsj - 2), tsj + 3),
++            # NO se amplia: `tsj` es umbral de frecuencia documental y subirlo
++            # poda vocabulario, lo que baja lemas/UCE (retencion), endpoint
++            # registrado del paper (0.451 frente a 0.537 de ALCESTE). La
++            # censura se declara en _BOUNDARY_DECLINED y el auditor la deja
++            # en el log de cada corrida; el techo se queda en 5.
++            "tsj": (max(2, tsj - 2), tsj + 2),
+             # pseudocount eliminado (BLOQUE 1: siempre 0.0)
+             "cdh_target_k": (3, k_hi),
+             # v6 (PRE-REGISTRADO antes del run v6): 0 fuera del espacio.
+--- a/tests/test_v5_space.py
++++ b/tests/test_v5_space.py
+@@ -304,10 +304,12 @@
+     assert 1 in levels
+ 
+ 
+-def test_tsj_ceiling_is_widened_one_step(opt):
+-    """v5 dejo el optimo de tsj censurado al techo en AMBAS etapas."""
++def test_tsj_ceiling_is_declared_not_widened(opt):
++    """v5 censuro `tsj` al techo; NO se amplia: subirlo poda vocabulario."""
+     cfg = mw.Config()
+-    assert opt._search_space_cached["tsj"] == (max(2, cfg.tsj - 2), cfg.tsj + 3)
++    assert opt._search_space_cached["tsj"] == (max(2, cfg.tsj - 2), cfg.tsj + 2)
++    assert "tsj" in _need("_BOUNDARY_DECLINED")
++    assert "tsj" not in _need("_BOUNDARY_EXPANDABLE")
+ 
+ 
+ def test_boundary_audit_flags_expandable_and_structural_edges():
+@@ -336,7 +338,7 @@
+         },
+     }
+     chosen = {
+-        "tsj": 6,                                    # techo: ampliable
++        "tsj": 6,                                    # techo: declinado
+         "coref_weight": 0.0,                         # piso: ampliable
+         "swap_iterations": 5,                        # techo: estructural
+         "cdh_target_k": 3,                           # piso: estructural
+@@ -365,7 +367,6 @@
+     by_name = {name: (value, rec) for name, value, rec in hits}
+     # Ampliables: la recomendacion propone ensanchar el rango.
+     for name, expected in (
+-        ("tsj", "(2, 7)"),
+         ("forms_gap", "(2, 8)"),
+         ("coref_weight", "por debajo del minimo"),
+         ("min_r2_threshold", "por debajo del minimo"),
+@@ -373,8 +374,13 @@
+         rec = by_name[name][1]
+         assert rec.startswith("ampliable:"), (name, rec)
+         assert expected in rec, (name, rec)
++    assert by_name["coref_weight"][0] == "0.0"
++
++    # Censurados declarados: se reportan, pero la recomendacion es NO ampliar.
++    rec = by_name["tsj"][1]
++    assert rec.startswith("censurado-declarado:"), rec
++    assert "NO se amplia" in rec, rec
+     assert by_name["tsj"][0] == "6"
+-    assert by_name["coref_weight"][0] == "0.0"
+ 
+     # Estructurales: el auditor dice explicitamente que NO se amplia.
+     for name in (

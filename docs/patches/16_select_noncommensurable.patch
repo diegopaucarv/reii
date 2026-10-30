@@ -1,0 +1,205 @@
+--- a/src/reii/method_selection.py
++++ b/src/reii/method_selection.py
+@@ -327,7 +327,7 @@
+             f"  dominancia sobre '{self.dominance_scale}': c=a*(1-nu) > "
+             f"{self.max_class_share_max:.2f} | nulo={self.null_mode}"
+             f"@{self.null_alpha:.2f} | margen {self.margin:.2f}",
+-            f"  {'met':4}{'K':>4}{'stab':>7}{'knd':>6}{'cov':>7}{'covS':>7}"
++            f"  {'met':4}{'K':>4}{'stab':>7}{'knd':>12}{'cov':>7}{'covS':>7}"
+             f"{'usable':>8}{'noise':>7}{'dom':>6}{'domC':>7}{'nullp':>7}  "
+             f"{'perturbacion':14}  veredicto",
+         ]
+@@ -342,7 +342,7 @@
+             out.append(
+                 f"  {row['method']:4}{int(row.get('k') or 0):>4}"
+                 f"{_fmt(row.get('stability')):>7}"
+-                f"{str(row.get('stability_kind') or '-'):>6}"
++                f"{str(row.get('stability_kind') or '-'):>12}"
+                 f"{float(row.get('coverage') or 0.0):>7.3f}"
+                 f"{_fmt(row.get('coverage_stable')):>7}"
+                 f"{float(row.get('usable') or 0.0):>8.3f}"
+@@ -428,7 +428,21 @@
+ #: Backends sin grados de libertad en el pase tight/loose: ``ari == 1.0`` por
+ #: construcción (``BACKEND_C.md`` §3), así que ese ARI no mide estabilidad.
+ _TAUTOLOGICAL_BACKENDS: Tuple[str, ...] = ("ward", "kmeans_spherical")
+ 
++#: Backends cuyo pase tight/loose NO es conmensurable con A/B aunque su ARI no
++#: sea 1.0 exacto: la perturbacion solo mueve un multiplicador interno
++#: (``dense_cdh_loose_factor``), asi que su ARI de perturbacion tiene un piso
++#: artificialmente alto. Medido en `reii_probe_v5_stage2` (20 trials, mismo
++#: corpus): C(dense_cdh) 0.756-0.963 frente a B 0.244-0.405 y A 0.307.
++#: Ordenar por ``stability`` con ``kind="perturbation"`` entre estos backends y
++#: A/B no compara la misma magnitud de perturbacion (``SELECT_V4.md`` §5): sin
++#: ``bootstrap_ari`` no compiten.
++_NONCOMMENSURABLE_BACKENDS: Tuple[str, ...] = (
++    "ward",
++    "kmeans_spherical",
++    "dense_cdh",
++)
++
+ #: Modos de uso del contraste contra el nulo. "diagnostic" persiste e imprime
+ #: el p-valor pero no descarta ni ordena (STABILITY_NULL.md §1.3).
+ _NULL_MODES: Tuple[str, ...] = ("gate", "rank", "off", "diagnostic")
+@@ -511,16 +525,24 @@
+         if tiny > 0.0:
+             detail += f" menos tiny {tiny:.3f}"
+         return detail + ")"
+     if (
+         reject_tautological
+         and metric.stability_kind == "perturbation"
+-        and str(metric.backend) in _TAUTOLOGICAL_BACKENDS
++        and str(metric.backend) in _NONCOMMENSURABLE_BACKENDS
+     ):
+-        return (
+-            f"estabilidad tautologica: backend {metric.backend} no tiene grados"
+-            " de libertad en el pase tight/loose (ARI=1.0 por construccion);"
+-            " falta bootstrap_ari"
+-        )
++        backend = str(metric.backend)
++        if backend in _TAUTOLOGICAL_BACKENDS:
++            return (
++                f"estabilidad tautologica: backend {backend} no tiene grados"
++                " de libertad en el pase tight/loose (ARI=1.0 por construccion);"
++                " falta bootstrap_ari"
++            )
++        return (
++            f"estabilidad no conmensurable: backend {backend} solo mueve"
++            " dense_cdh_loose_factor en el pase tight/loose, asi que su ARI"
++            " tiene piso artificial (medido 0.76-0.96 frente a 0.24-0.41 de"
++            " A/B); falta bootstrap_ari para comparar en la misma escala"
++        )
+     boot = float(getattr(metric, "bootstrap_ari", float("nan")))
+     if math.isfinite(boot) and boot < float(STABILITY_MEAN_MIN):
+         return (
+--- a/tests/test_select_v4.py
++++ b/tests/test_select_v4.py
+@@ -684,3 +684,129 @@
+                 payload["all_metrics"], key=lambda r: r["method"]
+             )
+         assert first == second
++
++
++# ══════════════════════════════════════════════════════════════════════════
++# Backends no conmensurables: ``dense_cdh`` solo mueve un multiplicador
++# ══════════════════════════════════════════════════════════════════════════
++class TestBackendsNoConmensurables:
++    def test_dense_cdh_por_perturbacion_no_compite(self):
++        """El pase tight/loose solo mueve ``dense_cdh_loose_factor``."""
++        a = _m("A", 5, 0.307, 0.400)
++        c = _m(
++            "C",
++            4,
++            0.931,
++            1.000,
++            backend="dense_cdh",
++            coverage_stable=0.479,
++            max_class_share=0.400,
++            null_p=0.004,
++        )
++        assert c.stability_kind == "perturbation"
++        why = _ms._feasibility(c, 0.15, (3, 20))
++        assert why is not None
++        assert "dense_cdh" in why
++        assert "dense_cdh_loose_factor" in why
++        assert "bootstrap_ari" in why
++        sel = select_method([a, c])
++        assert sel.winner == "A"
++        assert [d["method"] for d in sel.discarded] == ["C"]
++        assert "dense_cdh" in sel.discarded[0]["why"]
++
++    def test_dense_cdh_con_bootstrap_si_compite(self):
++        """Con ``bootstrap_ari`` finito la regla no lo descarta."""
++        c = _m(
++            "C",
++            4,
++            0.700,
++            1.000,
++            backend="dense_cdh",
++            bootstrap_ari=0.620,
++            coverage_stable=0.900,
++            max_class_share=0.400,
++            null_p=0.004,
++        )
++        assert c.stability_kind == "bootstrap"
++        assert _ms._feasibility(c, 0.15, (3, 20)) is None
++        a = _m("A", 5, 0.307, 0.400)
++        sel = select_method([a, c])
++        assert sel.winner == "C"
++        assert sel.discarded == []
++        assert sel.winner_stability_kind == "bootstrap"
++
++    def test_ward_y_kmeans_conservan_el_mensaje_tautologico(self):
++        """Los backends tautologicos no cambian su motivo de descarte."""
++        for backend in ("ward", "kmeans_spherical"):
++            m = _m(
++                "C",
++                4,
++                1.000,
++                1.000,
++                backend=backend,
++                coverage_stable=0.950,
++                max_class_share=0.400,
++                null_p=0.004,
++            )
++            why = _ms._feasibility(m, 0.15, (3, 20))
++            assert why == (
++                f"estabilidad tautologica: backend {backend} no tiene grados"
++                " de libertad en el pase tight/loose (ARI=1.0 por construccion);"
++                " falta bootstrap_ari"
++            )
++
++    def test_reject_tautological_sigue_gobernando(self):
++        """El escape cubre los dos casos, no solo la tautologia."""
++        c = _m(
++            "C",
++            4,
++            0.931,
++            1.000,
++            backend="dense_cdh",
++            coverage_stable=0.479,
++            max_class_share=0.400,
++            null_p=0.004,
++        )
++        assert _ms._feasibility(c, 0.15, (3, 20)) is not None
++        assert (
++            _ms._feasibility(c, 0.15, (3, 20), reject_tautological=False)
++            is None
++        )
++
++
++class TestExplainAlineacion:
++    def test_cabecera_y_filas_tienen_el_mismo_ancho(self):
++        """Incluye ``stability_kind="perturbation"`` (12 caracteres)."""
++        rows = [
++            _m("A", 5, 0.310, 0.450),
++            _m("B", 6, 0.280, 0.400),
++            _m(
++                "C",
++                4,
++                1.000,
++                1.000,
++                backend="ward",
++                bootstrap_ari=0.620,
++                coverage_stable=0.950,
++                max_class_share=0.400,
++                null_p=0.004,
++            ),
++        ]
++        sel = select_method(rows)
++        lines = sel.explain_lines()
++        header_i = next(
++            i for i, line in enumerate(lines) if line.startswith("  met")
++        )
++        header = lines[header_i]
++        # El veredicto/tag es texto libre: el ancho fijo termina en la
++        # columna ``perturbacion``, y ahi debe cuadrar la cabecera.
++        width = len(header) - len("veredicto")
++        method_rows = lines[header_i + 1 : header_i + 1 + len(rows)]
++        assert len(method_rows) == len(rows)
++        for line in method_rows:
++            body = line
++            for tag in ("<- runner-up", "<- winner", "no disponible"):
++                if body.endswith(tag):
++                    body = body[: -len(tag)]
++                    break
++            assert len(body) == width, f"{len(body)} != {width}: {line!r}"

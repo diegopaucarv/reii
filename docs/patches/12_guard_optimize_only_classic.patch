@@ -1,0 +1,21 @@
+diff --git a/src/reii/main_workflow.py b/src/reii/main_workflow.py
+--- a/src/reii/main_workflow.py
++++ b/src/reii/main_workflow.py
+@@ -8093,6 +8093,17 @@
+     No toca `pseudocount`: el paper pide 0.1 pero la CDH no lo consume
+     (docs/design_v5/CLASSIC_MODE.md §3). Queda 0.0 y se declara.
+     """
++    # `_optimizer_will_run = bool(_OPTIMIZE_ONLY) or (...)` (main()) fuerza el
++    # optimizador aunque classic fije optimize=False; la etapa 2 corre en
++    # mode="select", asi que optimizaria el objetivo moderno sobre una config
++    # clasica y escribiria best_params en data/classic/ con exit 0.
++    if _OPTIMIZE_ONLY:
++        print(
++            "[X] --optimize-only no es compatible con --mode classic: el escenario A "
++            "fija los hiperparámetros del paper (optimize=False) y el optimizador los "
++            "buscaría con el objetivo de 'select'."
++        )
++        sys.exit(2)
+     base = os.path.join(CLASSIC_DATA_DIR)
+     os.makedirs(base, exist_ok=True)
+     os.makedirs(CLASSIC_OUTPUT_DIR, exist_ok=True)

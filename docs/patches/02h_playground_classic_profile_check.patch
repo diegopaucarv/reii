@@ -1,0 +1,814 @@
+diff --git a/scripts/playground/classic_profile_check.py b/scripts/playground/classic_profile_check.py
+--- a/scripts/playground/classic_profile_check.py
++++ b/scripts/playground/classic_profile_check.py
+@@ -1,26 +1,35 @@
+ #!/usr/bin/env python3
+-"""Valida el perfil ``classic`` de ``--mode classic`` de forma estatica.
+-
+-No importa ``reii.main_workflow`` (arrastra Stanza/spaCy/DB y tarda minutos) ni
+-``reii.main_workflow_clasico``. Solo parsea ambos ficheros con ``ast``.
+-
+-Que comprueba
+--------------
+-1. ``CLASSIC_PROFILE`` (si ya esta en ``main_workflow.py``) o, mientras el diff
+-   esta pendiente, la copia canonica de este script: cada clave existe como
+-   campo de ``Config`` y su tipo es compatible con la anotacion. Evita el fallo
+-   clasico de ``--mode classic`` con una clave inexistente.
+-2. Tabla ``clave | fork | pipeline | perfil classic | ¿igual al fork?`` usando
+-   los valores EFECTIVOS (default del dataclass + kwargs del ``Config(...)``
+-   dentro de ``if __name__ == "__main__"``), no solo el default.
+-3. ``cdh_enforce_min_leaf is False`` y las claves de innovacion desactivadas.
+-4. Imprime el perfil como JSON ordenado.
++"""Valida el contrato del perfil ``classic`` (ALCESTE 2012) de forma estatica.
++
++No importa ``reii.main_workflow`` (arrastra Stanza/spaCy/DB y tarda minutos).
++Solo parsea su fuente con ``ast``.
++
++Contrato que valida (docs/design_v5/CLASSIC_MODE.md)
++---------------------------------------------------
++1. ``CLASSIC_OVERRIDES`` existe y es un dict literal con EXACTAMENTE las 8
++   claves del perfil (ni mas ni menos) y los valores del contrato.
++2. Cada clave existe como campo de ``Config`` y su tipo encaja con la
++   anotacion.
++3. ``apply_classic_mode(config, uc_config)`` existe con 2 parametros y su
++   cuerpo rechaza ``--optimize-only`` (``_OPTIMIZE_ONLY`` + ``sys.exit(2)``).
++4. ``apply_classic_mode`` NO fija ``pseudocount``: el doc lo deja en 0.0 a
++   proposito (seccion 3), asi que no puede ser un override.
++5. Tabla de valores EFECTIVOS: clave | perfil classic | default del pipeline |
++   origen. Los numeros historicos (tsj=3, uce_target_size=26, n_perm_cdh=100,
++   min_cluster_size_cdh=0.10, swap_iterations=2, min_r2_threshold=0.05,
++   pseudocount=0.0) son defaults del pipeline, no overrides del perfil.
++
++Si ``CLASSIC_OVERRIDES`` no existe se sale con codigo 1: no hay fallback a
++ninguna copia canonica. Ese fallback es lo que daba por bueno un perfil que el
++codigo ya no implementa.
+ 
+ Uso:
+-    python scripts/playground/classic_profile_check.py            # texto + JSON
+-    python scripts/playground/classic_profile_check.py --json     # solo JSON
+-
+-Sin red, sin docker, sin escrituras. < 10 s. Exit 0 si el contrato se cumple.
++    python scripts/playground/classic_profile_check.py                  # texto
++    python scripts/playground/classic_profile_check.py --json           # JSON
++    python scripts/playground/classic_profile_check.py --pipeline RUTA  # otro fichero
++
++Sin red, sin docker, sin escrituras. < 10 s. Exit 0 solo si el contrato se
++cumple.
+ """
+ 
+ from __future__ import annotations
+@@ -33,55 +42,33 @@
+ from typing import Any, Dict, List, Optional, Tuple
+ 
+ ROOT = Path(__file__).resolve().parents[2]
+-PIPELINE = ROOT / "src" / "reii" / "main_workflow.py"
+-FORK = ROOT / "src" / "reii" / "main_workflow_clasico.py"
+-
+-# ---------------------------------------------------------------------------
+-# Copia canonica del perfil. Es la fuente de verdad MIENTRAS el diff no este
+-# aplicado (docs/design_v5/MODE_CLASSIC.md, seccion 5). Cuando el diff este
+-# aplicado, este script exige que CLASSIC_PROFILE == CANONICAL_CLASSIC_PROFILE
+-# (guarda anti-deriva), asi que no hay dos definiciones vivas.
+-# ---------------------------------------------------------------------------
+-CANONICAL_CLASSIC_PROFILE: Dict[str, Any] = {
+-    # -- trazabilidad y guardas -------------------------------------------
+-    "run_mode": "classic",  # campo nuevo (diff): "modern" | "classic"
+-    "classification_mode": "wc_only",  # solo Metodo A: sin coref (B), sin HDBSCAN (C)
+-    "optimize": False,  # ALCESTE 2012 fija los hiperparametros
+-    # -- nucleo CDH (paper 2, paso 2) ------------------------------------
+-    "cdh_enforce_min_leaf": False,  # sin piso de hoja: cortes 1-vs-(n-1) validos
+-    "use_ppmi": False,  # campo nuevo (diff): matriz logica binaria
+-    "min_cluster_size_cdh": 0.10,  # sigue como regla de PARADA de la recursion
+-    "swap_iterations": 2,
+-    "min_r2_threshold": 0.05,
+-    "n_perm_cdh": 100,
+-    "pseudocount": 0.0,  # epsilon: knob sin consumidor (ver doc, seccion 4)
+-    # -- segmentacion (paper 2, paso 1) ----------------------------------
+-    "uce_target_size": 18,  # valor fijo del fork/alceste_config
+-    "auto_calibrate_uce_size": False,  # sin calibracion bayesiana
+-    "min_forms_uc": [10, 14],  # paper: dos corridas de 10 vs 14 palabras
+-    "tsj": 3,
+-    # -- capas REII que no deben reportarse en A -------------------------
+-    "use_liminal_projection": False,  # proyeccion abductiva: no es ALCESTE
++DEFAULT_PIPELINE = ROOT / "src" / "reii" / "main_workflow.py"
++
++# El contrato real: 8 overrides (docs/design_v5/CLASSIC_MODE.md seccion 2).
++EXPECTED_OVERRIDES: Dict[str, Any] = {
++    "run_mode": "classic",
++    "classification_mode": "wc_only",
++    "min_forms_uc": [10, 14],
++    "cdh_enforce_min_leaf": False,
++    "optimize": False,
++    "use_embeddings": False,
++    "use_liminal_projection": False,
++    "auto_calibrate_uce_size": False,
+ }
+ 
+-# Claves que el perfil usa pero que aun no existen en Config porque el diff de
+-# src/reii/main_workflow.py no se ha aplicado. Se declaran con su tipo esperado
+-# para que un typo SIGA fallando (no es una amnistia general).
+-PENDING_DIFF_KEYS: Dict[str, str] = {"run_mode": "str", "use_ppmi": "bool"}
+-
+-# Semantica del fork para claves que el fork NO declara. True = el perfil
+-# reproduce lo que el fork HACE (aunque no lo nombre).
+-FORK_ABSENT_EQUIVALENT: Dict[str, Tuple[bool, str]] = {
+-    "run_mode": (False, "el fork no lo tiene (metadato de corrida)"),
+-    "use_ppmi": (True, "el fork nunca construye PPMI => equivale a False"),
+-    "cdh_enforce_min_leaf": (True, "el fork no tiene el fix => equivale a False"),
+-    "auto_calibrate_uce_size": (True, "el fork no calibra => equivale a False"),
+-    "use_liminal_projection": (True, "el fork no proyecta => equivale a False"),
+-    "classification_mode": (
+-        False,
+-        "el fork tiene un solo metodo; su __main__ pedia 'all'",
+-    ),
+-}
++# Numeros del paper que NO son overrides: son defaults del pipeline (2.1). Se
++# reportan en la tabla para que nadie los confunda con fidelidad del perfil.
++HISTORICAL_DEFAULTS: Tuple[str, ...] = (
++    "tsj",
++    "uce_target_size",
++    "n_perm_cdh",
++    "min_cluster_size_cdh",
++    "swap_iterations",
++    "min_r2_threshold",
++    "pseudocount",
++)
++
++_MISSING = object()
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -91,10 +78,10 @@
+     return path.read_text(encoding="utf-8", errors="replace")
+ 
+ 
+-def config_annotations(tree: ast.Module) -> Dict[str, str]:
+-    """nombre -> anotacion (sin evaluar) de los campos de ``class Config``."""
++def class_annotations(tree: ast.Module, class_name: str) -> Dict[str, str]:
++    """nombre -> anotacion (sin evaluar) de los campos de ``class <name>``."""
+     for node in tree.body:
+-        if isinstance(node, ast.ClassDef) and node.name == "Config":
++        if isinstance(node, ast.ClassDef) and node.name == class_name:
+             out: Dict[str, str] = {}
+             for stmt in node.body:
+                 if isinstance(stmt, ast.AnnAssign) and isinstance(
+@@ -105,10 +92,10 @@
+     return {}
+ 
+ 
+-def config_defaults(tree: ast.Module) -> Dict[str, Any]:
+-    """nombre -> default literal de ``class Config`` (``<factory>`` si no es literal)."""
++def class_defaults(tree: ast.Module, class_name: str) -> Dict[str, Any]:
++    """nombre -> default literal de ``class <name>`` (``<factory>`` si no)."""
+     for node in tree.body:
+-        if isinstance(node, ast.ClassDef) and node.name == "Config":
++        if isinstance(node, ast.ClassDef) and node.name == class_name:
+             out: Dict[str, Any] = {}
+             for stmt in node.body:
+                 if not (
+@@ -121,22 +108,30 @@
+     return {}
+ 
+ 
++def config_annotations(tree: ast.Module) -> Dict[str, str]:
++    """nombre -> anotacion de los campos de ``class Config``."""
++    return class_annotations(tree, "Config")
++
++
++def config_defaults(tree: ast.Module) -> Dict[str, Any]:
++    """nombre -> default de ``class Config`` (``<factory>`` si no es literal)."""
++    return class_defaults(tree, "Config")
++
++
+ def _literal_or_factory(node: Optional[ast.AST]) -> Any:
+     if node is None:
+         return "<sin default>"
+     if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "field":
+         for kw in node.keywords:
+             if kw.arg == "default_factory":
+-                body = None
++                if isinstance(kw.value, ast.Name):  # default_factory=list
++                    return []
+                 if isinstance(kw.value, ast.Lambda):
+-                    body = kw.value.body
+-                elif isinstance(kw.value, ast.Name):  # default_factory=list
+-                    return []
+-                if body is not None:
+                     try:
+-                        return ast.literal_eval(body)
++                        return ast.literal_eval(kw.value.body)
+                     except (ValueError, SyntaxError):
+                         return "<factory>"
++                return "<factory>"
+         return "<factory>"
+     try:
+         return ast.literal_eval(node)
+@@ -144,72 +139,83 @@
+         return "<expr>"
+ 
+ 
+-def _main_config_kwargs(tree: ast.Module) -> Dict[str, ast.AST]:
+-    """kwargs del/los ``Config(...)`` dentro de ``if __name__ == "__main__"``."""
+-    out: Dict[str, ast.AST] = {}
+-    for node in tree.body:
+-        if isinstance(node, ast.If) and "__main__" in ast.unparse(node.test):
+-            for sub in ast.walk(node):
+-                if (
+-                    isinstance(sub, ast.Call)
+-                    and getattr(sub.func, "id", None) == "Config"
+-                ):
+-                    for kw in sub.keywords:
+-                        if kw.arg:
+-                            out[kw.arg] = kw.value
+-    return out
+-
+-
+-def _call_configs(tree: ast.Module) -> List[ast.Call]:
+-    return [
+-        n
+-        for n in ast.walk(tree)
+-        if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "Config"
+-    ]
+-
+-
+-def effective_config(path: Path) -> Tuple[Dict[str, Any], Dict[str, str], List[str]]:
+-    """(valores efectivos, anotaciones, kwargs desconocidos en __main__)."""
+-    tree = ast.parse(read(path))
+-    ann = config_annotations(tree)
+-    defaults = config_defaults(tree)
+-    main_kw = _main_config_kwargs(tree)
+-
+-    effective = dict(defaults)
+-    unknown: List[str] = []
+-    for key, node in main_kw.items():
+-        if key not in ann:
+-            unknown.append(key)
+-            continue
+-        effective[key] = _literal_or_factory(node)
+-    return effective, ann, unknown
+-
+-
+-def find_profile(tree: ast.Module) -> Optional[Dict[str, Any]]:
+-    """``CLASSIC_PROFILE: Dict[str, Any] = {...}`` del pipeline, o None."""
++def find_overrides(tree: ast.Module) -> Optional[Dict[str, Any]]:
++    """``CLASSIC_OVERRIDES`` del pipeline, o None si no existe / no es literal."""
+     for node in ast.walk(tree):
+-        if isinstance(node, ast.Assign) and any(
+-            isinstance(t, ast.Name) and t.id == "CLASSIC_PROFILE" for t in node.targets
+-        ):
+-            src = node.value
+-        elif (
+-            isinstance(node, ast.AnnAssign)
+-            and isinstance(node.target, ast.Name)
+-            and node.target.id == "CLASSIC_PROFILE"
+-        ):
+-            src = node.value
++        if isinstance(node, ast.Assign):
++            targets = node.targets
++        elif isinstance(node, ast.AnnAssign):
++            targets = [node.target]
+         else:
+             continue
++        if not any(
++            isinstance(t, ast.Name) and t.id == "CLASSIC_OVERRIDES" for t in targets
++        ):
++            continue
+         try:
+-            value = ast.literal_eval(src)  # type: ignore[arg-type]
+-        except (ValueError, SyntaxError):
++            value = ast.literal_eval(node.value)
++        except (ValueError, SyntaxError, TypeError):
+             return None
+         return value if isinstance(value, dict) else None
+     return None
+ 
+ 
++def find_function(tree: ast.Module, name: str) -> Optional[ast.AST]:
++    for node in ast.walk(tree):
++        if (
++            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
++            and node.name == name
++        ):
++            return node
++    return None
++
++
++def _mentions_name(node: ast.AST, name: str) -> bool:
++    return any(isinstance(sub, ast.Name) and sub.id == name for sub in ast.walk(node))
++
++
++def _exits_with_two(node: ast.AST) -> bool:
++    """True si el cuerpo llama a ``exit(2)`` / ``SystemExit(2)`` (o lo eleva)."""
++    for sub in ast.walk(node):
++        if not isinstance(sub, ast.Call):
++            continue
++        func = sub.func
++        fname = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
++        if fname not in ("exit", "SystemExit") or not sub.args:
++            continue
++        arg = sub.args[0]
++        if isinstance(arg, ast.Constant) and arg.value == 2:
++            return True
++    return False
++
++
++def sets_pseudocount(node: ast.AST) -> bool:
++    """True si el cuerpo escribe ``pseudocount`` (atributo, item, kw o setattr)."""
++    for sub in ast.walk(node):
++        if (
++            isinstance(sub, ast.Attribute)
++            and sub.attr == "pseudocount"
++            and isinstance(sub.ctx, ast.Store)
++        ):
++            return True
++        if isinstance(sub, ast.Subscript) and isinstance(sub.ctx, ast.Store):
++            sl = sub.slice
++            if isinstance(sl, ast.Constant) and sl.value == "pseudocount":
++                return True
++        if isinstance(sub, ast.Call):
++            if any(kw.arg == "pseudocount" for kw in sub.keywords):
++                return True
++            func = sub.func
++            fname = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
++            if fname == "setattr" and len(sub.args) >= 2:
++                arg = sub.args[1]
++                if isinstance(arg, ast.Constant) and arg.value == "pseudocount":
++                    return True
++    return False
++
++
+ # ---------------------------------------------------------------------------
+-# Comprobaciones
++# Tipos
+ # ---------------------------------------------------------------------------
+ _ALLOWED: Dict[str, Tuple[type, ...]] = {
+     "bool": (bool,),
+@@ -262,18 +268,21 @@
+     return None
+ 
+ 
++# ---------------------------------------------------------------------------
++# Presentacion
++# ---------------------------------------------------------------------------
+ def fmt(value: Any) -> str:
+     if isinstance(value, bool):
+         return "True" if value else "False"
+     if isinstance(value, float):
+-        return f"{value:g}"
++        return repr(value)
+     if isinstance(value, list):
+         return "[" + ", ".join(fmt(v) for v in value) + "]"
+     return str(value)
+ 
+ 
+ def render_table(rows: List[Tuple[str, str, str, str]]) -> str:
+-    header = ("clave", "fork", "pipeline", "perfil classic", "igual al fork")
++    header = ("clave", "perfil classic", "default del pipeline", "origen")
+     widths = [len(h) for h in header]
+     for row in rows:
+         for i, cell in enumerate(row):
+@@ -285,175 +294,239 @@
+     return "\n".join(lines)
+ 
+ 
++def _rel(path: Path) -> str:
++    try:
++        return str(path.resolve().relative_to(ROOT))
++    except ValueError:
++        return str(path)
++
++
++def _fail(message: str) -> int:
++    print(f"[X] {message}")
++    print("=> estado: FALLO")
++    return 1
++
++
+ def main(argv: Optional[List[str]] = None) -> int:
+     ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--json", action="store_true", help="imprime el informe JSON")
++    ap.add_argument("--quiet", action="store_true", help="solo errores y tabla")
+     ap.add_argument(
+-        "--json", action="store_true", help="imprime solo el JSON del perfil"
++        "--pipeline",
++        type=Path,
++        default=DEFAULT_PIPELINE,
++        help="ruta de main_workflow.py (default: %(default)s)",
+     )
+-    ap.add_argument("--quiet", action="store_true", help="solo errores y avisos")
+     args = ap.parse_args(argv)
+ 
+-    ok = True
++    pipeline: Path = args.pipeline
+     problems: List[str] = []
+ 
+     def say(msg: str) -> None:
+-        if not args.quiet:
++        # Con --json no se mezcla prosa con el payload (la linea de estado si va).
++        if not args.quiet and not args.json:
+             print(msg)
+ 
+-    if not PIPELINE.exists():
+-        print(f"[X] no encuentro {PIPELINE}")
+-        return 1
+-
+-    tree = ast.parse(read(PIPELINE))
+-    ann = config_annotations(tree)
+-    pipe_eff, _, _ = effective_config(PIPELINE)
+-    fork_eff, _, fork_unknown = (
+-        effective_config(FORK) if FORK.exists() else ({}, {}, [])
+-    )
+-
+-    implemented = find_profile(tree)
+-    profile = implemented if implemented is not None else CANONICAL_CLASSIC_PROFILE
+-    source = (
+-        "CLASSIC_PROFILE (implementado)"
+-        if implemented is not None
+-        else "CANONICAL_CLASSIC_PROFILE (diff pendiente)"
+-    )
+-
+-    say(f"-> pipeline : {PIPELINE.relative_to(ROOT)} ({len(ann)} campos en Config)")
+-    say(f"-> fork     : {FORK.relative_to(ROOT)} ({len(fork_eff)} campos efectivos)")
+-    say(f"-> perfil   : {source}")
+-
+-    # -- 1. claves del perfil contra Config --------------------------------
+-    missing = [k for k in profile if k not in ann]
+-    pending = [k for k in missing if k in PENDING_DIFF_KEYS]
+-    fatal_missing = [k for k in missing if k not in PENDING_DIFF_KEYS]
+-
+-    for key in profile:
+-        if key in ann:
+-            why = type_problem(ann[key], profile[key])
+-            if why:
+-                ok = False
+-                problems.append(f"{key}: {why} (anotacion {ann[key]})")
+-        elif key in PENDING_DIFF_KEYS:
+-            why = type_problem(PENDING_DIFF_KEYS[key], profile[key])
+-            if why:
+-                ok = False
+-                problems.append(f"{key} (pendiente): {why}")
++    if not pipeline.exists():
++        return _fail(f"no encuentro {pipeline}")
++
++    try:
++        tree = ast.parse(read(pipeline))
++    except SyntaxError as exc:
++        return _fail(f"no puedo parsear {pipeline}: {exc}")
++
++    annotations = config_annotations(tree)
++    defaults = config_defaults(tree)
++    uc_defaults = class_defaults(tree, "UCBuilderConfig")
++
++    # -- 1. CLASSIC_OVERRIDES: existe, claves exactas ----------------------
++    overrides = find_overrides(tree)
++    if overrides is None:
++        return _fail(
++            "no existe CLASSIC_OVERRIDES (o no es un dict literal) en "
++            f"{_rel(pipeline)}; el contrato usa CLASSIC_OVERRIDES y no hay copia "
++            "canonica de respaldo"
++        )
++
++    say(f"-> pipeline : {_rel(pipeline)} ({len(annotations)} campos en Config)")
++    say(f"-> perfil   : CLASSIC_OVERRIDES ({len(overrides)} claves)")
++
++    expected_keys = set(EXPECTED_OVERRIDES)
++    got_keys = set(overrides)
++    missing = sorted(expected_keys - got_keys)
++    extra = sorted(got_keys - expected_keys)
++    if missing:
++        problems.append(f"CLASSIC_OVERRIDES: faltan claves {missing}")
++    if extra:
++        problems.append(f"CLASSIC_OVERRIDES: sobran claves {extra} (deriva)")
++    if not missing and not extra:
++        say(
++            f"[ok] CLASSIC_OVERRIDES: {len(expected_keys)}/{len(expected_keys)} "
++            "claves esperadas, sin claves de mas ni de menos"
++        )
++
++    value_drift = [
++        f"{key}={fmt(overrides[key])} (esperado {fmt(EXPECTED_OVERRIDES[key])})"
++        for key in sorted(expected_keys & got_keys)
++        if overrides[key] != EXPECTED_OVERRIDES[key]
++    ]
++    if value_drift:
++        problems.append(
++            "CLASSIC_OVERRIDES: valores fuera del contrato -> " + "; ".join(value_drift)
++        )
++
++    # -- 2. cada clave es campo de Config con tipo compatible -------------
++    type_ok = 0
++    for key in sorted(expected_keys & got_keys):
++        if key not in annotations:
++            problems.append(f"{key}: no existe como campo de Config")
++            continue
++        why = type_problem(annotations[key], overrides[key])
++        if why:
++            problems.append(f"{key}: {why} (anotacion {annotations[key]})")
+         else:
+-            ok = False
+-            problems.append(f"{key}: no existe como campo de Config")
+-
+-    if not fatal_missing:
++            type_ok += 1
++    for key in extra:
++        if key not in annotations:
++            problems.append(f"{key}: clave extra que no existe como campo de Config")
++    if type_ok == len(expected_keys):
+         say(
+-            f"[ok] {len(profile) - len(pending)}/{len(profile)} claves existen en Config y el tipo encaja"
+-        )
+-    if pending:
++            f"[ok] {type_ok}/{len(expected_keys)} claves existen en Config y el "
++            "tipo encaja"
++        )
++
++    # -- 3. apply_classic_mode: firma + guarda --optimize-only ------------
++    fn = find_function(tree, "apply_classic_mode")
++    n_params = 0
++    has_optimize_only = False
++    exits_two = False
++    touches_epsilon = False
++    if fn is None:
++        problems.append("no existe apply_classic_mode(config, uc_config)")
++    else:
++        a = fn.args  # type: ignore[attr-defined]
++        n_params = len(a.posonlyargs) + len(a.args) + len(a.kwonlyargs)
++        has_optimize_only = _mentions_name(fn, "_OPTIMIZE_ONLY")
++        exits_two = _exits_with_two(fn)
++        touches_epsilon = sets_pseudocount(fn)
++
++        if n_params == 2:
++            say("[ok] apply_classic_mode con 2 parametros (config, uc_config)")
++        else:
++            problems.append(
++                f"apply_classic_mode tiene {n_params} parametros, se esperaban 2"
++            )
++
++        if has_optimize_only and exits_two:
++            say(
++                "[ok] apply_classic_mode rechaza --optimize-only "
++                "(_OPTIMIZE_ONLY + exit 2)"
++            )
++        else:
++            falta = []
++            if not has_optimize_only:
++                falta.append("_OPTIMIZE_ONLY")
++            if not exits_two:
++                falta.append("SystemExit/exit 2")
++            problems.append("apply_classic_mode no menciona " + " ni ".join(falta))
++
++    # -- 3b. no fija pseudocount (epsilon queda en el default) ------------
++    if fn is not None:
++        if touches_epsilon:
++            problems.append(
++                "apply_classic_mode fija pseudocount; el perfil debe dejarlo en "
++                "el default 0.0 (docs/design_v5/CLASSIC_MODE.md seccion 3)"
++            )
++        else:
++            say(
++                "[ok] apply_classic_mode no fija pseudocount (queda en el default "
++                "del pipeline)"
++            )
++
++    # -- 4. valores historicos: defaults del pipeline, no del perfil ------
++    leaked = [key for key in HISTORICAL_DEFAULTS if key in overrides]
++    if leaked:
++        problems.append(
++            "valores historicos que NO deben ser overrides del perfil: "
++            + ", ".join(leaked)
++        )
++    absent = [
++        key
++        for key in HISTORICAL_DEFAULTS
++        if key not in defaults and key not in uc_defaults and key not in overrides
++    ]
++    if absent:
++        problems.append(
++            "valores historicos sin default en el pipeline: " + ", ".join(absent)
++        )
++    if not leaked and not absent:
+         say(
+-            f"[!] {len(pending)} clave(s) pendientes del diff: {', '.join(sorted(pending))} "
+-            "(ver docs/design_v5/MODE_CLASSIC.md, seccion 5)"
+-        )
+-
+-    # -- 2. invariantes del perfil ----------------------------------------
+-    if profile.get("cdh_enforce_min_leaf") is False:
+-        say("[ok] cdh_enforce_min_leaf=False (sin piso duro de hoja)")
+-    else:
+-        ok = False
+-        problems.append("cdh_enforce_min_leaf debe ser False en el perfil classic")
+-
+-    innovation = {
+-        "classification_mode": "wc_only",
+-        "optimize": False,
+-        "use_liminal_projection": False,
+-        "auto_calibrate_uce_size": False,
+-        "use_ppmi": False,
+-    }
+-    for key, expected in innovation.items():
+-        got = profile.get(key, "<ausente>")
+-        if got == expected:
+-            say(f"[ok] {key}={fmt(expected)} (innovacion desactivada)")
++            f"[ok] {len(HISTORICAL_DEFAULTS)} valores historicos son defaults del "
++            "pipeline, no overrides del perfil"
++        )
++
++    # -- 5. tabla de valores EFECTIVOS ------------------------------------
++    keys = sorted(overrides) + [k for k in HISTORICAL_DEFAULTS if k not in overrides]
++    rows: List[Tuple[str, str, str, str]] = []
++    for key in keys:
++        is_override = key in overrides
++        if is_override:
++            effective = overrides[key]
+         else:
+-            ok = False
+-            problems.append(
+-                f"{key} debe ser {fmt(expected)} en classic, es {fmt(got)!r}"
+-            )
+-
+-    # -- 3. tabla comparativa ---------------------------------------------
+-    rows: List[Tuple[str, str, str, str]] = []
+-    same, differ, n_a = 0, 0, 0
+-    for key in sorted(profile):
+-        fork_v = fmt(fork_eff[key]) if key in fork_eff else "—"
+-        pipe_v = fmt(pipe_eff[key]) if key in pipe_eff else "—"
+-        if key in fork_eff:
+-            eq = fork_eff[key] == profile[key]
+-        elif key in FORK_ABSENT_EQUIVALENT:
+-            eq = FORK_ABSENT_EQUIVALENT[key][0]
+-        else:
+-            eq = None
+-        if eq is True:
+-            same += 1
+-        elif eq is False:
+-            differ += 1
+-        else:
+-            n_a += 1
++            effective = defaults.get(key, uc_defaults.get(key, _MISSING))
++        default_v = defaults.get(key, uc_defaults.get(key, _MISSING))
+         rows.append(
+             (
+                 key,
+-                fork_v,
+-                pipe_v,
+-                fmt(profile[key]),
+-                "si" if eq is True else ("no" if eq is False else "n/a"),
++                fmt(effective) if effective is not _MISSING else "<ausente>",
++                fmt(default_v) if default_v is not _MISSING else "<ausente>",
++                "override" if is_override else "default",
+             )
+         )
+ 
+-    if not args.json:
++    if not args.json and not args.quiet:
+         print()
+         print(render_table(rows))
+         print()
+ 
+-    # -- 4. estado del fork ------------------------------------------------
+-    if fork_unknown:
+-        say(
+-            f"[!] el fork NO es ejecutable: Config() rechaza {len(fork_unknown)} kwarg(s) "
+-            f"que su __main__ pasa (p.ej. {', '.join(sorted(fork_unknown)[:3])}...)"
+-        )
+-    if differ:
+-        say(
+-            f"[!] {differ} clave(s) del perfil NO coinciden con el fork: "
+-            "son desviaciones deliberadas (paper) o bugs del fork; ver doc."
+-        )
+-    say(f"[ok] {same} clave(s) coinciden con el fork, {n_a} son n/a")
+-
+-    # -- 5. salida ---------------------------------------------------------
++    # -- 6. informe y estado ----------------------------------------------
++    ok = not problems
+     payload = {
+-        "profile": {k: profile[k] for k in sorted(profile)},
+-        "n_overrides": len(profile),
+-        "source": "implemented" if implemented is not None else "canonical",
+-        "diff_pending": implemented is None,
+-        "pending_keys": sorted(pending),
+-        "fork_runnable": not fork_unknown,
+-        "fork_unknown_kwargs": sorted(fork_unknown),
+-        "matches_fork": same,
+-        "differs_from_fork": differ,
++        "ok": ok,
++        "estado": "OK" if ok else "FALLO",
++        "pipeline": _rel(pipeline),
++        "expected_overrides": {
++            k: EXPECTED_OVERRIDES[k] for k in sorted(EXPECTED_OVERRIDES)
++        },
++        "classic_overrides": {k: overrides[k] for k in sorted(overrides)},
++        "missing_keys": missing,
++        "extra_keys": extra,
++        "value_drift": value_drift,
++        "apply_classic_mode": {
++            "found": fn is not None,
++            "n_params": n_params,
++            "mentions_optimize_only": has_optimize_only,
++            "exits_2": exits_two,
++            "sets_pseudocount": touches_epsilon,
++        },
++        "effective_values": [
++            {
++                "clave": key,
++                "perfil_classic": classic_v,
++                "default_pipeline": default_v,
++                "origen": origin,
++            }
++            for key, classic_v, default_v, origin in rows
++        ],
++        "problems": problems,
+     }
+-    print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+-
+-    if implemented is not None:
+-        if implemented != CANONICAL_CLASSIC_PROFILE:
+-            ok = False
+-            problems.append(
+-                "CLASSIC_PROFILE del pipeline != CANONICAL_CLASSIC_PROFILE (deriva)"
+-            )
+-
+-    if problems:
+-        for p in problems:
+-            print(f"[X] {p}")
+-        print("=> estado: FALLO")
+-        return 1
+-
+-    print(
+-        f"=> estado: {'APLICADO' if implemented is not None else 'PENDIENTE (perfil canonico valido)'}"
+-    )
+-    return 0
++    if args.json:
++        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
++
++    for problem in problems:
++        print(f"[X] {problem}")
++    print(f"=> estado: {'OK' if ok else 'FALLO'}")
++    return 0 if ok else 1
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/test_mode_classic.py b/tests/test_mode_classic.py
+--- a/tests/test_mode_classic.py
++++ b/tests/test_mode_classic.py
+@@ -393,3 +393,59 @@
+     )
+     assert proc.returncode == 0, proc.stdout + proc.stderr
+     assert "=> estado:" in proc.stdout
++    # El checker ya valida el contrato real: nada de "perfil pendiente".
++    assert "PENDIENTE" not in proc.stdout
++    assert "CLASSIC_OVERRIDES" in proc.stdout
++
++
++def _source_without_module_assignment(name: str) -> str:
++    """``SOURCE`` sin la asignacion de modulo ``name`` (p.ej. CLASSIC_OVERRIDES)."""
++    for node in TREE.body:
++        target = None
++        if isinstance(node, ast.Assign) and len(node.targets) == 1:
++            target = node.targets[0]
++        elif isinstance(node, ast.AnnAssign):
++            target = node.target
++        if isinstance(target, ast.Name) and target.id == name:
++            lines = SOURCE.splitlines(keepends=True)
++            return "".join(lines[: node.lineno - 1] + lines[node.end_lineno :])
++    raise AssertionError(f"no existe {name} a nivel de modulo")
++
++
++# Forma minima del pipeline DESPUES de borrar el bloque CLASSIC_OVERRIDES. Se
++# usa un fichero corto a proposito: parsear las 11.5k lineas reales cuesta ~1 s
++# en este entorno y el test debe quedar < 2 s.
++_STRIPPED_PIPELINE = """class Config:
++    run_mode: str = "modern"
++
++
++def apply_classic_mode(config, uc_config):
++    return config, uc_config, CLASSIC_OVERRIDES
++"""
++
++
++def test_checker_fails_without_classic_overrides(tmp_path):
++    """Guard: sin CLASSIC_OVERRIDES el checker falla (no hay fallback silencioso).
++
++    ``--pipeline`` apunta a la forma que deja el bloque borrado. El pipeline real
++    si declara la asignacion y el helper la quita del texto; aqui solo se valida
++    el guard, sin importar ``reii`` ni parsear el fichero completo. < 2 s.
++    """
++    stripped = _source_without_module_assignment("CLASSIC_OVERRIDES")
++    assert "CLASSIC_OVERRIDES: Dict[str, Any] = {" not in stripped
++
++    pipeline = tmp_path / "main_workflow.py"
++    pipeline.write_text(_STRIPPED_PIPELINE, encoding="utf-8")
++
++    proc = subprocess.run(
++        [sys.executable, str(CHECKER), "--pipeline", str(pipeline)],
++        capture_output=True,
++        text=True,
++        encoding="utf-8",
++        errors="replace",
++        timeout=20,
++        cwd=str(ROOT),
++    )
++    assert proc.returncode != 0, proc.stdout + proc.stderr
++    assert "CLASSIC_OVERRIDES" in proc.stdout
++    assert "=> estado:" in proc.stdout

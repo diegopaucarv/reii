@@ -385,7 +385,25 @@ def _save_agent_unified(entry: Dict[str, Any]) -> None:
 SUBCAT_FILTER_KEY = "subcat_filters"  # dict: {category_key: value_or_None}
 
 
-def _set_multiple_filters(tab_name: str, filters_dict: dict):
+def _safe_rerun(scope: str = "app") -> None:
+    """Rerun the app, or only the current fragment when that is allowed.
+
+    ``st.rerun(scope="fragment")`` raises when called during a full-app run
+    (even from inside a fragment), so fall back to a normal rerun there.
+    """
+    if scope != "fragment":
+        st.rerun()
+        return
+
+    from streamlit.errors import StreamlitAPIException
+
+    try:
+        st.rerun(scope="fragment")
+    except StreamlitAPIException:
+        st.rerun()
+
+
+def _set_multiple_filters(tab_name: str, filters_dict: dict, scope: str = "app"):
     """
     Reemplaza los filtros actuales por un grupo nuevo de filtros.
     """
@@ -393,7 +411,7 @@ def _set_multiple_filters(tab_name: str, filters_dict: dict):
     st.session_state[SUBCAT_FILTER_KEY] = clean_filters
     st.session_state["_pending_tab_a"] = tab_name
 
-    st.rerun()
+    _safe_rerun(scope)
 
 
 st.markdown(
@@ -543,15 +561,18 @@ def _load_discourse(_version: str) -> Dict[str, Any]:
 
 _version = _wf_version()
 data = _load_snapshot(_version)
-# cache_resource returns the SAME shared object across sessions; copy the
-# parts we mutate below so we never write into the cached snapshot.
-data = {**data, "uces": [dict(u) for u in data["uces"]]}
-disc = _load_discourse(_discourse_version())
+_disc_version = _discourse_version()
+disc = _load_discourse(_disc_version)
 annotations_by_uce = disc.get("annotations_by_uce", {})
 
-# Merge discourse annotations into UCEs (legacy normalization, same as before)
+# Merge discourse annotations into UCEs (legacy normalization, same as before).
+# Copy-on-write: only clone the UCE dicts when there is something to merge, so
+# the common path does not shallow-copy the whole corpus on every full rerun.
 if annotations_by_uce:
-    for uce in data.get("uces", []):
+    # cache_resource returns the SAME shared object across sessions; copy the
+    # parts we mutate below so we never write into the cached snapshot.
+    data = {**data, "uces": [dict(u) for u in data["uces"]]}
+    for uce in data["uces"]:
         raw_anns = annotations_by_uce.get(uce.get("id"), [])
         normalized = []
         for ann in raw_anns:
@@ -572,6 +593,10 @@ if annotations_by_uce:
     data["annotations_by_uce"] = annotations_by_uce
 
 uces = data.get("uces", [])
+
+# O(1) exact-id index. Tab A used to rebuild this dict on every rerun; it is
+# also useful to other renderers (tab C).
+UCE_BY_ID: Dict[str, Dict] = {u["id"]: u for u in uces}
 
 
 @st.cache_data(show_spinner=False)
@@ -2301,9 +2326,9 @@ def _build_stats_from_uces(uces: List[Dict]) -> Dict:
     }
 
 
-@st.cache_data(show_spinner=False)
-def _build_stats_cached(_version: str, uce_ids_key: tuple) -> Dict:
-    _uces = _load_snapshot(_version).get("uces", [])
+@st.cache_data(show_spinner=False, max_entries=256)
+def _build_stats_cached(version: str, uce_ids_key: tuple) -> Dict:
+    _uces = _load_snapshot(version).get("uces", [])
     lookup = {u["id"]: u for u in _uces}
     filtered = [lookup[uid] for uid in uce_ids_key if uid in lookup]
     return _build_stats_from_uces(filtered)
@@ -8076,6 +8101,20 @@ def _complexity_radar(uces_all):
     return fig
 
 
+# Cached wrappers: the Tab A "Global" tab used to rebuild both Plotly figures
+# on every fragment rerun. Cache them by dataset version + visible UCE ids.
+@st.cache_data(show_spinner=False, max_entries=64)
+def _trajectory_charts_cached(version: str, uids_key: tuple, dm: bool):
+    _uces = [UCE_BY_ID[uid] for uid in uids_key if uid in UCE_BY_ID]
+    return _trajectory_charts(_uces)
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _complexity_radar_cached(version: str, uids_key: tuple, dm: bool):
+    _uces = [UCE_BY_ID[uid] for uid in uids_key if uid in UCE_BY_ID]
+    return _complexity_radar(_uces)
+
+
 # ══════════════════════════════════════════════════════════════
 # SUBCATEGORY FILTER STATE
 # ══════════════════════════════════════════════════════════════
@@ -8088,7 +8127,7 @@ def _get_subcat_filter() -> Dict[str, str]:
     return st.session_state[SUBCAT_FILTER_KEY]
 
 
-def _set_subcat_filter(cat: str, val: Optional[str]):
+def _set_subcat_filter(cat: str, val: Optional[str], scope: str = "app"):
     """
     Activa o desactiva un filtro individual.
     Es utilizado por los gráficos de barras (_filter_bar) para hacer 'toggle'.
@@ -8104,10 +8143,10 @@ def _set_subcat_filter(cat: str, val: Optional[str]):
         current.pop(cat, None)
 
     st.session_state[SUBCAT_FILTER_KEY] = current
-    st.rerun()
+    _safe_rerun(scope)
 
 
-def _set_multiple_filters(tab_name: str, filters_dict: dict):
+def _set_multiple_filters(tab_name: str, filters_dict: dict, scope: str = "app"):
     """
     Reemplaza los filtros actuales por un grupo nuevo de filtros.
     """
@@ -8115,10 +8154,10 @@ def _set_multiple_filters(tab_name: str, filters_dict: dict):
     st.session_state[SUBCAT_FILTER_KEY] = clean_filters
     st.session_state["_pending_tab_a"] = tab_name
 
-    st.rerun()
+    _safe_rerun(scope)
 
 
-def _clear_subcat_filters():
+def _clear_subcat_filters(scope: str = "app"):
     """Clear all subcategory filters and related UI selections."""
     st.session_state[SUBCAT_FILTER_KEY] = {}
     # Clear coreference selection
@@ -8128,7 +8167,7 @@ def _clear_subcat_filters():
     st.session_state.pred_filter_voice = "Todas"
     st.session_state.pred_filter_role = "Todos"
     st.session_state.pred_filter_negated = "Ambos"
-    st.rerun()
+    _safe_rerun(scope)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -8161,12 +8200,12 @@ def _filter_bar(
             df = pd.concat([df, pad], ignore_index=True)
 
     df = df.sort_values(count_col, ascending=True)
-    colors = [
-        f"rgba({_hex_to_rgb(color)},0.9)"
-        if (active is None or str(row[raw_val_col]) == active)
-        else f"rgba({_hex_to_rgb(color)},0.25)"
-        for _, row in df.iterrows()
-    ]
+    rgba_hi = f"rgba({_hex_to_rgb(color)},0.9)"
+    rgba_lo = f"rgba({_hex_to_rgb(color)},0.25)"
+    if active is None:
+        colors = [rgba_hi] * len(df)
+    else:
+        colors = [rgba_hi if str(v) == active else rgba_lo for v in df[raw_val_col]]
 
     fig = go.Figure(
         go.Bar(
@@ -8200,7 +8239,7 @@ def _filter_bar(
     if event and event.get("selection", {}).get("points"):
         pt = event["selection"]["points"][0]
         raw = df.iloc[pt["point_index"]][raw_val_col]
-        _set_subcat_filter(filter_cat, str(raw))
+        _set_subcat_filter(filter_cat, str(raw), scope="fragment")
 
     # Active filter badge
     if active:
@@ -8209,7 +8248,7 @@ def _filter_bar(
             st.caption(f"Filtrando: **{active}**")
         with col2:
             if st.button("✕", key=f"clear_{filter_cat}", help="Quitar filtro"):
-                _set_subcat_filter(filter_cat, None)
+                _set_subcat_filter(filter_cat, None, scope="fragment")
 
 
 def _hex_to_rgb(hex_color: str) -> str:
@@ -8254,7 +8293,8 @@ def tab_global(stats: Dict, uces_all: List[Dict]):
     )
 
     # ── Trajectory multi-panel (replaces single topic-shift chart) ──
-    traj_fig = _trajectory_charts(uces_all)
+    _uids_key = tuple(u.get("id", "") for u in uces_all)
+    traj_fig = _trajectory_charts_cached(_version, _uids_key, _dm)
     if traj_fig:
         st.plotly_chart(traj_fig, width="stretch", config={"displayModeBar": False})
         st.caption(
@@ -8265,7 +8305,9 @@ def tab_global(stats: Dict, uces_all: List[Dict]):
 
     st.divider()
     st.plotly_chart(
-        _complexity_radar(uces_all), width="stretch", config={"displayModeBar": False}
+        _complexity_radar_cached(_version, _uids_key, _dm),
+        width="stretch",
+        config={"displayModeBar": False},
     )
     st.caption(
         "Radar normalizado. Los valores representan la media del corpus filtrado."
@@ -9166,12 +9208,18 @@ def tab_cuantificadores(stats: Dict, uces_all: List[Dict]):
 # ══════════════════════════════════════════════════════════════
 
 
-def _uce_matches_subcat_filters(uce: Dict) -> bool:
+def _uce_matches_subcat_filters(
+    uce: Dict, filters: Optional[Dict[str, str]] = None
+) -> bool:
     """
     Returns True if the UCE contains at least one annotation matching ALL active subcat filters.
     Filters are ANDed across categories, ORed within (i.e., any verb with mood=Ind counts).
+
+    ``filters`` can be passed in when the caller already read the active filters, so
+    a paragraph with N UCEs doesn't hit session_state N times.
     """
-    filters = _get_subcat_filter()
+    if filters is None:
+        filters = _get_subcat_filter()
     if not filters:
         return True  # no filter active
 
@@ -9300,9 +9348,17 @@ def reg_pill_html(registro: Optional[str]) -> str:
 
 
 def _entity_color(rep: str) -> str:
-    """Deterministic color per coreference entity."""
+    """Deterministic color per coreference entity.
+
+    ``hash()`` is salted per process, so colors used to change across restarts
+    and differ between workers. A tiny order-dependent checksum keeps the
+    mapping stable everywhere.
+    """
     palette = ["#2dd4bf", "#f97b6b", "#a78bfa", "#fbbf24", "#5b9cf6", "#4ade80"]
-    return palette[hash(rep) % len(palette)]
+    seed = 0
+    for i, ch in enumerate(rep):
+        seed = (seed * 131 + ord(ch) * (i + 1)) & 0x7FFFFFFF
+    return palette[seed % len(palette)]
 
 
 def _predicate_cluster_color(cluster_id) -> str:
@@ -9370,6 +9426,9 @@ def _clear_specific_filter(filter_key: str):
         st.rerun()
 
 
+_UNSET_HIGHLIGHT = object()
+
+
 def render_annotated_uce(
     uce: Dict,
     active_layers: set,
@@ -9377,6 +9436,7 @@ def render_annotated_uce(
     theme: Dict = T,
     cls_colors: List = class_colors,
     search: str = "",
+    highlight_entity: Any = _UNSET_HIGHLIGHT,
 ) -> str:
     texto = uce.get("texto", "")
     texto_len = len(texto)
@@ -9624,7 +9684,8 @@ def render_annotated_uce(
 
     # --- 9. Correferencias ---
     if "coref" in active_layers:
-        highlight_entity = st.session_state.get("highlight_entity", None)
+        if highlight_entity is _UNSET_HIGHLIGHT:
+            highlight_entity = st.session_state.get("highlight_entity", None)
         for chain in uce.get("coref_chains", []):
             rep = chain.get("representative", "")
             color = (
@@ -9747,6 +9808,27 @@ def render_annotated_uce(
     return _highlight_search(result, search) if search else result
 
 
+# Cached per-UCE HTML. Search highlighting is applied by the caller so typing in
+# the search box doesn't create a cache entry per keystroke. ``version`` and
+# ``discourse_version`` partition the cache when the underlying data changes.
+@st.cache_data(show_spinner=False, max_entries=2048)
+def _annotated_uce_html_cached(
+    version: str,
+    discourse_version: str,
+    uce_id: str,
+    layers_key: tuple,
+    highlight_entity: Optional[str],
+) -> str:
+    uce = UCE_BY_ID.get(uce_id)
+    if not uce:
+        return ""
+    return render_annotated_uce(
+        uce,
+        set(layers_key),
+        highlight_entity=highlight_entity,
+    )
+
+
 # ══════════════════════════════════════════════════════════════
 # PARAGRAPH CARD RENDERER
 # ══════════════════════════════════════════════════════════════
@@ -9761,9 +9843,17 @@ def render_paragraph_card(
     search: str = "",
 ):
     is_stable = any(u.get("is_stable", False) for u in par_uces)
-    matching = [u for u in par_uces if _uce_matches_subcat_filters(u)]
-    n_match = len(matching)
+    filters = _get_subcat_filter()
     n_total = len(par_uces)
+    if filters:
+        matched_flags = {
+            u.get("id", ""): _uce_matches_subcat_filters(u, filters) for u in par_uces
+        }
+        n_match = sum(matched_flags.values())
+    else:
+        # Sin filtros activos toda UCE coincide: evitar el recorrido O(UCEs).
+        matched_flags = {}
+        n_match = n_total
     dim_par = n_match == 0
 
     ts = par_uces[0].get("topic_shift_prev", 0)
@@ -9781,7 +9871,7 @@ def render_paragraph_card(
         'border-radius:8px;padding:1px 5px;margin-left:6px;">inestable</span>'
     )
     filter_badge = ""
-    if _get_subcat_filter():
+    if filters:
         filter_badge = (
             f'<span style="font-size:9px;color:#4ade80;border:1px solid #166534;'
             f'border-radius:8px;padding:1px 5px;margin-left:6px;">{n_match}/{n_total} UCEs</span>'
@@ -9800,8 +9890,10 @@ def render_paragraph_card(
             return
 
         html_parts = []
+        layers_key = tuple(sorted(active_layers))
+        highlight_entity = st.session_state.get("highlight_entity", None)
         for uce in par_uces:
-            is_match = _uce_matches_subcat_filters(uce)
+            is_match = matched_flags.get(uce.get("id", ""), True)
             cid = uce.get("cluster_id")
             classified = cid is not None and cid >= 0
             opacity = "1" if is_match else "0.28"
@@ -9821,7 +9913,16 @@ def render_paragraph_card(
                 )
                 border_style = ""
 
-            annotated_html = render_annotated_uce(uce, active_layers, search=search)
+            base_html = _annotated_uce_html_cached(
+                _version,
+                _disc_version,
+                uce.get("id", ""),
+                layers_key,
+                highlight_entity,
+            )
+            annotated_html = (
+                _highlight_search(base_html, search) if search else base_html
+            )
             html_parts.append(
                 f'<span style="{border_style}opacity:{opacity};">'
                 f"{siglum}{annotated_html}</span> "
@@ -9881,7 +9982,7 @@ def render_paragraph_card(
             st.session_state.setdefault("last_card_click_ts", {})[f"card_{par_key}"] = (
                 click.get("ts")
             )
-            _set_multiple_filters(click["tab"], click["filters"])
+            _set_multiple_filters(click["tab"], click["filters"], scope="fragment")
 
 
 TRAIT_COLORS: Dict[str, str] = {
@@ -11011,19 +11112,40 @@ tab_a, tab_b, tab_c, tab_d, tab_e, tab_f = st.tabs(  # [quality-patch] tab
 @st.fragment
 def _render_tab_a():
     all_doc_ids_a = sorted(origen_index.keys())
-    # ── Barra superior ─────────────────────────────────────────
+    if not all_doc_ids_a:
+        st.info("No hay documentos en el corpus.")
+        return
+
+    # One document at a time (plus an explicit "all" option). The selected doc
+    # drives every other mechanism in this tab; keeping it in session_state
+    # preserves the last choice across reruns.
+    _ALL_DOCS = "⧉ Todos los documentos"
+    doc_options = [_ALL_DOCS] + all_doc_ids_a
+    if st.session_state.get("tab_a_doc") not in doc_options:
+        st.session_state["tab_a_doc"] = all_doc_ids_a[0]
+
+    # ── Barra superior ────────────────────────────────────────
     top_cols = st.columns([3, 5, 2])
     with top_cols[0]:
-        selected_docs = st.multiselect(
-            "Documents",
-            options=all_doc_ids_a,
-            default=None,
+        selected_doc = st.selectbox(
+            "Document",
+            options=doc_options,
+            format_func=lambda d: "Todos los documentos" if d == _ALL_DOCS else str(d),
             label_visibility="collapsed",
-            placeholder="Filter by document…",
-            key="tab_a_docs",
+            key="tab_a_doc",
         )
-        if not selected_docs:
-            selected_docs = all_doc_ids_a
+        selected_docs = all_doc_ids_a if selected_doc == _ALL_DOCS else [selected_doc]
+
+    # Al cambiar de documento, limpiar selecciones que pertenecían al anterior
+    # (entidad coref, lema predicativo, filtros de subcategoría). Sin esto el
+    # resto de mecanismos de la pestaña arrastraba estado de otro documento.
+    if st.session_state.get("tab_a_doc_prev") != selected_doc:
+        st.session_state["tab_a_doc_prev"] = selected_doc
+        st.session_state["coref_selected_entity"] = None
+        st.session_state.pop("coref_entity_pills", None)
+        st.session_state["pred_selected_lemma"] = None
+        st.session_state.pop("pred_lemma_select", None)
+        st.session_state[SUBCAT_FILTER_KEY] = {}
     with top_cols[1]:
         search_query = st.text_input(
             "Search",
@@ -11057,50 +11179,34 @@ def _render_tab_a():
             )
         )
     # Build UCE list filtered by selected documents
-    uce_lookup_a = {u["id"]: u for u in uces}
     all_uces_filtered: List[Dict] = []
     for doc_key in selected_docs:
         for uid in origen_index.get(doc_key, []):
-            u = uce_lookup_a.get(uid)
+            u = UCE_BY_ID.get(uid)
             if u:
                 all_uces_filtered.append(u)
-    # ── PRECOMPUTE SHARED DATA STRUCTURES ──────────────────────────
-    # Chain index for coreference (used by both columns)
-    chain_index: Dict[str, Dict] = {}
-    for u in all_uces_filtered:
-        for chain in u.get("coref_chains", []):
-            rep = chain.get("representative", "").strip()
-            if not rep:
-                continue
-            if rep not in chain_index:
-                chain_index[rep] = {"mentions": set(), "uce_ids": []}
-            chain_index[rep]["uce_ids"].append(u["id"])
-            for m in chain.get("mentions", []):
-                txt = m.get("text", "").strip()
-                if txt:
-                    chain_index[rep]["mentions"].add(txt)
-    # All predicate frames (used by both columns)
-    all_frames: List[Dict] = []
-    for u in all_uces_filtered:
-        for pf in u.get("predicate_frames", []):
-            frame = dict(pf) if not isinstance(pf, dict) else dict(pf)
-            frame["_uce_id"] = u.get("id", "")
-            all_frames.append(frame)
     # Now proceed with stats and column layout...
-    stats_a = dict(
-        _build_stats_cached(_version, tuple(u["id"] for u in all_uces_filtered))
-    )
-    stats_a["predicate_frames"] = data.get("predicate_frames", {})
+    ids_key_a = tuple(u["id"] for u in all_uces_filtered)
+    stats_a = _build_stats_cached(_version, ids_key_a)
 
-    def _pred_matches(f: dict) -> bool:
+    def _pred_state() -> tuple:
+        """Snapshot of the predicate sub-filters (read session_state once)."""
+        return (
+            st.session_state.get("pred_filter_voice", "Todas"),
+            st.session_state.get("pred_filter_role", "Todos"),
+            st.session_state.get("pred_filter_negated", "Ambos"),
+        )
+
+    def _pred_matches(f: dict, state: Optional[tuple] = None) -> bool:
         """
         Returns True if frame f passes the current predicate sub-filters.
-        Reads directly from st.session_state so it's always current.
-        Safe to call from both columns.
+
+        ``state`` can be supplied (see ``_pred_state``) so loops over thousands
+        of frames don't read session_state three times per frame.
         """
-        voice_filter = st.session_state.get("pred_filter_voice", "Todas")
-        role_filter = st.session_state.get("pred_filter_role", "Todos")
-        negated_filter = st.session_state.get("pred_filter_negated", "Ambos")
+        if state is None:
+            state = _pred_state()
+        voice_filter, role_filter, negated_filter = state
         if voice_filter != "Todas" and f.get("voice") != voice_filter:
             return False
         if role_filter != "Todos" and f.get("thematic_role") != role_filter:
@@ -11193,48 +11299,26 @@ def _render_tab_a():
                     f"{len(sorted_chains)} entidades correferentes — ordenadas por frecuencia</p>",
                     unsafe_allow_html=True,
                 )
-                # Columnas rep/count para cada cadena
-                max_uces = len(sorted_chains[0][1]["uce_ids"]) if sorted_chains else 1
-                for rep, info in sorted_chains:
-                    n_uces_chain = len(info["uce_ids"])
-                    n_mentions = len(info["mentions"])
-                    bar_pct = int(n_uces_chain / max_uces * 100)
-                    is_selected = st.session_state.get("coref_selected_entity") == rep
-                    entity_color = _entity_color(rep)
-                    # Card clicable por entidad
-                    label_html = (
-                        f'<div style="display:flex;align-items:center;gap:8px;'
-                        f"padding:6px 8px;border-radius:6px;margin-bottom:3px;cursor:pointer;"
-                        f"border:0.5px solid {'' + entity_color + '88' if is_selected else 'var(--border)'};"
-                        f'background:{"" + entity_color + "14" if is_selected else "transparent"};">'
-                        f'<div style="width:8px;height:8px;border-radius:50%;'
-                        f'background:{entity_color};flex-shrink:0"></div>'
-                        f'<span style="font-family:var(--font-mono);font-size:11px;'
-                        f"font-weight:{'600' if is_selected else '400'};"
-                        f'color:{"var(--text-hi)" if is_selected else "var(--text-mid)"};flex:1">'
-                        f"{sh(rep)}</span>"
-                        f'<div style="height:3px;width:60px;background:var(--bg-hover);'
-                        f'border-radius:2px;overflow:hidden">'
-                        f'<div style="height:100%;width:{bar_pct}%;background:{entity_color};'
-                        f'border-radius:2px"></div></div>'
-                        f'<span style="font-family:var(--font-mono);font-size:9px;'
-                        f'color:var(--text-low);min-width:32px;text-align:right">'
-                        f"{n_uces_chain} UCE</span>"
-                        f"</div>"
-                    )
-                    st.markdown(label_html, unsafe_allow_html=True)
-                    # Botón invisible de selección superpuesto
-                    btn_key = f"coref_btn_{rep}"
-                    if st.button(
-                        "✓" if is_selected else rep,
-                        key=btn_key,
-                        help=f"{n_mentions} tokens distintos · {n_uces_chain} UCEs",
-                    ):
-                        if is_selected:
-                            st.session_state.coref_selected_entity = None
-                        else:
-                            st.session_state.coref_selected_entity = rep
-                        st.rerun()
+                # Un solo widget reemplaza el par tarjeta + botón oculto que
+                # antes se creaba por entidad (2 elementos × N cadenas). Las
+                # pills conservan la selección única y escalan a cientos.
+                _ent_labels = {
+                    rep: f"{rep} · {len(info['uce_ids'])} UCE"
+                    for rep, info in sorted_chains
+                }
+                _ent_options = [rep for rep, _ in sorted_chains]
+                _prev_entity = st.session_state.get("coref_selected_entity")
+                picked_entity = st.pills(
+                    "Entidad correferente",
+                    options=_ent_options,
+                    format_func=lambda r: _ent_labels.get(r, r),
+                    selection_mode="single",
+                    default=_prev_entity if _prev_entity in chain_index else None,
+                    key="coref_entity_pills",
+                    label_visibility="collapsed",
+                )
+                if picked_entity != st.session_state.get("coref_selected_entity"):
+                    st.session_state["coref_selected_entity"] = picked_entity
                 # Detalle de menciones de la entidad seleccionada
                 sel_entity = st.session_state.get("coref_selected_entity")
                 if sel_entity and sel_entity in chain_index:
@@ -11270,11 +11354,19 @@ def _render_tab_a():
             # 1. Recopilar todos los frames de las UCEs visibles
             # ─────────────────────────────────────────────────
             all_frames: List[Dict] = []
+            frames_by_lemma: Dict[str, List[Dict]] = defaultdict(list)
             for u in all_uces_filtered:
                 for pf in u.get("predicate_frames", []):
-                    frame = dict(pf) if not isinstance(pf, dict) else pf
+                    # Always copy: the old branch handed back the snapshot dict
+                    # itself when it already was a dict, and then mutated it.
+                    frame = (
+                        dict(pf)
+                        if isinstance(pf, dict)
+                        else dict(getattr(pf, "__dict__", {}) or {})
+                    )
                     frame["_uce_id"] = u.get("id", "")
                     all_frames.append(frame)
+                    frames_by_lemma[frame.get("verb_lemma", "?")].append(frame)
             if not all_frames:
                 st.info("No hay marcos predicativos en los documentos seleccionados.")
             else:
@@ -11332,10 +11424,9 @@ def _render_tab_a():
                     label_visibility="collapsed",
                 )
                 st.session_state.pred_selected_lemma = sel_lemma
-                # Frames del lema seleccionado
-                lemma_frames = [
-                    f for f in all_frames if f.get("verb_lemma") == sel_lemma
-                ]
+                # Frames del lema seleccionado. Indexados al recolectar para
+                # no recorrer la lista completa de frames en cada rerun.
+                lemma_frames = frames_by_lemma.get(sel_lemma, [])
                 # 4. Filtros secundarios
                 # ─────────────────────
                 voices = ["Todas"] + sorted(
@@ -11378,7 +11469,10 @@ def _render_tab_a():
                     )
                 # 5. Aplicar filtros
                 # ─────────────────
-                filtered_frames = [f for f in lemma_frames if _pred_matches(f)]
+                pred_state = _pred_state()
+                filtered_frames = [
+                    f for f in lemma_frames if _pred_matches(f, pred_state)
+                ]
                 # 6. Estadísticas del lema bajo filtro
                 # ─────────────────────────────────────
                 if filtered_frames:
@@ -11427,11 +11521,14 @@ def _render_tab_a():
                         f'background:var(--bg-panel)">{rows_html}</div>',
                         unsafe_allow_html=True,
                     )
-                    # Sync filtro de subcat para que el corpus resalte
+                    # Sync filtro de subcat para que el corpus resalte.
+                    # `_set_subcat_filter` already reruns the fragment, so the
+                    # explicit `st.rerun()` that used to follow was unreachable.
                     current_pred_filter = _get_subcat_filter().get("predicate_lemma")
                     if current_pred_filter != sel_lemma:
-                        _set_subcat_filter("predicate_lemma", sel_lemma)
-                        st.rerun()
+                        _set_subcat_filter(
+                            "predicate_lemma", sel_lemma, scope="fragment"
+                        )
                 st.caption(f"{len(filtered_frames)} frames bajo filtro activo")
     # ══════════════════════════════════════════════════════════
     # COLUMNA DERECHA: corpus anotado
@@ -11465,8 +11562,7 @@ def _render_tab_a():
                     st.caption(f"Filtros activos: {filt_str}")
                 with c2:
                     if st.button("Limpiar filtros", key="clear_all_filters"):
-                        _clear_subcat_filters()
-                        st.stop()  # Prevent further execution after rerun request
+                        _clear_subcat_filters(scope="fragment")
             # ── DEFAULT CORPUS: all filtered UCEs ────────────────────────
             corpus_uces = all_uces_filtered
             # ── Coref: highlight selected entity and restrict UCEs ───────
@@ -11491,10 +11587,11 @@ def _render_tab_a():
             elif active_tab == "Predicados":
                 sel_lm = st.session_state.get("pred_selected_lemma")
                 if sel_lm:
+                    pred_state = _pred_state()
                     lm_uce_ids = {
                         f["_uce_id"]
-                        for f in all_frames
-                        if f.get("verb_lemma") == sel_lm and _pred_matches(f)
+                        for f in frames_by_lemma.get(sel_lm, [])
+                        if _pred_matches(f, pred_state)
                     }
                     # mini_html = _render_pred_mini_table(lm_uce_ids)
                     # st.markdown(mini_html, unsafe_allow_html=True)
@@ -11521,11 +11618,28 @@ def _render_tab_a():
             # (otherwise the same par_key appears in several groups → duplicate
             #  `card_<par_key>` element keys in Streamlit)
             corpus_uces = sorted(corpus_uces, key=lambda u: _par_key(u.get("id", "")))
-            # (groupby should be imported at top: from itertools import groupby)
-            for pk, group in groupby(
-                corpus_uces, key=lambda u: _par_key(u.get("id", ""))
-            ):
-                par_uces = list(group)
+            par_groups = [
+                (pk, list(group))
+                for pk, group in groupby(
+                    corpus_uces, key=lambda u: _par_key(u.get("id", ""))
+                )
+            ]
+
+            # Renderizado progresivo: montar todas las tarjetas de párrafo a la
+            # vez era la parte más cara de la pestaña (cada tarjeta es un
+            # componente aislado + HTML cacheado). Se muestra una ventana y el
+            # usuario puede cargar más; la ventana se reinicia al cambiar de
+            # documento, búsqueda o pestaña.
+            _PAR_PAGE = 8
+            _limit_key = "tab_a_par_limit"
+            _scope_key = "tab_a_par_scope"
+            _scope_value = (selected_doc, search_query, active_tab)
+            if st.session_state.get(_scope_key) != _scope_value:
+                st.session_state[_scope_key] = _scope_value
+                st.session_state[_limit_key] = _PAR_PAGE
+            _limit = max(int(st.session_state.get(_limit_key, _PAR_PAGE)), _PAR_PAGE)
+            visible_groups = par_groups[:_limit]
+            for pk, par_uces in visible_groups:
                 render_paragraph_card(
                     pk,
                     par_uces,
@@ -11534,6 +11648,20 @@ def _render_tab_a():
                     CAT_MAP,
                     search=search_query,
                 )
+            if len(par_groups) > _limit:
+                st.caption(
+                    f"Mostrando {len(visible_groups)} de {len(par_groups)} párrafos"
+                )
+                _next_n = min(_PAR_PAGE, len(par_groups) - _limit)
+                if st.button(
+                    f"Cargar {_next_n} párrafos más",
+                    key="tab_a_load_more",
+                    width="stretch",
+                ):
+                    st.session_state[_limit_key] = _limit + _PAR_PAGE
+                    _safe_rerun("fragment")
+            elif not par_groups:
+                st.caption("Sin UCEs que coincidan con la selección.")
 
 
 @st.fragment

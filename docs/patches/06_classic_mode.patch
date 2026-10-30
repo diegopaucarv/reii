@@ -1,0 +1,225 @@
+diff --git a/src/reii/main_workflow.py b/src/reii/main_workflow.py
+--- a/src/reii/main_workflow.py
++++ b/src/reii/main_workflow.py
+@@ -44,5 +44,7 @@
+ from reii.config import (
+     BEST_PARAMS_PATH,
++    CLASSIC_DATA_DIR,
++    CLASSIC_OUTPUT_DIR,
+     COREF_CHAINS_CACHE_PATH,
+     CORPUS_NAME,
+     DATABASE_URL,
+@@ -353,6 +355,7 @@
+     "coref_emb",
+     "all",
+     "select",
++    "classic",  # preset ALCESTE 2012 (NO es un classification_mode)
+     # aliases legacy
+     "auto",
+     "both",
+@@ -798,6 +801,13 @@
+         default_factory=lambda: [("ADV", "ADJ", "NOUN"), ("ADV", "VERB", "NOUN")]
+     )
+     stem_backend: str = "snowball"  # 'snowball' | 'none'
++
++    # Escenario del paper (docs/design_v5/CLASSIC_MODE.md, §1):
++    #   "modern"  = B (ALCESTE + innovaciones)
++    #   "classic" = A (ALCESTE 2012, fidelidad; se activa con --mode classic)
++    # NO está en ConfigStore a propósito: el dashboard no debe poder convertir
++    # una corrida en clásica por accidente.
++    run_mode: str = "modern"
+ 
+     min_uce_words: int = 2  # era 3; alineado con C (UCEs cortas)
+     uce_target_size: int = 26  # objetivo de entrada; ver auto_calibrate_uce_size
+@@ -7836,6 +7846,136 @@
+ except ImportError:
+     _OPTUNA_AVAILABLE = False
+ 
+ 
++# ══════════════════════════════════════════════════════════════════════
++# MODO CLÁSICO (ALCESTE 2012) — preset + identidad de especificación
++# ══════════════════════════════════════════════════════════════════════
++# Escenario A del paper (docs/design_v5/CLASSIC_MODE.md). Un override, no un
++# fork: el mismo pipeline con la fidelidad de 2012. El fork
++# main_workflow_clasico.py queda retirado (shim, §9.5).
++
++CLASSIC_OVERRIDES: Dict[str, Any] = {
++    "run_mode": "classic",
++    "classification_mode": "wc_only",     # §2 Paso 2: un solo CDH
++    "min_forms_uc": [10, 14],             # §2 Paso 1: UC 10 vs 14 palabras
++    "cdh_enforce_min_leaf": False,        # §2: el clásico no tiene piso de hoja
++    "optimize": False,                    # §2: parámetros fijos, sin búsqueda
++    "use_embeddings": False,              # §2/§3: sin retrofitting ni Method C
++    "use_liminal_projection": False,      # §3 Paso 6: proyección es de REII
++    "auto_calibrate_uce_size": False,     # §2: tamaño de UCE fijo
++}
++
++_CLASSIC_SPEC_FIELDS = (
++    "classification_mode", "min_forms_uc", "tsj", "pseudocount",
++    "cdh_enforce_min_leaf", "min_cluster_size_cdh", "min_r2_threshold",
++    "uce_target_size", "min_uce_words", "stem_backend",
++    "use_bigrams", "use_trigrams", "use_embeddings", "random_state",
++)
++
++
++def run_spec_id(config) -> str:
++    """Identidad de la especificación (§4.1). Moderno => "modern" literal,
++    para no invalidar ninguna caché previa."""
++    if str(getattr(config, "run_mode", "modern")) != "classic":
++        return "modern"
++    payload = {k: getattr(config, k, None) for k in _CLASSIC_SPEC_FIELDS}
++    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
++    return "classic:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
++
++
++def apply_classic_mode(config: Config, uc_config: "UCBuilderConfig"):
++    """Devuelve (Config, UCBuilderConfig) del escenario A. Idempotente.
++
++    No toca `pseudocount`: el paper pide 0.1 pero la CDH no lo consume
++    (docs/design_v5/CLASSIC_MODE.md §3). Queda 0.0 y se declara.
++    """
++    base = os.path.join(CLASSIC_DATA_DIR)
++    os.makedirs(base, exist_ok=True)
++    os.makedirs(CLASSIC_OUTPUT_DIR, exist_ok=True)
++    classic = dataclasses.replace(
++        config,
++        **CLASSIC_OVERRIDES,
++        # ── Aislamiento (§4.2): una sola palanca arrastra best_params,
++        #    comparative_results y el SQLite de Optuna.
++        db_local_path=os.path.join(base, "workflow_data.json"),
++        optimize_storage=(
++            f"sqlite:///{os.path.join(base, 'reii_optuna.db').replace(os.sep, '/')}"
++            if getattr(config, "optimize_storage", None)
++            else None
++        ),
++        optimize_study_name=f"{getattr(config, 'optimize_study_name', 'reii_search')}"
++        f":{run_spec_id(dataclasses.replace(config, **CLASSIC_OVERRIDES))}",
++    )
++    spec = run_spec_id(classic)
++    print("   [CLI] --mode classic -> ALCESTE 2012 (escenario A)")
++    print(f"         spec={spec}  data_dir={CLASSIC_DATA_DIR}")
++    print(
++        "         overrides: classification_mode=wc_only min_forms_uc=[10, 14]\n"
++        "                    cdh_enforce_min_leaf=False optimize=False\n"
++        "                    use_embeddings=False use_liminal_projection=False\n"
++        "                    auto_calibrate_uce_size=False"
++    )
++    print(
++        "         [!] pseudocount=0.0 (paper pide 0.1; epsilon no implementado "
++        "en la CDH)"
++    )
++    return classic, uc_config
++
++
++# ══════════════════════════════════════════════════════════════════════
++# LECTOR DE PARAMS ROBUSTO (claves desconocidas) — §6
++# ══════════════════════════════════════════════════════════════════════
++_NON_CONFIG_PARAM_KEYS = {
++    # espacio de búsqueda / parámetros que se aplican fuera de Config
++    "cdh_target_k",
++    "min_forms_uc_1",
++    "forms_gap",
++    "similarity_threshold",   # UCBuilderConfig
++    "coref_weight",           # UCBuilderConfig
++    "uc_window_size",         # UCBuilderConfig
++}
++
++
++def resolve_best_params(
++    params: Dict[str, Any],
++    *,
++    where: str = "best_params.json",
++) -> Dict[str, Any]:
++    """Filtra claves no aplicables; falla SÓLO si no queda ninguna válida.
++
++    Un archivo con una clave de un diseño futuro debe degradar, no abortar:
++    el resto de los parámetros sigue siendo el resultado del optimizador.
++    """
++    if not params:
++        return {}
++    known = set(Config.__dataclass_fields__) | _NON_CONFIG_PARAM_KEYS
++    valid: Dict[str, Any] = {}
++    ignored: List[str] = []
++    for key, value in params.items():
++        if key in known:
++            valid[key] = value
++        else:
++            ignored.append(str(key))
++    if ignored:
++        print(
++            f"   [!] {where}: {len(ignored)} clave(s) desconocida(s) ignorada(s): "
++            f"{', '.join(sorted(ignored))}"
++        )
++        logger.warning(
++            "%s: claves ignoradas (no aplicables a esta versión de Config): %s",
++            where,
++            sorted(ignored),
++        )
++        for _k in sorted(ignored):
++            print(f"       - {_k} = {params[_k]!r}")
++    if not valid:
++        raise ValueError(
++            f"{where}: ninguna de las {len(params)} claves es aplicable "
++            f"(ignoradas: {', '.join(sorted(ignored))}). "
++            "No se puede continuar sin parámetros."
++        )
++    return valid
++
++
+ # Centinela dominado para trials inválidos (gates duros). Optuna 3.6.2
+ # (pin <4.0.0) crashea en TPE multi-objetivo cuando un trial PRUNED
+@@ -8527,7 +8667,11 @@
+         cfg.classification_mode = mode
+         cfg.min_forms_uc = [mf1, mf2]
+         cfg.tsj = params["tsj"]
+-        cfg.pseudocount = 0.0  # BLOQUE 1: nunca sumar ε
++        # BLOQUE 1: nunca sumar ε. En clásico se conserva el valor declarado
++        # para poder REPORTARLO (sigue siendo 0.0 mientras ε no exista en la
++        # CDH — ver CLASSIC_MODE.md §3). En moderno, invariante 0.0.
++        if str(getattr(cfg, "run_mode", "modern")) != "classic":
++            cfg.pseudocount = 0.0
+         cfg.min_cluster_size_cdh = _cdh_frac_from_params(
+             params, default=cfg.min_cluster_size_cdh
+         )
+@@ -10543,6 +10687,6 @@
+     # ── Override CLI: --mode gana sobre ConfigStore ─────────────────────
+     _cli_mode = _parse_cli_mode()
+-    if _cli_mode is not None:
++    if _cli_mode is not None and _cli_mode != "classic":
+         alceste_config = dataclasses.replace(
+             alceste_config, classification_mode=_cli_mode
+         )
+@@ -10596,6 +10740,8 @@
+         chi2_threshold=3.84,  # α=0.05 for 1 degree of freedom (χ²=3.84)
+     )
+     cfg = UCBuilderConfig()
++    if _cli_mode == "classic":
++        alceste_config, cfg = apply_classic_mode(alceste_config, cfg)
+ 
+     # Entrenar clasificador de adverbios si no existe
+     clf_path = os.path.join(
+@@ -10696,7 +10842,11 @@
+         grammatical_pipeline=gram_pipeline,
+         global_corpus=global_corpus,
+         lex_analyzer=lex_analyzer,
+-        grammatical_dashboard_path=OUTPUT_DASHBOARD,
++        grammatical_dashboard_path=(
++            os.path.join(CLASSIC_OUTPUT_DIR, "global_dashboard.json")
++            if alceste_config.run_mode == "classic"
++            else OUTPUT_DASHBOARD
++        ),
+         checkpoint_path=_coref_ckpt_path,
+         force=_force_from_cli,
+     )
+@@ -10717,6 +10867,10 @@
+     G = lex_analyzer.semantic_network()
+     print(f"Network: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+-    lex_analyzer.export_network_gexf(OUTPUT_NETWORK_GEXF)
++    lex_analyzer.export_network_gexf(
++        os.path.join(CLASSIC_OUTPUT_DIR, "red_semantica.gexf")
++        if alceste_config.run_mode == "classic"
++        else OUTPUT_NETWORK_GEXF
++    )
+ 
+     # ── PHASE 4: Guardar todo ─────────────────────────────────────────
+     # Fixed: Removed the overlapping positional argument

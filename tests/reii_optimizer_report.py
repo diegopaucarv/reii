@@ -514,7 +514,7 @@ def run_benchmark(seeds, log, scenarios=None, on_scenario=None):
             for (t, name), rows in out.items():
                 if t != tag: continue
                 a = np.array(rows); u = a[:, 0]; d = u - ref
-                ci = 1.96 * d.std(ddof=1) / np.sqrt(len(d)) if len(d) > 1 else 0.0
+                ci = 1.96 * d.std(ddof=1) / np.sqrt(len(d)) if len(d) > 1 else float("nan")
                 lines.append(f"| {name} | {u.mean():.3f} | {d.mean():+.3f} ± {ci:.3f} | "
                              f"{a[:,2].mean():.0f} | {a[:,1].mean():.0f} | {a[:,3].mean():.1f} |")
             lines.append("")
@@ -568,14 +568,14 @@ def main():
         body += l
 
     body += ["", "## 4. Resumen", "",
-             "- Tests: " + ("✅ todo OK" if ok_all else "❌ hay fallos, ver sección 2"),
+             "- Tests: " + ("omitidos (--skip-tests)" if args.skip_tests else ("[ok] todo OK" if ok_all else "[FALLO] hay fallos, ver seccion 2")),
              "- Benchmark: Δ vs S1 con su IC95; si el IC cruza 0 no hay evidencia de diferencia."]
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write("\n".join(head + body) + "\n")
     with open(os.path.splitext(args.out)[0] + ".json", "w", encoding="utf-8") as fh:
         json.dump({"tests_ok": bool(ok_all), "benchmark": results}, fh,
                   default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o), indent=1)
-    log(f"→ reporte escrito en {args.out} (+ {os.path.splitext(args.out)[0]}.json)")
+    log(f"-> reporte escrito en {args.out} (+ {os.path.splitext(args.out)[0]}.json)")
 
 
 if __name__ == "__main__":

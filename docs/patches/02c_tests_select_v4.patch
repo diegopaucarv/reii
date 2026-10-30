@@ -1,0 +1,93 @@
+diff --git a/tests/test_select_v4.py b/tests/test_select_v4.py
+--- a/tests/test_select_v4.py
++++ b/tests/test_select_v4.py
+@@ -90,17 +90,24 @@
+         assert sel.winner == "A"
+         assert sel.winner_stability == pytest.approx(0.550)
+         assert sel.winner_stability_kind == "bootstrap"
+-        assert sel.runner_up == "C"
+-        # Ambos miden bootstrap y A cubre MAS que C (0.60 vs 0.40): no hay
+-        # conflicto de criterios. El conflicto aparece cuando el runner-up
+-        # cubre mas o cuando los kinds difieren (tests dedicados abajo).
++        # C (bootstrap 0.25) no llega a runner-up: STABILITY_MEAN_MIN=0.30
++        # (STABILITY_NULL.md) lo descarta por falta de senal de estructura.
++        assert sel.runner_up is None
++        assert [d["method"] for d in sel.discarded] == ["C"]
++        assert "piso 0.30" in sel.discarded[0]["why"]
++        # Sin runner-up no hay conflicto de criterios que declarar.
++        # (El conflicto aparece cuando el runner-up cubre mas o cuando
++        # los kinds difieren: tests dedicados abajo.)
+         assert sel.criteria_conflict is False
+ 
+     def test_denso_no_gana_sin_evidencia_contra_el_nulo(self):
+         """C con bootstrap 0.70 pero ``null_p=0.61``: descartado por el gate."""
+         a = _m("A", 5, 0.400, 0.500, bootstrap_ari=0.40, null_p=0.010)
+         c = _c(bootstrap_ari=0.700, coverage_stable=0.900, null_p=0.610)
+-        sel = select_method([a, c])
++        # El gate del nulo ya no es el default (SELECT_V4.md 3.7.4: el
++        # default es "diagnostic"); este test verifica el GATE, asi que lo
++        # pide explicito.
++        sel = select_method([a, c], null_mode="gate")
+         assert sel.winner == "A"
+         why = [d["why"] for d in sel.discarded if d["method"] == "C"]
+         assert why and "nulo" in why[0]
+@@ -279,7 +286,10 @@
+         a = _m("A", 5, 0.120, 0.300, null_p=0.620)
+         b = _m("B", 6, 0.100, 0.350, null_p=0.550)
+         c = _c(bootstrap_ari=0.200, coverage_stable=0.500, null_p=0.400)
+-        sel = select_method([a, b, c])
++        # El gate del nulo ya no es el default (SELECT_V4.md 3.7.4: el
++        # default es "diagnostic"); este test verifica el GATE, asi que lo
++        # pide explicito.
++        sel = select_method([a, b, c], null_mode="gate")
+         assert sel.winner is None
+         assert sel.abstained is True
+         assert len(sel.discarded) == 3
+@@ -332,7 +342,7 @@
+     def test_kinds_iguales_y_mas_coverage_marcan_conflicto(self):
+         a = _m("A", 5, 0.550, 0.600, bootstrap_ari=0.550, null_p=0.010)
+         c = _c(
+-            bootstrap_ari=0.250,
++            bootstrap_ari=0.450,  # >= STABILITY_MEAN_MIN (0.30): viable
+             coverage_stable=0.850,
+             max_class_share=0.450,
+             null_p=0.010,
+@@ -345,7 +355,7 @@
+     def test_kinds_iguales_y_menos_coverage_no_marcan_conflicto(self):
+         a = _m("A", 5, 0.550, 0.700, bootstrap_ari=0.550, null_p=0.010)
+         c = _c(
+-            bootstrap_ari=0.250,
++            bootstrap_ari=0.450,  # >= STABILITY_MEAN_MIN (0.30): viable
+             coverage_stable=0.400,
+             max_class_share=0.450,
+             null_p=0.010,
+@@ -495,7 +505,7 @@
+         sel = select_method([MethodMetrics("A", 7, 0.35, 0.60)])
+         assert sel.winner == "A"
+         assert sel.winner_stability_kind == "perturbation"
+-        assert sel.null_mode == "gate"
++        assert sel.null_mode == "diagnostic"
+         assert sel.dominance_scale == "corpus"
+         sel.explain_text().encode("cp1252")
+ 
+@@ -525,7 +535,10 @@
+         ]
+ 
+     def test_gate_abstiene(self):
+-        assert select_method(self._only_bad_null()).winner is None
++        # El default es "diagnostic"; el gate se prueba pasandolo
++        # explicito (si no, este assert dejaria de verificar el gate).
++        sel = select_method(self._only_bad_null(), null_mode="gate")
++        assert sel.winner is None
+ 
+     def test_off_ignora_el_nulo(self):
+         sel = select_method(self._only_bad_null(), null_mode="off")
+@@ -630,7 +643,7 @@
+         assert again.winner == sel.winner
+         assert again.rule_version == RULE_VERSION
+         assert again.dominance_scale == "corpus"
+-        assert again.null_mode == "gate"
++        assert again.null_mode == "diagnostic"
+         assert again.null_alpha == pytest.approx(0.05)
+         assert again.max_class_share_max == pytest.approx(0.70)
+         assert again.winner_stability_kind == "perturbation"

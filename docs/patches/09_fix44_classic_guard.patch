@@ -1,0 +1,14 @@
+diff --git a/src/reii/main_workflow.py b/src/reii/main_workflow.py
+--- a/src/reii/main_workflow.py
++++ b/src/reii/main_workflow.py
+@@ -10371,6 +10371,10 @@
+                             print(
+                                 f"   [WARNING] No se pudo sellar best_params.json: {_se}"
+                             )
++            except RuntimeError:
++                # Guardas de contrato (p.ej. aislamiento del modo clasico,
++                # #44): NO deben degradar a 'optimizador si habilitado'.
++                raise
+             except Exception as e:
+                 print(
+                     f"   [WARNING] Could not load best_params.json: {e}. "

@@ -13,7 +13,10 @@ Errores de la versión anterior, corregidos aquí:
     del estudio), no de suposiciones.
 
 Etapa 1 (study *_stage1_wc_*): objetivos = (ARI, coverage, -K)
-Etapa 2 (study *_stage2_all_*): objetivos = (coverage, agreement_sym, -K)
+Etapa 2 (study *_stage2_select_*): objetivos = (coverage, ARI_ganador, -K)
+  ARI_ganador = ARI intra-metodo (A1<->A2, B1<->B2 o C1<->C2) del metodo
+  elegido por la regla select-v1. Ya NO hay agreement_sym ni interseccion
+  triple: ese objetivo vaciaba el 100% de los trials.
 Direcciones: maximize, maximize, minimize  (minimize sobre -K  ==> PREMIA más clases).
 
 Uso:
@@ -25,6 +28,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import re
 import sqlite3
 import sys
 from collections import Counter, defaultdict
@@ -37,6 +41,13 @@ DIRS = {
     1: "MINIMIZE",
     2: "MAXIMIZE",
 }  # enum de Optuna: MINIMIZE=1, MAXIMIZE=2
+
+# Detector de inversión de signo entre etapas: |ρ| mínimo en AMBAS etapas.
+SIGNFLIP_MIN_ABS_RHO = 0.30
+
+# Sufijos que identifican la etapa en el nombre del estudio. El prefijo anterior
+# (p. ej. `reii_probe_v5`) es la clave de emparejamiento.
+STAGE_MARKERS = (("_stage1_wc_", "stage1"), ("_stage2_select_", "stage2"))
 
 
 def find_db(explicit):
@@ -82,6 +93,78 @@ def spearman(a, b):
     return num / den if den else None
 
 
+def param_series(params, valid, pn):
+    """Valores de `pn` en los trials válidos, en el orden de `valid`."""
+    return [float(params[t][pn]) for t in valid if pn in params[t]]
+
+
+def param_objective_rhos(params, num, valid, n_obj, param_names):
+    """{param: [ρ(obj 0), ρ(obj 1), ...]} sobre los trials válidos de un estudio.
+
+    `None` = ρ no calculable (n<4, parámetro constante u objetivo sin varianza).
+    Es la ÚNICA fuente del cálculo: la usan la tabla por estudio y el detector
+    de inversión de signo entre etapas.
+    """
+    return {
+        pn: [
+            spearman(
+                param_series(params, valid, pn),
+                [num[t][i] for t in valid if pn in params[t]],
+            )
+            for i in range(n_obj)
+        ]
+        for pn in param_names
+    }
+
+
+def trial_attrs(con, sid):
+    """{trial_id: {clave: valor}} desde `trial_user_attributes` (value_json→objeto)."""
+    out = defaultdict(dict)
+    for tid, key, vj in con.execute(
+        'SELECT ua.trial_id, ua."key", ua.value_json FROM trial_user_attributes ua '
+        "JOIN trials t ON t.trial_id=ua.trial_id WHERE t.study_id=?",
+        (sid,),
+    ):
+        try:
+            out[tid][key] = json.loads(vj)
+        except (TypeError, ValueError):
+            out[tid][key] = vj
+    return out
+
+
+def k_bounds(reason):
+    """(lo, hi) del rango `[lo, hi]` que aparezca en el motivo, o (None, None)."""
+    m = re.search(r"\[\s*(-?\d+)\s*,\s*(-?\d+)\s*\]", reason)
+    return (int(m.group(1)), int(m.group(2))) if m else (None, None)
+
+
+def sentinel_gate_breakdown(sent, attrs):
+    """Agrupa los centinelas por `gate_reason` y recoge `k_rejected` por motivo.
+
+    Devuelve (Counter(motivo→n), {motivo: [k_rejected...]}, n_sin_atribuir).
+    Los centinelas sin `gate_reason` (BD antigua) se cuentan aparte en vez de
+    perderse: son el 30% del presupuesto que antes no se explicaba.
+    """
+    by_reason = Counter()
+    k_rejected = defaultdict(list)
+    unattributed = 0
+    for t in sent:
+        a = attrs.get(t, {})
+        reason = a.get("gate_reason")
+        if reason is None:
+            unattributed += 1
+            continue
+        reason = str(reason)
+        by_reason[reason] += 1
+        kr = a.get("k_rejected")
+        if kr is not None:
+            try:
+                k_rejected[reason].append(int(kr))
+            except (TypeError, ValueError):
+                pass
+    return by_reason, k_rejected, unattributed
+
+
 def dominates(a, b, dirs):
     better = False
     for x, y, d in zip(a, b, dirs):
@@ -109,7 +192,7 @@ def diagnose_study(con, sid, name):
     stage = (
         "etapa 1 (wc_only): (ARI, coverage, -K)"
         if "stage1" in name
-        else "etapa 2 (all): (coverage, agreement_sym, -K)"
+        else "etapa 2 (select): (coverage, ARI_ganador, -K)"
         if "stage2" in name
         else "etapa desconocida"
     )
@@ -142,10 +225,11 @@ def diagnose_study(con, sid, name):
     num = {tid: tuple(v[i] for i in sorted(v)) for tid, v in vals.items()}
     if not num:
         print("  (sin valores: ¿estudio vacío o aún corriendo?)")
-        return
+        return {"sid": sid, "name": name, "n_obj": 0, "rhos": {}}
     n_obj = len(next(iter(num.values())))
     sent = [t for t, v in num.items() if tuple(v) == SENTINEL]
     valid = [t for t in num if t not in sent]
+    attrs = trial_attrs(con, sid)
     print(
         f"Centinelas {SENTINEL}: {len(sent)}/{len(num)} ({100 * len(sent) / len(num):.0f}%) "
         f"— presupuesto desperdiciado en trials inviables"
@@ -166,9 +250,29 @@ def diagnose_study(con, sid, name):
         f"(se evitan filtrando el espacio, no evaluando)"
     )
 
+    # Atribución fina: el código ya escribe la causa en user attrs.
+    by_reason, k_rejected, unattributed = sentinel_gate_breakdown(sent, attrs)
+    if by_reason:
+        print(f"  por gate_reason: {dict(by_reason)}")
+        for reason, ks in sorted(k_rejected.items()):
+            if not ks:
+                continue
+            lo, hi = k_bounds(reason)
+            detail = ""
+            if lo is not None and min(ks) > hi:
+                detail = f" (por exceso del límite superior {hi})"
+            elif lo is not None and max(ks) < lo:
+                detail = f" (por defecto del límite inferior {lo})"
+            print(f"    {reason}: k_rejected {min(ks)}..{max(ks)}{detail}")
+    if unattributed:
+        print(
+            f"  centinelas sin gate_reason en user attrs: {unattributed} "
+            f"(BD antigua o atribución no escrita)"
+        )
+
     if not valid:
         print("  Ningún trial válido.")
-        return
+        return {"sid": sid, "name": name, "n_obj": n_obj, "rhos": {}}
     K = Counter(int(-num[t][-1]) for t in valid)
     print(f"Distribución de K (clases) en trials válidos: {dict(sorted(K.items()))}")
     for i in range(n_obj):
@@ -217,40 +321,104 @@ def diagnose_study(con, sid, name):
     print(
         "Correlación de Spearman parámetro↔objetivo (|ρ|<0.10 en todos = parámetro probablemente INERTE):"
     )
+    rhos = param_objective_rhos(params, num, valid, n_obj, sorted(dists))
     for pn in sorted(dists):
-        xs = [float(params[t][pn]) for t in valid if pn in params[t]]
+        xs = param_series(params, valid, pn)
         if len(set(xs)) < 2:
             print(f"   {pn:38s} sin variación")
             continue
-        rhos = []
-        for i in range(n_obj):
-            ys = [num[t][i] for t in valid if pn in params[t]]
-            r = spearman(xs, ys)
-            rhos.append("  n/a " if r is None else f"{r:+.2f}")
-        inert = all(
-            r.strip() != "n/a" and abs(float(r)) < 0.10
-            for r in rhos
-            if r.strip() != "n/a"
-        ) and any(r.strip() != "n/a" for r in rhos)
-        print(f"   {pn:38s} ρ={rhos}{'   ◄ inerte' if inert else ''}")
-
-    ua = Counter(
-        k
-        for (k,) in con.execute(
-            "SELECT key FROM trial_user_attributes ua JOIN trials t ON t.trial_id=ua.trial_id WHERE t.study_id=?",
-            (sid,),
+        raw = rhos[pn]
+        cells = ["  n/a " if r is None else f"{r:+.2f}" for r in raw]
+        inert = all(r is not None and abs(r) < 0.10 for r in raw) and any(
+            r is not None for r in raw
         )
-    )
+        print(f"   {pn:38s} ρ={cells}{'   ◄ inerte' if inert else ''}")
+
+    ua = Counter(k for a in attrs.values() for k in a)
     print(f"\nUser attrs presentes: {dict(ua) or 'ninguno (normal en etapa 1)'}")
+    return {"sid": sid, "name": name, "n_obj": n_obj, "rhos": rhos}
 
 
-def main():
+def split_stage(name):
+    """(prefijo, etapa) del nombre de estudio, o None si no casa con el patrón."""
+    for marker, stage in STAGE_MARKERS:
+        if marker in name:
+            return name.split(marker, 1)[0], stage
+    return None
+
+
+def pair_stage_records(records):
+    """{prefijo: {'stage1': rec, 'stage2': rec}} solo con ambas etapas presentes."""
+    pairs = {}
+    for rec in records:
+        split = split_stage(rec["name"])
+        if not split:
+            continue
+        prefix, stage = split
+        pairs.setdefault(prefix, {}).setdefault(stage, rec)
+    return {p: d for p, d in pairs.items() if {"stage1", "stage2"} <= set(d)}
+
+
+def is_sign_flip(r1, r2):
+    """Signos opuestos y |ρ| ≥ umbral en AMBAS etapas."""
+    return (
+        r1 is not None
+        and r2 is not None
+        and r1 * r2 < 0
+        and abs(r1) >= SIGNFLIP_MIN_ABS_RHO
+        and abs(r2) >= SIGNFLIP_MIN_ABS_RHO
+    )
+
+
+def print_sign_flip_section(records):
+    """Diagnóstico (NO gate): ρ del mismo parámetro con signo opuesto entre etapas.
+
+    Un parámetro no puede mejorar y dañar la misma estructura subyacente. Si el
+    signo se invierte con magnitud suficiente, lo que cambió es lo que MIDE el
+    objetivo de la etapa 2, no la señal. Solo informa: no filtra ni cambia el rc.
+    """
+    pairs = pair_stage_records(records)
+    if not pairs:
+        return
+    print("\n" + "=" * 72)
+    print("SIGN FLIP ENTRE ETAPAS (posible artefacto de objetivo)")
+    print("=" * 72)
+    for prefix in sorted(pairs):
+        s1, s2 = pairs[prefix]["stage1"], pairs[prefix]["stage2"]
+        print(f"\n  pareja {prefix}: {s1['name']}  vs  {s2['name']}")
+        rows = 0
+        flipped = 0
+        for pn in sorted(set(s1["rhos"]) & set(s2["rhos"])):
+            for i in range(min(len(s1["rhos"][pn]), len(s2["rhos"][pn]))):
+                r1, r2 = s1["rhos"][pn][i], s2["rhos"][pn][i]
+                if r1 is None or r2 is None:
+                    continue
+                flip = is_sign_flip(r1, r2)
+                rows += 1
+                flipped += int(flip)
+                print(
+                    f"   {pn:38s} obj[{i}]  ρ_etapa1={r1:+.2f}  ρ_etapa2={r2:+.2f}"
+                    f"{'   <<< INVIERTE' if flip else ''}"
+                )
+        if not rows:
+            print("   (sin parámetros/objetivos comparables entre ambas etapas)")
+        elif not flipped:
+            print(f"   ningún ρ invierte con |ρ| ≥ {SIGNFLIP_MIN_ABS_RHO:.2f}")
+    print(
+        "\n  Lectura: es un DIAGNÓSTICO, no un gate: no filtra trials ni cambia el exit code.\n"
+        "  Un parámetro no puede mejorar y dañar la misma estructura subyacente: si el signo\n"
+        "  del ρ se invierte con magnitud suficiente, lo que cambió es lo que MIDE el objetivo\n"
+        "  de la etapa 2 (no la señal). Revisa ese objetivo antes de fiarte del ganador."
+    )
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--db", default=None)
     ap.add_argument("--study", default=None, help="subcadena del nombre del estudio")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     db = find_db(a.db)
     if not db or not db.exists():
         print("✗ No encuentro una BD de Optuna. Pasa --db data/<archivo>.db")
@@ -261,10 +429,14 @@ def main():
         "SELECT study_id, study_name FROM studies ORDER BY study_id"
     ).fetchall()
     print(f"Estudios: {[s[1] for s in studies]}")
+    diagnosed = []
     for sid, name in studies:
         if a.study and a.study not in name:
             continue
-        diagnose_study(con, sid, name)
+        rec = diagnose_study(con, sid, name)
+        if rec:
+            diagnosed.append(rec)
+    print_sign_flip_section(diagnosed)
 
 
 if __name__ == "__main__":

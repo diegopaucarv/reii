@@ -1,0 +1,535 @@
+--- a/src/reii/main_workflow.py
++++ b/src/reii/main_workflow.py
+@@ -442,7 +442,12 @@
+     "--coverage-gate",
+     "--coverage-gate-all",
+ }
+-_CLI_FLAGS_SIN_VALOR = {"--optimize-only", "--no-optuna-warm-start", "--single-stage"}
++_CLI_FLAGS_SIN_VALOR = {
++    "--optimize-only",
++    "--no-optuna-warm-start",
++    "--single-stage",
++    "--stability-bootstrap",
++}
+ _OPTIMIZE_ONLY = "--optimize-only" in sys.argv
+ _NO_OPTUNA_WARM_START = "--no-optuna-warm-start" in sys.argv
+ _SINGLE_STAGE = "--single-stage" in sys.argv
+@@ -503,6 +508,8 @@
+     if _SINGLE_STAGE:
+         upd["optimize_two_stage"] = False
+         print("   [CLI] --single-stage: una sola etapa (mode=select)")
++    if "--stability-bootstrap" in sys.argv:
++        upd["stability_bootstrap"] = True
+     if _OPTIMIZE_ONLY:
+         print(
+             "   [CLI] --optimize-only: se ignora best_params.json "
+@@ -1049,6 +1056,12 @@
+     method_selection_stability_boot: int = 10
+     method_selection_stability_perm: int = 50
+     method_selection_stability_min_n: int = 30
++    #: Opt-in del bootstrap real de estabilidad (submuestra + reajuste)
++    #: que alimenta ``DoubleClassifier._stability_spaces``. Con False no
++    #: se construye ningun espacio y ``_stability_blocks`` devuelve
++    #: ``{}``: comportamiento identico al anterior (la corrida congelada
++    #: no cambia). Ver docs/design_v5/BOOTSTRAP_WIRING.md.
++    stability_bootstrap: bool = False
+     method_selection_k_bounds: Tuple[int, int] = (3, 20)
+     method_selection_min_class_share: float = 0.01
+     method_selection_noise_max: float = 0.50
+@@ -5237,7 +5250,8 @@
+         mat = _compute_uce_centroids_from_retro(all_uces, retrofitted_vectors, we, sub)
+ 
+         # Reject if >50 % of UCEs are unembeddable
+-        zero_rows = int(np.all(mat == 0, axis=1).sum())
++        embeddable_mask = ~np.all(mat == 0, axis=1)
++        zero_rows = int((~embeddable_mask).sum())
+         if zero_rows > len(all_uces) * 0.5:
+             print(
+                 f"   [EMB] {zero_rows}/{len(all_uces)} zero-vectors — "
+@@ -5353,6 +5367,10 @@
+         )
+         if result is None:
+             return None
++        # [stability] UCEs con embedding real del pase tight: el bootstrap
++        # de C remuestrea solo esta subpoblacion (las OOV colapsan en un
++        # unico punto tras el PCA y falsearian el ARI).
++        result["embeddable_mask"] = embeddable_mask
+         print(
+             f"   [EMB backend={result['backend']}] UCEs={len(all_uces)}, "
+             f"clusters={result['n_clusters']}, noise={result['n_noise']}, "
+@@ -5685,6 +5703,206 @@
+         if self.config.use_trigrams:
+             for t in uce.trigram_stems if use_stems else uce.trigrams:
+                 yield "_".join(t)
++
++    #: Techo de celdas de la matriz densa que usa el bootstrap de A/B. Con
++    #: n=528 UCEs y ~5k terminos son ~2.6M celdas (~21 MiB); el techo solo
++    #: evita que un vocabulario anomalo densifique cientos de MiB.
++    _STABILITY_MAX_DENSE_CELLS = 20_000_000
++
++    def _build_stability_spaces(
++        self,
++        res_wc: Optional[Dict],
++        res_coref: Optional[Dict],
++        res_emb: Optional[Dict],
++        *,
++        min_n: int = 30,
++    ) -> Optional[Dict[str, Tuple[Any, List[str], Dict[str, int], Any]]]:
++        """Espacios ``(X, ids, cluster_of, predict_fn)`` del bootstrap.
++
++        Opt-in: con ``config.stability_bootstrap`` en False devuelve ``None``
++        y ``_stability_blocks`` recibe ``None`` -> ``{}``, que es el
++        comportamiento previo byte a byte. Con True se intenta cada metodo por
++        separado: el que no se pueda construir se OMITE (su ``bootstrap_ari``
++        queda ``nan`` = "no disponible" y la regla no descarta por eso) y se
++        imprime ``[stability] metodo X sin espacio: motivo``. Nunca lanza.
++
++        Las unidades son las de la particion PRIMARIA del metodo; NO se
++        re-segmenta el corpus:
++
++          * A/B: las UCs del pase tight, con la MISMA matriz UC x terminos
++            (binaria -> PPMI) que consumio el CDH; ``predict_fn`` reajusta el
++            CDH sobre la submuestra de UCs conservando el piso absoluto.
++          * C: las UCEs con embedding del pase tight, en las coordenadas PCA
++            del ajuste; ``predict_fn`` reajusta el backend denso con el mismo
++            ``target_k`` y el piso re-escalado a esa subpoblacion.
++        """
++        if not bool(getattr(self.config, "stability_bootstrap", False)):
++            return None
++
++        import contextlib
++        import dataclasses
++        import io
++
++        try:
++            from scipy.sparse import csr_matrix
++        except Exception as exc:  # pragma: no cover - scipy es dependencia
++            print(f"   [stability] sin espacios: {exc}")
++            return {}
++
++        spaces: Dict[str, Tuple[Any, List[str], Dict[str, int], Any]] = {}
++
++        def _omit(method: str, reason: object) -> None:
++            print(f"   [stability] metodo {method} sin espacio: {reason}")
++
++        def _term_space(res: Optional[Dict]):
++            if not res:
++                raise RuntimeError("sin resultado del pase tight")
++            ucs = res.get("ucs") or []
++            voc = res.get("voc") or []
++            labels = res.get("labels")
++            if not ucs or not voc or labels is None:
++                raise RuntimeError("resultado sin ucs/voc/labels")
++            if len(ucs) != len(labels):
++                raise RuntimeError(f"ucs={len(ucs)} != labels={len(labels)}")
++            mat = MatrizBuilder(self.config).construir_matriz_dispersa(
++                ucs, voc
++            )
++            if self.ppmi_builder is not None:
++                mat = self.ppmi_builder.build(mat, voc)
++            n_cells = int(mat.shape[0]) * int(mat.shape[1])
++            if n_cells > self._STABILITY_MAX_DENSE_CELLS:
++                raise RuntimeError(
++                    f"matriz {mat.shape[0]}x{mat.shape[1]}={n_cells} celdas "
++                    f"> {self._STABILITY_MAX_DENSE_CELLS}"
++                )
++            X = np.asarray(
++                mat.toarray() if hasattr(mat, "toarray") else mat, dtype=float
++            )
++            ids = [str(uc.id) for uc in ucs]
++            cluster_of = {uid: int(labels[i]) for i, uid in enumerate(ids)}
++            n_assigned = sum(1 for v in cluster_of.values() if v >= 0)
++            if n_assigned < int(min_n):
++                raise RuntimeError(
++                    f"asignadas={n_assigned} < min_n={int(min_n)}"
++                )
++            # Piso ABSOLUTO del ajuste completo: se conserva en cada replica
++            # (mismo K efectivo), no la fraccion del submuestreo.
++            floor = max(
++                5,
++                int(len(ids) * float(self.config.min_cluster_size_cdh)),
++            )
++
++            def predict(X_sub):
++                n_sub = int(np.asarray(X_sub).shape[0])
++                # +0.5 para que int(n_sub * frac) == floor pese al redondeo
++                # en coma flotante (`clasificar` trunca, no redondea).
++                frac_sub = (float(floor) + 0.5) / float(max(1, n_sub))
++                cfg_sub = dataclasses.replace(
++                    self.config, min_cluster_size_cdh=frac_sub
++                )
++                with contextlib.redirect_stdout(io.StringIO()):
++                    labels_sub, _tree = ClasificadorDescendente(
++                        cfg_sub
++                    ).clasificar(csr_matrix(X_sub))
++                return labels_sub
++
++            return (X, ids, cluster_of, predict)
++
++        for method, res in (("A", res_wc), ("B", res_coref)):
++            try:
++                spaces[method] = _term_space(res)
++            except Exception as exc:
++                _omit(method, exc)
++        try:
++            if not res_emb:
++                raise RuntimeError("sin resultado del pase tight")
++            X_emb = res_emb.get("embedding_matrix")
++            labels_arr = res_emb.get("labels_array")
++            ids_all = list(res_emb.get("uce_ids") or [])
++            backend = str(res_emb.get("backend") or "")
++            if X_emb is None or labels_arr is None:
++                raise RuntimeError(
++                    "resultado sin embedding_matrix/labels_array"
++                )
++            if backend not in ("dense_cdh", "ward", "kmeans_spherical"):
++                raise RuntimeError(f"backend={backend!r} no controla K")
++            A = np.asarray(X_emb, dtype=float)
++            y = np.asarray(labels_arr, dtype=int).ravel()
++            if A.ndim != 2 or A.shape[0] != len(ids_all):
++                raise RuntimeError(
++                    f"matriz {A.shape} != uce_ids={len(ids_all)}"
++                )
++            if y.size != len(ids_all):
++                raise RuntimeError(
++                    f"labels={y.size} != uce_ids={len(ids_all)}"
++                )
++            mask = res_emb.get("embeddable_mask")
++            if mask is None:
++                raise RuntimeError("resultado sin embeddable_mask")
++            mask = np.asarray(mask, dtype=bool).ravel()
++            if mask.size != len(ids_all):
++                raise RuntimeError(
++                    f"embeddable_mask={mask.size} != uce_ids={len(ids_all)}"
++                )
++            ids = [ids_all[i] for i in np.flatnonzero(mask)]
++            A = A[mask]
++            y = y[mask]
++            n_assigned = int((y >= 0).sum())
++            if n_assigned < int(min_n):
++                raise RuntimeError(
++                    f"embeddable={len(ids)} asignadas={n_assigned} "
++                    f"< min_n={int(min_n)}"
++                )
++            target_k = int(res_emb.get("target_k") or 0)
++            floor_full = int(res_emb.get("min_cluster_size") or 0)
++            floor_min = int(
++                getattr(self.config, "hdbscan_uce_min_cluster_floor", 5)
++            )
++            # Misma FRACCION de piso que el ajuste completo, aplicada a las
++            # UCEs informativas: el K efectivo se conserva y el piso no
++            # depende del tamano de la replica.
++            frac_floor = float(floor_full) / float(max(1, len(ids_all)))
++            floor = max(floor_min, int(round(frac_floor * len(ids))))
++            min_r2_1d = float(
++                getattr(self.config, "dense_cdh_min_r2_1d", 0.0)
++            )
++            min_r2_dense = float(
++                getattr(self.config, "dense_cdh_min_r2_dense", 0.08)
++            )
++            mcs_frac = float(floor) / float(max(1, len(ids)))
++
++            def predict_c(X_sub):
++                with contextlib.redirect_stdout(io.StringIO()):
++                    labels_sub, diag = guarded_fit(
++                        backend,
++                        np.asarray(X_sub, dtype=float),
++                        target_k,
++                        floor,
++                        n_zero_rows=0,
++                        ward_max_n=_METHOD_C_WARD_MAX_N,
++                        min_r2_1d=min_r2_1d,
++                        min_r2_dense=min_r2_dense,
++                        mcs_frac=mcs_frac,
++                    )
++                if labels_sub is None:
++                    reason = (diag.get("precondition") or {}).get(
++                        "reason", "?"
++                    )
++                    raise RuntimeError(
++                        f"guarded_fit sin particion ({reason})"
++                    )
++                return labels_sub
++
++            spaces["C"] = (
++                A,
++                ids,
++                {uid: int(y[i]) for i, uid in enumerate(ids)},
++                predict_c,
++            )
++        except Exception as exc:
++            _omit("C", exc)
++
++        return spaces
+ 
+     def _stability_blocks(
+         self,
+@@ -6493,6 +6711,14 @@
+             "C": _partition_sizes(res_emb1["uce_to_label"] if res_emb1 else None),
+         }
+ 
++        self._stability_spaces = self._build_stability_spaces(
++            res_wc1,
++            res_coref1,
++            res_emb1,
++            min_n=int(
++                getattr(self.config, "method_selection_stability_min_n", 30)
++            ),
++        )
+         stability_blocks = self._stability_blocks(
+             getattr(self, "_stability_spaces", None),
+             n_boot=int(
+--- /dev/null
++++ b/tests/test_stability_bootstrap.py
+@@ -0,0 +1,251 @@
++"""Bootstrap real de estabilidad: `_stability_spaces` (patch 20).
++
++El bug que cubre: ``run()`` pasaba ``getattr(self, "_stability_spaces", None)``
++a ``_stability_blocks``, pero NADA asignaba ese atributo. El espacio llegaba
++siempre ``None``, todos los ``bootstrap_ari`` caian a ``nan`` y
++``MethodMetrics.stability_kind`` caia siempre a ``"perturbation"``: el
++"criterio principal: bootstrap (remuestreo real)" que documenta
++``reii/method_selection.py`` nunca estuvo operativo.
++
++Contrato que se fija aqui:
++
++  (a) flag apagado -> no se construye espacio y el tipo sigue "perturbation".
++  (b) flag encendido + espacio valido -> ``bootstrap_ari`` finito y
++      ``stability_kind == "bootstrap"``.
++  (c) espacio malformado -> ``{}`` para ese metodo, sin lanzar.
++  (d) un metodo malo no impide evaluar al resto.
++  (e) ``_build_stability_spaces`` degrada POR METODO, no propaga excepciones.
++
++No se instancia el pipeline: ``DoubleClassifier.__new__`` evita
++Segmentador/UCBuilder (Stanza). El import del modulo cuesta lo mismo que en
++``test_cdh_min_leaf_floor.py`` (spacy/prince/transformers).
++"""
++
++from __future__ import annotations
++
++import sys
++
++import numpy as np
++import pytest
++
++from reii.main_workflow import (
++    Config,
++    DoubleClassifier,
++    UC,
++    _CLI_FLAGS_SIN_VALOR,
++    _cli_overrides,
++)
++from reii.method_selection import MethodMetrics
++
++
++# ── Helpers ────────────────────────────────────────────────────────────
++def _dc(**cfg) -> DoubleClassifier:
++    """``DoubleClassifier`` sin ``__init__`` (no necesita Stanza)."""
++    dc = DoubleClassifier.__new__(DoubleClassifier)
++    dc.config = Config(**cfg)
++    dc.ppmi_builder = None
++    dc.quiet_selection = True
++    return dc
++
++
++def _blobs(n: int = 120, d: int = 4, seed: int = 0):
++    """Tres nubes separadas en la 1a coordenada + particion de referencia."""
++    rng = np.random.default_rng(seed)
++    X = rng.normal(scale=0.3, size=(n, d))
++    third = n // 3
++    X[:third, 0] += 6.0
++    X[2 * third :, 0] -= 6.0
++    y = np.repeat([0, 1, 2], [third, third, n - 2 * third])
++    return X, y
++
++
++def _predict_thirds(X_sub):
++    """Refit trivial y determinista: reasigna por la 1a coordenada."""
++    v = np.asarray(X_sub, dtype=float)[:, 0]
++    return np.where(v > 3.0, 0, np.where(v < -3.0, 2, 1))
++
++
++def _spec(X, y):
++    ids = [f"u{i}" for i in range(len(y))]
++    return ids, {u: int(c) for u, c in zip(ids, y)}
++
++# ── (a) flag apagado: nada cambia ──────────────────────────────────────
++def test_flag_off_builds_no_space_and_keeps_perturbation():
++    assert Config().stability_bootstrap is False
++    dc = _dc()  # default: False
++
++    # Corta ANTES de validar argumentos: no toca ucs/voc/labels.
++    assert dc._build_stability_spaces(None, None, None) is None
++    assert dc._build_stability_spaces({"ucs": []}, {}, {}) is None
++
++    # Asi queda en run(): el atributo vale None y el bloque no existe.
++    dc._stability_spaces = dc._build_stability_spaces(None, None, None)
++    assert dc._stability_spaces is None
++    assert dc._stability_blocks(dc._stability_spaces) == {}
++
++    metric = MethodMetrics(method="A", k=3, ari=0.42, coverage=0.4)
++    assert metric.stability_kind == "perturbation"
++    assert metric.stability == pytest.approx(0.42)
++
++
++# ── (b) espacio valido: bootstrap real, finito ─────────────────────────
++def test_valid_space_yields_finite_bootstrap_ari():
++    dc = _dc()
++    X, y = _blobs()
++    ids, cmap = _spec(X, y)
++    spaces = {"A": (X, ids, cmap, _predict_thirds)}
++
++    out = dc._stability_blocks(spaces, n_boot=10, n_perm=10, min_n=30)
++    block = out["A"]
++    assert block, "un espacio valido no puede producir un bloque vacio"
++
++    value = float(block["bootstrap_ari"])
++    assert np.isfinite(value)
++    assert value > 0.9, "las tres nubes deben reproducirse en la replica"
++    assert block["stability_kind"] == "bootstrap"
++    assert np.isfinite(float(block["bootstrap_ari_ci_low"]))
++    assert np.isfinite(float(block["bootstrap_ari_ci_high"]))
++
++    metric = MethodMetrics(
++        method="A",
++        k=3,
++        ari=0.5,
++        coverage=0.5,
++        bootstrap_ari=value,
++    )
++    assert metric.stability_kind == "bootstrap"
++    assert metric.stability == pytest.approx(value)
++
++
++# ── (c) espacio malformado: {} sin lanzar ──────────────────────────────
++def test_malformed_spaces_are_dropped_without_raising():
++    dc = _dc()
++    X, y = _blobs()
++    ids, cmap = _spec(X, y)
++
++    # (i) X con shape[0] != len(ids)
++    wrong_rows = (np.zeros((3, X.shape[1])), ids, cmap, _predict_thirds)
++    assert dc._stability_blocks({"A": wrong_rows}) == {"A": {}}
++
++    # (ii) predict_fn no callable
++    assert dc._stability_blocks({"A": (X, ids, cmap, None)}) == {"A": {}}
++
++    # (iii) nada asignado (< min_n)
++    unassigned = {u: -1 for u in ids}
++    spec = (X, ids, unassigned, _predict_thirds)
++    assert dc._stability_blocks({"A": spec}, min_n=30) == {"A": {}}
++
++
++# ── (d) un metodo malo no bloquea al resto ─────────────────────────────
++def test_one_bad_space_does_not_block_the_rest():
++    dc = _dc()
++    X, y = _blobs()
++    ids, cmap = _spec(X, y)
++    bad = (np.zeros((1, X.shape[1])), ids, cmap, _predict_thirds)
++    good = (X, ids, cmap, _predict_thirds)
++
++    out = dc._stability_blocks(
++        {"A": bad, "B": good}, n_boot=5, n_perm=5, min_n=30
++    )
++    assert set(out) == {"A", "B"}
++    assert out["A"] == {}
++    assert np.isfinite(float(out["B"]["bootstrap_ari"]))
++
++
++# ── (e) construccion: degrada POR METODO, nunca lanza ──────────────────
++def _uc_corpus(n: int = 40):
++    """UCs sinteticas: dos bloques lexicos + un termino comun."""
++    ucs, labels = [], []
++    for i in range(n):
++        head = "a" if i < n // 2 else "b"
++        terms = [f"{head}1", f"{head}2", "comun"]
++        ucs.append(
++            UC(
++                texto=" ".join(terms),
++                lemmas=list(terms),
++                stems=list(terms),
++                uce_ids=[f"uce{i}"],
++            )
++        )
++        labels.append(0 if head == "a" else 1)
++    return {
++        "ucs": ucs,
++        "labels": np.asarray(labels, dtype=int),
++        "voc": sorted({"a1", "a2", "b1", "b2", "comun"}),
++    }
++
++
++def test_build_spaces_off_by_default_and_degrades_per_method():
++    # flag off: ni siquiera se mira el resultado
++    assert _dc()._build_stability_spaces(_uc_corpus(), None, None) is None
++
++    dc = _dc(stability_bootstrap=True)
++    spaces = dc._build_stability_spaces(_uc_corpus(), None, None, min_n=30)
++
++    # A se construye; B y C no tienen resultado -> se omiten con motivo.
++    assert set(spaces) == {"A"}
++    X, ids, cmap, predict = spaces["A"]
++    assert X.shape[0] == len(ids) == 40
++    assert set(cmap) == set(ids)
++    assert callable(predict)
++    assert len(predict(X[:32])) == 32
++
++    # El motor completo tampoco lanza sobre un espacio degenerado.
++    out = dc._stability_blocks(spaces, n_boot=3, n_perm=3, min_n=30)
++    assert "A" in out
++
++
++# ── Method C: solo las UCEs con embedding ──────────────────────────────
++def _emb_result(n_all: int = 60, n_emb: int = 54, seed: int = 0):
++    rng = np.random.default_rng(seed)
++    X = rng.normal(size=(n_all, 4))
++    y = np.repeat([0, 1, 2], [20, 20, 20])
++    mask = np.zeros(n_all, dtype=bool)
++    mask[:n_emb] = True
++    return {
++        "uce_ids": [f"e{i}" for i in range(n_all)],
++        "labels_array": y,
++        "embedding_matrix": X,
++        "embeddable_mask": mask,
++        "backend": "kmeans_spherical",
++        "target_k": 3,
++        "min_cluster_size": 5,
++    }
++
++
++def test_method_c_space_uses_embeddable_subset():
++    dc = _dc(stability_bootstrap=True)
++    spaces = dc._build_stability_spaces(None, None, _emb_result(), min_n=30)
++
++    assert set(spaces) == {"C"}
++    X, ids, cmap, predict = spaces["C"]
++    assert X.shape[0] == len(ids) == 54
++    assert len(cmap) == 54
++    assert ids == [f"e{i}" for i in range(54)]
++    assert callable(predict)
++
++
++def test_method_c_omitted_when_too_few_embeddable():
++    dc = _dc(stability_bootstrap=True)
++    res = _emb_result()
++    res["embeddable_mask"] = np.array([True] * 10 + [False] * 50)
++    assert "C" not in dc._build_stability_spaces(None, None, res, min_n=30)
++
++
++def test_method_c_omitted_when_mask_missing():
++    dc = _dc(stability_bootstrap=True)
++    res = _emb_result()
++    res.pop("embeddable_mask")
++    assert "C" not in dc._build_stability_spaces(None, None, res, min_n=30)
++
++
++# ── CLI: opt-in declarado y aplicado ───────────────────────────────────
++def test_cli_flag_declared_and_applied(monkeypatch):
++    # Declarado: si no, `_warn_unknown_cli_flags` lo reporta como ignorado.
++    assert "--stability-bootstrap" in _CLI_FLAGS_SIN_VALOR
++
++    monkeypatch.setattr(sys, "argv", ["reii", "--stability-bootstrap"])
++    assert _cli_overrides(Config()).stability_bootstrap is True
++
++    monkeypatch.setattr(sys, "argv", ["reii"])
++    assert _cli_overrides(Config()).stability_bootstrap is False

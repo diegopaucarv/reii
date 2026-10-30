@@ -1,0 +1,60 @@
+diff --git a/scripts/playground/hardening_bench.py b/scripts/playground/hardening_bench.py
+--- a/scripts/playground/hardening_bench.py
++++ b/scripts/playground/hardening_bench.py
+@@ -112,10 +112,14 @@
+ ZERO_ROW_MAX_FRAC = 0.5  # espejo de main_workflow.py:5124-5131
+ 
+ #: Calibrado con measure_ward_memory() sobre esta maquina (ver HARDENING.md
+-#: §2). El presupuesto es 256 MB de pico ADICIONAL; con el ajuste cuadratico
+-#: medido, 4000 es el mayor multiplo de 500 que cabe con margen.
+-DEFAULT_WARD_MAX_N = 4000
+-DEFAULT_WARD_MAX_BYTES = 256 * 1024 * 1024
++#: §2). Presupuesto 320 MiB de pico ADICIONAL. El peor camino (cuadrado
++#: completo) gasta 8 B/par (= 275 MiB a n=6000); el condensado 4 B/par (144
++#: MiB), asi que 6000 respeta el peor caso con margen. Coincide con
++#: _METHOD_C_WARD_MAX_N (main_workflow.py, #69): el banco y produccion no
++#: deben calibrar distinto, o el guard degradaria justo donde el diseno dice
++#: que se permite ward.
++DEFAULT_WARD_MAX_N = 6000
++DEFAULT_WARD_MAX_BYTES = 320 * 1024 * 1024
+ 
+ DEFAULT_FLOOR = 5  # hdbscan_uce_min_cluster_floor
+ DEFAULT_MCS_FRAC = 0.08  # hdbscan_uce_min_cluster_frac (tight)
+@@ -918,11 +922,11 @@
+                 exponent=ex["exponent"],
+             )
+             print(
+-                f"  -> method_c_ward_max_n calibrado={cal} "
+-                f"(pico extrapolado n={cal}: "
++                f"  -> ward_max_n calibrado={cal} (curva MEDIDA, camino "
++                f"condensado; extrapolado n={cal}: "
+                 f"{ex['peak_mb_at'](cal):.0f} MB, presupuesto "
+-                f"{DEFAULT_WARD_MAX_BYTES // 2**20} MB); "
+-                f"default propuesto={DEFAULT_WARD_MAX_N}"
++                f"{DEFAULT_WARD_MAX_BYTES // 2**20} MB); default de "
++                f"POLITICA={DEFAULT_WARD_MAX_N} (PEOR camino: 8 B/par)"
+             )
+             allowed, msg = ward_guard(DEFAULT_WARD_MAX_N + 1000)
+             print(f"  {msg if msg else 'sin aviso'}")
+diff --git a/src/reii/method_c_policy.py b/src/reii/method_c_policy.py
+--- a/src/reii/method_c_policy.py
++++ b/src/reii/method_c_policy.py
+@@ -39,10 +39,14 @@
+ ZERO_ROW_MAX_FRAC = 0.5  # espejo de main_workflow.py:5124-5131
+ 
+ #: Calibrado con measure_ward_memory() sobre esta maquina (ver HARDENING.md
+-#: §2). El presupuesto es 256 MB de pico ADICIONAL; con el ajuste cuadratico
+-#: medido, 4000 es el mayor multiplo de 500 que cabe con margen.
+-DEFAULT_WARD_MAX_N = 4000
+-DEFAULT_WARD_MAX_BYTES = 256 * 1024 * 1024
++#: §2). Presupuesto 320 MiB de pico ADICIONAL. El peor camino (cuadrado
++#: completo) gasta 8 B/par (= 275 MiB a n=6000); el condensado 4 B/par (144
++#: MiB), asi que 6000 respeta el peor caso con margen. Coincide con
++#: _METHOD_C_WARD_MAX_N (main_workflow.py, #69): el banco y produccion no
++#: deben calibrar distinto, o el guard degradaria justo donde el diseno dice
++#: que se permite ward.
++DEFAULT_WARD_MAX_N = 6000
++DEFAULT_WARD_MAX_BYTES = 320 * 1024 * 1024
+ 
+ DEFAULT_FLOOR = 5  # hdbscan_uce_min_cluster_floor
+ DEFAULT_MCS_FRAC = 0.08  # hdbscan_uce_min_cluster_frac (tight)
